@@ -1,0 +1,20 @@
+Tom's Crazy Ideas for a simple python script...
+
+When turning it on, Altitude is zero, increasing as it moves upwards... and Azimuth is zero, probably normal convention...
+and as documented, RA/DEC are some placeholder
+and when trying to use stellarium, which is presumably issuing RA/DEC gotos, it just goes to its initial position
+
+Then, after fake-aligning on Saturn, which was ~150 az, 25 alt...
+
+z
+Z
+72c2,13b9
+
+which means:
+
+0xBLAH / 65536 * 360
+
+161,27
+
+so the documentation was kinda wrong, but the altaz is just as you'd expect... heading ccw from north, and up from horizon
+so basically if you turn it on facing north and aligned with the index mark, hooray for you!
