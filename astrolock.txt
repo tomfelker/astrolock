@@ -1,0 +1,109 @@
+AstroLock
+=========
+
+Idea here is to make software to basically replace a telescope hand controller.  It should:
+
+- be able to align a telescope mount given a few bright stars
+	- known stars?  easy, but of course, gotta identify them...
+	- unknown stars?  blah, just algorithms, just need to tune magnitude cutoff vs pointing accuracy
+	- stretch goal: modeling arbitrary mount geometry (alt-az, equatorial, other random IK systems)
+	- stretch goal: modeling physical errors in mounts?
+- be able to point at things
+	- fixed stars / galaxies / nebulae
+	- planets, comets, asteroids, etc.
+	- satellites, including tracking them
+	- terrestrial objects (stretch goal: Google Maps integration, raytracing against world)
+	- aircraft with ADS-B
+	- birds
+- nice real-time controls
+	- using gamepads, keyboards, etc
+	- direct slewing
+	- tracking unknown moving objects (rocket launches, planes, new satellites, UFOs)
+- support many telescope mounts
+	- celestron, the one I have... which is able to move to commanded angles and rates
+	- whatever else people add support for (with open source! none of this proprietary crap)
+	- simulated stuff (stellarium?) for testing
+- optical alignment (stretch goal)
+	- take a picture with stars, plate solve, use that for alignment (don't even need to point at bright stars!)
+	- webcam or phone + Dobsonian mount + voice commands (computer -> meat servo = win!)
+- optical tracking (stretch goal)
+	- grab frames in real time, find target, adjust rates to track = sweet ISS pictures
+	
+Software Dependencies
+	- AstroPy
+		- lots of framework for this sort of thing, in Python - coordinate systems, libararies, ephermerides, etc.
+	- TensorFlow / NumPy - for computer vision stuff
+	- TkInter - for UI prolly
+	
+	
+	
+Alignment Modes:
+	- system aligned - the two axes we command are only assumed perpendicular, basically an AltAz mount on a tripod of arbitrary orientation
+	- AltAz rough aligned - the two axes are altitude and azimuth, as though you turned on my telescope while it was level/north
+	- Eq rough aligned - the two axes are R.A and Dec., as though you turned on an EQ telescope and it was aligned...
+	
+	
+API Stuff
+	- "Targets" as things which have paths...
+		position (or direction? how to handle positions at infinity?) (in some coordinate system) as a function of time...
+		
+	- Tracking considered relative to this:
+		- we remember an offset from the target path
+			- in direction space?  e.g., degrees ahead, degrees above/below
+			- 
+	
+UI Pages
+	- Time
+		- "current" time
+		- system clock
+			- hmm, any way to disable this from getting auto set by windows?
+			- maybe can use the 
+		- offset from system clock
+			- auto set from GPS
+			- enter here
+		- GPS time last received and system clock time of that
+		- system clock time at GPS last received
+		- delay
+	- Location
+		- sync from GPS
+		- set from Maps
+		- go to map
+	
+	- Alignment
+		- list of alignments:
+			- mount coordinates, "unknown star" - what we'd need for 1, 2, 3 star aligns
+			- mount coordinates + known object
+			- mount coordinates + plate solve
+			- checkboxes for whether to use
+			- solution error
+		- alignemt solution:
+			- orientation of mount w.r.t earth centered earth fixed
+			- with plate solving, also can get orientation (or at least roll) of camera wrt mount
+			- parameters of mount sloppiness
+	
+		big buttons:
+			- Align!  do the math
+			- Add Point
+				- unknown bright star
+				- known star
+				- plate solve
+				- known map point (known elev?)
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
