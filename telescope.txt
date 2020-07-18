@@ -1,0 +1,32 @@
+Telescope nerdiness!!!
+
+
+Goal - write some software for this thing, can't be hard to beat what's out there
+
+First goal, simple tracking of any moving object:
+	- many modes:
+		- just directly control motor rates.
+			- Good enough, easy, no alignment concerns
+			- sucks near gimbal lock
+		- control your angular velocity
+			- should be better for satellites, only need corrections due to parallex / curved path
+			- need to actually know orientation of axes though don't really care which frame they're in...
+				- basically need to know what the gimbal is., e.g., euler convention
+			- also raises question of how to handle instances where commanded motor rate isn't reached:
+				- could just blindly trust returned positions, apply desired angular velocity relative to that
+					- would motor drag / voltage / etc slow things down?  not sure if it's open or closed loop on the motor controller side...
+					- simplest approach
+				- could do our own integration of commanded rates to get desired angles, and do some PID stuff on top of that...
+					- pid tuning would be annoying
+					- allows to resume tracking after gimbal lock
+					- human in loop at wrong point... e.g., gimbal lock slows us down, human tries to increase rate to compensate, messes up desired ang velocity vector
+						- disable inputs that would increase a commanded rate that's already at max?
+		- control based on TLE
+			- need GPS / time / a library to do all these calcs
+			- should be fully automatic, only need fine tuning
+			- tracking in terms of messing with time, and orbital angular velocity vector
+			- now that we actually care about a different reference frame other than "whatever the telescope is set up at...", alignment becomes important
+				- actually probably don't want the scope to align itself, since we'll be reading the alignment in terms of scope's alignment, but driving raw motor commands
+				- so we kind of need our own alignment info... is there a way to query this from the scope?
+			
+					
