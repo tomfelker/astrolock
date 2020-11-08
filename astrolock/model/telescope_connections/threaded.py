@@ -10,15 +10,15 @@ class ThreadedConnection(telescope_connection.TelescopeConnection):
     def loop(self):
         raise NotImplementedError
 
-    def __init__(self, url):
-       super().__init__(url)
+    def __init__(self, *args, **kwargs):
+       super().__init__(*args, **kwargs)
 
-    def __enter__(self):
+    def start(self):
         self.want_to_stop = False
         self.loop_thread = threading.Thread(target = self.loop)
         self.loop_thread.start()
         return self
 
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def stop(self):
         self.want_to_stop = True

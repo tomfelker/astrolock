@@ -9,5 +9,5 @@ class DummyConnection(telescope_connection.TelescopeConnection):
     def get_urls():
         return [ DummyConnection.get_url_scheme() ]
 
-    def __init__(self, url):
-        pass
+    def __init__(self, *args, **kwargs):
+        super().init(*args, **kwargs)

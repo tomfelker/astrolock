@@ -17,8 +17,8 @@ class AngleClockConnection(astrolock.model.telescope_connections.com_port.ComPor
     def get_baud_rate(self):
         return 115200
 
-    def __init__(self, url):
-       super().__init__(url)
+    def __init__(self, *args, **kwargs):
+       super().__init__(*args, **kwargs)
 
     def loop(self):
         self._open_serial_stream()

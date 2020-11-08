@@ -20,8 +20,8 @@ class ComPortConnection(threaded.ThreadedConnection):
             urls.append(url)
         return urls
 
-    def __init__(self, url):
-       super().__init__(url)
+    def __init__(self, *args, **kwargs):
+       super().__init__(*args, **kwargs)
 
     def _open_serial_stream(self):
         self.serial_stream = serial.Serial(self.url_path, self.get_baud_rate())

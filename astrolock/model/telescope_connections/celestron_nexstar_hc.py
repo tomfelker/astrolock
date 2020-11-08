@@ -11,5 +11,5 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
     def get_baud_rate(self):
         return 9600
 
-    def __init__(self, url):
-        super().__init__(url)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)

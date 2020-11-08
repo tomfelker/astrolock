@@ -1,14 +1,15 @@
 import astropy.units as u
+import numpy as np
 
 class TelescopeConnection(object):
-    def __init__(self, url):
+    def __init__(self, url, tracker):
+        self.tracker = tracker
         if not url.startswith(self.__class__.get_url_scheme()):
             raise RuntimeError("This connection type can't handle this URL scheme")
         self.url = url
         self.url_path = url[len(self.__class__.get_url_scheme()):]
-
-        self.desired_axis_rates = [0, 0] * (u.rad / u.s)
-        self.axis_angles = [0, 0] * u.rad
+        self.axis_angles = np.zeros(2) * u.rad
+        self.desired_axis_rates = np.zeros(2) * u.rad / u.s
 
 
     # override this to return something like "my_device_type:"
@@ -29,8 +30,8 @@ class TelescopeConnection(object):
 
     
     @classmethod
-    def get_connection(cls, url):
-        return cls.get_connection_class(url)(url)
+    def get_connection(cls, url, tracker):
+        return cls.get_connection_class(url)(url, tracker)
 
     @classmethod
     def get_urls_for_subclasses(cls):
@@ -46,12 +47,9 @@ class TelescopeConnection(object):
     # override this to return a list of URL strings you could be constructed with, e.g., [ "my_device_type:port1", "my_device_type:port2" ]
     @classmethod
     def get_urls(cls):
-        return cls.get_urls_for_subclasses()
-
-    def set_update_callback(self, update_callback):
-        self.update_callback = update_callback
-
-    def get_status_string(self):
+        raise NotImplementedError
+    
+    def get_status(self):
         s = "Connected to " + self.url + "\n"
         s += "Desired rates: " + str(self.desired_axis_rates.to(u.deg / u.s)) + "\n"
         s += "Angles:        " + str(self.axis_angles.to(u.deg)) + "\n"
