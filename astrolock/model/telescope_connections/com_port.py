@@ -25,3 +25,4 @@ class ComPortConnection(threaded.ThreadedConnection):
 
     def _open_serial_stream(self):
         self.serial_stream = serial.Serial(self.url_path, self.get_baud_rate())
+        return self.serial_stream

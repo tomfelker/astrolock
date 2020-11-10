@@ -19,10 +19,9 @@ class StellariumConnection(threaded.ThreadedConnection):
         super().__init__(*args, **kwargs)
 
     def loop(self):
-        try:
-            while not self.want_to_stop:
+        while not self.want_to_stop:
+            try:
                 #first we read some information, both to display, and because it's needed to set the rates
-
                 
                 status = requests.get('http:' + self.url_path + '/api/main/status')
                 status_json = status.json()
@@ -63,6 +62,6 @@ class StellariumConnection(threaded.ThreadedConnection):
 
                 self.tracker.update_gui_callback()
                 time.sleep(.1)
-        except ConnectionError:
-            #hmm, how to signal a disconnection?
-            pass
+            except ConnectionError:
+                self.want_to_stop = True
+                pass

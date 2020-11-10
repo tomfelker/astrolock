@@ -30,6 +30,8 @@ class MainWindow(tk.Tk):
 
         notebook.pack(fill = tk.BOTH)
 
+        self.bind("<Destroy>", self._destroy)
+
     def update_gui_from_tracker_threads(self):
         try:
             self.after(0, self.update_gui)
@@ -39,6 +41,9 @@ class MainWindow(tk.Tk):
 
     def update_gui(self):
         self.status_tab.update_gui()
+
+    def _destroy(self, *args, **kwargs):
+        self.tracker.disconnect_from_telescope()
 
 def gui_loop():
     window = MainWindow()

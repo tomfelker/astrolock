@@ -11,7 +11,7 @@ import time
 
 class TelescopeConnection:
     def __init__(self):
-        stream = serial.Serial('COM3', 9600)
+        stream = serial.Serial('COM4', 9600)
         self.istream = stream
         self.ostream = stream
 
