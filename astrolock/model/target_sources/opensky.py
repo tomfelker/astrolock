@@ -15,7 +15,7 @@ import astrolock.model.target
 class OpenSkyTargetSource(target_source.TargetSource):
     def __init__(self, tracker = None):
         self.want_to_stop = True
-        self.query_range = 15 * u.km
+        self.query_range = 20 * u.km
         self.api_url = "https://opensky-network.org/api"
         self.targets = []
         self.tracker = tracker
@@ -30,13 +30,9 @@ class OpenSkyTargetSource(target_source.TargetSource):
             params = {'time': 0}
 
             if self.query_range > 0:
-                #todo: cool stuff like this
                 lat = self.tracker.location.lat
                 lon = self.tracker.location.lon
-                #cart = self.tracker.location.geocentric
-                #r = np.dot(cart, cart)
-                #print(r)
-                # todo: date line bugs...
+                # todo: international date line and north/south pole bugs...
                 earth_circumference = astropy.constants.R_earth * 2.0 * math.pi;
                 lat_range = self.query_range * (360.0 * u.deg / earth_circumference)
                 lon_range = lat_range / np.cos(lat)
@@ -68,42 +64,81 @@ class OpenSkyTargetSource(target_source.TargetSource):
     def json_to_targets(self, json):
         targets = []
 
-        if json["states"] is not None:
-            for state_vector_array in json["states"]:
-                props = dict(zip(self.json_keys, state_vector_array))
-                # can't do much if it doesn't at least have these...
-                if props['latitude'] is not None and props['longitude'] is not None:
-                    new_target = astrolock.model.target.Target()
-                    new_target.display_name = props["callsign"]
-                    new_target.url = 'astrolock://skyvector/icao24/' + props['icao24']
-                    new_target.skyvector_props = props
+        json_states = json["states"] or []
+        
+        print(f'Parsing {len(json_states)} targets')
+        start_perf_counter = time.perf_counter()
 
-                    new_target.latitude_deg = float(props['latitude'])
-                    new_target.longitude_deg = float(props['longitude'])
-                    new_target.altitude_m = 0
-                    if props['geo_altitude'] is not None:
-                        new_target.altitude_m = float(props['geo_altitude']) 
-                    if props['baro_altitude'] is not None:
-                        new_target.altitude_m = float(props['baro_altitude']) 
+        for state_vector_array in json["states"]:
+            props = dict(zip(self.json_keys, state_vector_array))
+            # can't do much if it doesn't at least have these...
+            if props['latitude'] is not None and props['longitude'] is not None:
+                new_target = astrolock.model.target.Target()
+                new_target.display_name = props["callsign"]
+                new_target.url = 'astrolock://skyvector/icao24/' + props['icao24']
+                new_target.skyvector_props = props
 
-                    # want this, but it's too slow to do one-by-one                
-                    #new_target.location = astropy.coordinates.EarthLocation.from_geodetic(lon = new_target.longitudes_deg * u.deg, lat = new_target.latitudes_deg * u.deg, height = new_target.altitudes_m * u.m)
-                    # so we'll do it below in a big array
+                new_target.latitude_deg = float(props['latitude'])
+                new_target.longitude_deg = float(props['longitude'])
+                new_target.altitude_m = 0
+                if props['geo_altitude'] is not None:
+                    new_target.altitude_m = float(props['geo_altitude']) 
+                if props['baro_altitude'] is not None:
+                    new_target.altitude_m = float(props['baro_altitude']) 
 
-                    targets.append(new_target)
-            
-            # doing this in one big array for performance reasons
-            latitudes_deg = np.zeros(len(targets))
-            longitudes_deg = np.zeros(len(targets))
-            altitudes_m = np.zeros(len(targets))
-            for target_index, target in enumerate(targets):
-                latitudes_deg[target_index] = target.latitude_deg
-                longitudes_deg[target_index] = target.longitude_deg
-                altitudes_m[target_index] = target.altitude_m
-            coordinates = astropy.coordinates.EarthLocation.from_geodetic(lon = longitudes_deg * u.deg, lat = latitudes_deg * u.deg, height = altitudes_m * u.m)
-            for target_index, target in enumerate(targets):
-                target.location = coordinates[target_index]
-            
+                # want this, but it's too slow to do one-by-one                
+                #new_target.location = astropy.coordinates.EarthLocation.from_geodetic(lon = new_target.longitudes_deg * u.deg, lat = new_target.latitudes_deg * u.deg, height = new_target.altitudes_m * u.m)
+                # so we'll do it below in a big array
+
+                targets.append(new_target)
+        
+        print(f'took {(time.perf_counter() - start_perf_counter) * 1e3} ms')
+        
+        # doing this in one big array for performance reasons
+        latitudes_deg = np.zeros(len(targets))
+        longitudes_deg = np.zeros(len(targets))
+        altitudes_m = np.zeros(len(targets))
+        for target_index, target in enumerate(targets):
+            latitudes_deg[target_index] = target.latitude_deg
+            longitudes_deg[target_index] = target.longitude_deg
+            altitudes_m[target_index] = target.altitude_m
+
+        print(f'Astropy processing {len(targets)} targets')
+        start_perf_counter = time.perf_counter()
+
+        last_known_locations = astropy.coordinates.EarthLocation.from_geodetic(lon = longitudes_deg * u.deg, lat = latitudes_deg * u.deg, height = altitudes_m * u.m)
+        
+        tracker_altaz = astropy.coordinates.AltAz(location = self.tracker.location, obstime = 'J2000')
+
+        #25 ms, wtf?
+        #and our fast version is still 6 ms
+        #target_altaz = target.location.itrs.transform_to(tracker_altaz)
+        # maybe that was just due to pathing to find the appropriate transform?
+        # even that's still 5ish ms
+
+        last_known_locations_itrs = last_known_locations.itrs
+        altazs_from_tracker = astrolock.model.astropy_util.itrs_to_altaz(last_known_locations_itrs, tracker_altaz)
+        
+        scores = altazs_from_tracker.alt.to_value(u.deg)
+
+        #even this stuff is so slow we have to vectorize...
+        display_columns = {}
+        display_columns['latitude'] = last_known_locations.lat.to_string(decimal = True)
+        display_columns['longitude'] = last_known_locations.lon.to_string(decimal = True)
+        display_columns['altitude'] = altazs_from_tracker.alt.to_string(decimal = True)
+        display_columns['azimuth'] = altazs_from_tracker.az.to_string(decimal = True)
+        display_columns['distance'] = altazs_from_tracker.distance.to(u.km)
+
+
+        print(f'took {(time.perf_counter() - start_perf_counter) * 1e3} ms')
+
+        for target_index, target in enumerate(targets):
+            target.last_known_location = last_known_locations[target_index]
+            target.last_known_location_itrs = last_known_locations_itrs[target_index]
+            target.altaz_from_tracker = altazs_from_tracker[target_index]
+            target.score = scores[target_index]
+            for column in display_columns.keys():
+                target.display_columns[column] = display_columns[column][target_index]
         return targets
         
 

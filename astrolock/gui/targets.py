@@ -28,7 +28,10 @@ class TargetsFrame(tk.Frame):
         self.targets_treeview.heading('altitude', text = 'Altitude')
         self.targets_treeview.heading('azimuth', text = 'Azimuth')
         self.targets_treeview.heading('distance', text = 'Distance')
-        self.targets_treeview.pack()
+        self.targets_treeview.pack(side = 'left', fill = 'both', expand = True)
+        self.targets_treeview_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.targets_treeview.yview)
+        self.targets_treeview_scrollbar.pack(side='right', fill='y')
+        self.targets_treeview.configure(yscrollcommand=self.targets_treeview_scrollbar.set)
 
         self.connection_source = astrolock.model.target_sources.opensky.OpenSkyTargetSource(self.tracker)
         self.connection_source.start()
@@ -36,6 +39,8 @@ class TargetsFrame(tk.Frame):
     
     def update_gui(self):
         targets = self.connection_source.get_targets()
+
+        targets.sort(key = (lambda target : target.score), reverse = True)
 
         #hax:
         #targets = targets[0:5]
@@ -45,36 +50,14 @@ class TargetsFrame(tk.Frame):
         # it's insane that this is the best way... seems O(n^2)
         self.targets_treeview.delete(*self.targets_treeview.get_children())
 
-        tracker_altaz = astropy.coordinates.AltAz(location = self.tracker.location, obstime = 'J2000')
-
         for target in targets:
             values = (target.display_name, target.url)
             self.targets_treeview.insert(parent = '', index = 'end', iid = target.url, values = values)
 
-            # the value we got from OpenSky
-            self.targets_treeview.set(item = target.url, column = 'latitude', value = target.latitude_deg)
-            self.targets_treeview.set(item = target.url, column = 'longitude', value = target.longitude_deg)
-            
-            # the cooked value (should be the same), but this is way too slow for some reason:
-            #self.targets_treeview.set(item = target.url, column = 'latitude', value = target.location.lat.to_string(decimal = True))
-            #self.targets_treeview.set(item = target.url, column = 'longitude', value = target.location.lon.to_string(decimal = True))
+            for column in self.targets_treeview['columns']:
+                if column in target.display_columns:
+                    self.targets_treeview.set(item = target.url, column = column, value = target.display_columns[column])
 
-            start_time_ns = time.perf_counter_ns()
-
-            #25 ms, wtf?
-            #and our fast version is still 6 ms
-            #target_altaz = target.location.itrs.transform_to(tracker_altaz)
-            # maybe that was just due to pathing to find the appropriate transform?
-            # even that's still 5ish ms
-            target_altaz = astrolock.model.astropy_util.itrs_to_altaz(target.location.itrs, tracker_altaz)
-            
-            
-            #print(f"transform took {(time.perf_counter_ns() - start_time_ns)*1e-6} ms")
-            
-            self.targets_treeview.set(item = target.url, column = 'altitude', value = target_altaz.alt.to_string(decimal = True))
-            self.targets_treeview.set(item = target.url, column = 'azimuth', value = target_altaz.az.to_string(decimal = True))
-            self.targets_treeview.set(item = target.url, column = 'distance', value = target_altaz.distance.to(u.km))
-            
         try:
             self.targets_treeview.selection_set(old_selection)
         except:
