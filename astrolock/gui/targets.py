@@ -6,6 +6,9 @@ import astropy.coordinates
 import astropy.units as u
 
 import astrolock.model.target_sources.opensky
+import astrolock.model.astropy_util
+
+import time
 
 class TargetsFrame(tk.Frame):
     def __init__(self, *args, tracker, **kwargs):        
@@ -42,6 +45,8 @@ class TargetsFrame(tk.Frame):
         # it's insane that this is the best way... seems O(n^2)
         self.targets_treeview.delete(*self.targets_treeview.get_children())
 
+        tracker_altaz = astropy.coordinates.AltAz(location = self.tracker.location, obstime = 'J2000')
+
         for target in targets:
             values = (target.display_name, target.url)
             self.targets_treeview.insert(parent = '', index = 'end', iid = target.url, values = values)
@@ -54,7 +59,18 @@ class TargetsFrame(tk.Frame):
             #self.targets_treeview.set(item = target.url, column = 'latitude', value = target.location.lat.to_string(decimal = True))
             #self.targets_treeview.set(item = target.url, column = 'longitude', value = target.location.lon.to_string(decimal = True))
 
-            target_altaz = target.location.itrs.transform_to(astropy.coordinates.AltAz(location = self.tracker.location, obstime = 'J2000'))
+            start_time_ns = time.perf_counter_ns()
+
+            #25 ms, wtf?
+            #and our fast version is still 6 ms
+            #target_altaz = target.location.itrs.transform_to(tracker_altaz)
+            # maybe that was just due to pathing to find the appropriate transform?
+            # even that's still 5ish ms
+            target_altaz = astrolock.model.astropy_util.itrs_to_altaz(target.location.itrs, tracker_altaz)
+            
+            
+            #print(f"transform took {(time.perf_counter_ns() - start_time_ns)*1e-6} ms")
+            
             self.targets_treeview.set(item = target.url, column = 'altitude', value = target_altaz.alt.to_string(decimal = True))
             self.targets_treeview.set(item = target.url, column = 'azimuth', value = target_altaz.az.to_string(decimal = True))
             self.targets_treeview.set(item = target.url, column = 'distance', value = target_altaz.distance.to(u.km))
