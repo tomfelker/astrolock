@@ -108,6 +108,7 @@ class OpenSkyTargetSource(target_source.TargetSource):
 
         last_known_locations = astropy.coordinates.EarthLocation.from_geodetic(lon = longitudes_deg * u.deg, lat = latitudes_deg * u.deg, height = altitudes_m * u.m)
         
+        # really shouldn't need to specify a time here, but astropy will crash if we don't - presumably it's trying to transform through a solar system barycentric frame
         tracker_altaz = astropy.coordinates.AltAz(location = self.tracker.location, obstime = 'J2000')
 
         #25 ms, wtf?
@@ -117,7 +118,7 @@ class OpenSkyTargetSource(target_source.TargetSource):
         # even that's still 5ish ms
 
         last_known_locations_itrs = last_known_locations.itrs
-        altazs_from_tracker = astrolock.model.astropy_util.itrs_to_altaz(last_known_locations_itrs, tracker_altaz)
+        altazs_from_tracker = astrolock.model.astropy_util.itrs_to_altaz_direct(last_known_locations_itrs, tracker_altaz)
         
         scores = altazs_from_tracker.alt.to_value(u.deg)
 

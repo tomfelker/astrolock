@@ -1,10 +1,10 @@
 import astropy.coordinates
 import numpy as np
 
-print("Adding simple ITRS to AltAz transform.")
-
-@astropy.coordinates.frame_transform_graph.transform(astropy.coordinates.FunctionTransform, astropy.coordinates.ITRS, astropy.coordinates.AltAz)
-def itrs_to_altaz(obj_itrs_coord, home_altaz_frame):
+# one could use this globally like this:
+#@astropy.coordinates.frame_transform_graph.transform(astropy.coordinates.FunctionTransform, astropy.coordinates.ITRS, astropy.coordinates.AltAz)
+# but it changes the behavior globally, in a way that I'm not sure is correct.
+def itrs_to_altaz_direct(obj_itrs_coord, home_altaz_frame):
     # what is the Alt and Az for me, standing at home, to view the object?
     home_itrs = home_altaz_frame.location.itrs.cartesian
     home_up = home_itrs / home_itrs.norm()
