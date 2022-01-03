@@ -7,6 +7,9 @@ import astropy.constants
 import astropy.units as u
 import numpy as np
 
+import skyfield
+import skyfield.api
+
 import astrolock.model.target_source as target_source
 import astrolock.model.target
 
@@ -30,8 +33,8 @@ class OpenSkyTargetSource(target_source.TargetSource):
             params = {'time': 0}
 
             if self.query_range > 0:
-                lat = self.tracker.location.lat
-                lon = self.tracker.location.lon
+                lat = self.tracker.location_ap.lat
+                lon = self.tracker.location_ap.lon
                 # todo: international date line and north/south pole bugs...
                 earth_circumference = astropy.constants.R_earth * 2.0 * math.pi;
                 lat_range = self.query_range * (360.0 * u.deg / earth_circumference)
@@ -106,37 +109,95 @@ class OpenSkyTargetSource(target_source.TargetSource):
         print(f'Astropy processing {len(targets)} targets')
         start_perf_counter = time.perf_counter()
 
-        last_known_locations = astropy.coordinates.EarthLocation.from_geodetic(lon = longitudes_deg * u.deg, lat = latitudes_deg * u.deg, height = altitudes_m * u.m)
+        # astropy, with direct model
+        if True:
+            last_known_locations = astropy.coordinates.EarthLocation.from_geodetic(lon = longitudes_deg * u.deg, lat = latitudes_deg * u.deg, height = altitudes_m * u.m)
+            
+            # really shouldn't need to specify a time here, but astropy will crash if we don't - presumably it's trying to transform through a solar system barycentric frame
+            tracker_altaz = astropy.coordinates.AltAz(location = self.tracker.location_ap, obstime = 'J2000')
+
+            #25 ms, wtf?
+            #and our fast version is still 6 ms
+            #target_altaz = target.location.itrs.transform_to(tracker_altaz)
+            # maybe that was just due to pathing to find the appropriate transform?
+            # even that's still 5ish ms
+
+            last_known_locations_itrs = last_known_locations.itrs
+            altazs_from_tracker = astrolock.model.astropy_util.itrs_to_altaz_direct(last_known_locations_itrs, tracker_altaz)
+            
+            scores = altazs_from_tracker.alt.to_value(u.deg)
+
+            #even this stuff is so slow we have to vectorize...
+            display_columns = {}
+            display_columns['latitude'] = last_known_locations.lat.to_string(decimal = True)
+            display_columns['longitude'] = last_known_locations.lon.to_string(decimal = True)
+            display_columns['altitude'] = altazs_from_tracker.alt.to_string(decimal = True)
+            display_columns['azimuth'] = altazs_from_tracker.az.to_string(decimal = True)
+            display_columns['distance'] = altazs_from_tracker.distance.to(u.km)
         
-        # really shouldn't need to specify a time here, but astropy will crash if we don't - presumably it's trying to transform through a solar system barycentric frame
-        tracker_altaz = astropy.coordinates.AltAz(location = self.tracker.location, obstime = 'J2000')
+        #skyfield, broken vectorization, not going through earth position
+        if False:
+            # alas here too we need an arbitray time:
+            ts = skyfield.api.load.timescale()
+            t = ts.utc(2014, 1, 23, 11, 18, 7)
+            times = skyfield.api.Time(ts, [t])
 
-        #25 ms, wtf?
-        #and our fast version is still 6 ms
-        #target_altaz = target.location.itrs.transform_to(tracker_altaz)
-        # maybe that was just due to pathing to find the appropriate transform?
-        # even that's still 5ish ms
+            # ...and, we can't vectorize, or at() will complain...  blah
+            display_columns = {}
+            display_columns['latitude'] = []
+            display_columns['longitude'] = []
+            display_columns['altitude'] = []
+            display_columns['azimuth'] = []
+            display_columns['distance'] = []
+            scores = []
 
-        last_known_locations_itrs = last_known_locations.itrs
-        altazs_from_tracker = astrolock.model.astropy_util.itrs_to_altaz_direct(last_known_locations_itrs, tracker_altaz)
-        
-        scores = altazs_from_tracker.alt.to_value(u.deg)
+            for target_index, target in enumerate(targets):
+                last_known_locations_geodetic = skyfield.api.wgs84.latlon(latitudes_deg[target_index], longitudes_deg[target_index], elevation_m = altitudes_m[target_index])
+                tracker_geodetic = self.tracker.location_sf
+                thingies = last_known_locations_geodetic - tracker_geodetic
+                topocentric = thingies.at(t)
+                alts, azs, dists = topocentric.altaz()
+                scores.append(alts.degrees)
 
-        #even this stuff is so slow we have to vectorize...
-        display_columns = {}
-        display_columns['latitude'] = last_known_locations.lat.to_string(decimal = True)
-        display_columns['longitude'] = last_known_locations.lon.to_string(decimal = True)
-        display_columns['altitude'] = altazs_from_tracker.alt.to_string(decimal = True)
-        display_columns['azimuth'] = altazs_from_tracker.az.to_string(decimal = True)
-        display_columns['distance'] = altazs_from_tracker.distance.to(u.km)
+                display_columns['latitude'].append(latitudes_deg[target_index])
+                display_columns['longitude'].append(longitudes_deg[target_index])
+                display_columns['altitude'].append(alts.degrees)
+                display_columns['azimuth'].append(azs.degrees)
+                display_columns['distance'].append(dists.m)
 
+        # skyfield, going through earth position
+        if False:
+            display_columns = {}
 
+            ts = skyfield.api.load.timescale()
+            t = ts.utc(2014, 1, 23, 11, 18, 7)
+            planets = skyfield.api.load('de440s.bsp')
+            earth = planets['earth']
+
+            last_known_locations_geodetic = skyfield.api.wgs84.latlon(latitudes_deg, longitudes_deg, elevation_m = altitudes_m)
+            last_known_locations_astrometric = earth + last_known_locations_geodetic
+            
+            tracker_geodetic = self.tracker.location_sfa
+            tracker = earth + tracker_geodetic
+            tracker_astrometric = tracker.at(t)
+
+            last_known_locations_topocentric = tracker_astrometric.observe(last_known_locations_astrometric)
+            
+            alts, azs, dists = last_known_locations_topocentric.altaz()
+            scores = alts.degrees
+
+            display_columns['latitude'].append(latitudes_deg[target_index])
+            display_columns['longitude'].append(longitudes_deg[target_index])
+            display_columns['altitude'].append(alts.degrees)
+            display_columns['azimuth'].append(azs.degrees)
+            display_columns['distance'].append(dists.m)
+            
         print(f'took {(time.perf_counter() - start_perf_counter) * 1e3} ms')
 
         for target_index, target in enumerate(targets):
-            target.last_known_location = last_known_locations[target_index]
-            target.last_known_location_itrs = last_known_locations_itrs[target_index]
-            target.altaz_from_tracker = altazs_from_tracker[target_index]
+            #target.last_known_location = last_known_locations[target_index]
+            #target.last_known_location_itrs = last_known_locations_itrs[target_index]
+            #target.altaz_from_tracker = altazs_from_tracker[target_index]
             target.score = scores[target_index]
             for column in display_columns.keys():
                 target.display_columns[column] = display_columns[column][target_index]

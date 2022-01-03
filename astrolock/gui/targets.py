@@ -5,6 +5,9 @@ import tkinter.scrolledtext
 import astropy.coordinates
 import astropy.units as u
 
+import skyfield
+import skyfield.api
+
 import astrolock.model.target_sources.opensky
 import astrolock.model.astropy_util
 
@@ -17,7 +20,10 @@ class TargetsFrame(tk.Frame):
         self.tracker = tracker
 
         # hax:
-        self.tracker.location = astropy.coordinates.EarthLocation.from_geodetic(lat = "37d30'39.02\"", lon = "-122d16'19.33\"", height = 64)
+        self.tracker.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = 37.510839 * u.deg, lon = -122.272036 * u.deg, height = 64 * u.m)
+        self.tracker.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = 37.510839, longitude_degrees = -122.272036, elevation_m = 64)
+        self.tracker.location_sfa = skyfield.api.wgs84.latlon(latitude_degrees = [37.510839], longitude_degrees = [-122.272036], elevation_m = [64])
+
 
         self.targets_treeview = ttk.Treeview(self, show = 'headings')
         self.targets_treeview['columns'] = ('callsign', 'url', 'latitude', 'longitude', 'altitude', 'azimuth', 'distance')
