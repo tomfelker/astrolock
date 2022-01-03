@@ -8,6 +8,6 @@ class Target:
         self.display_columns = {}
 
     # callers will do  target = target.updated_with(new_target)
-    def updated_with(new_target):
+    def updated_with(self, new_target):
         return new_target
     

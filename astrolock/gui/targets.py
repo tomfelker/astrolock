@@ -24,7 +24,6 @@ class TargetsFrame(tk.Frame):
         self.tracker.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = 37.510839, longitude_degrees = -122.272036, elevation_m = 64)
         self.tracker.location_sfa = skyfield.api.wgs84.latlon(latitude_degrees = [37.510839], longitude_degrees = [-122.272036], elevation_m = [64])
 
-
         self.targets_treeview = ttk.Treeview(self, show = 'headings')
         self.targets_treeview['columns'] = ('callsign', 'url', 'latitude', 'longitude', 'altitude', 'azimuth', 'distance')
         self.targets_treeview.heading('callsign', text = 'Callsign')
@@ -39,12 +38,23 @@ class TargetsFrame(tk.Frame):
         self.targets_treeview_scrollbar.pack(side='right', fill='y')
         self.targets_treeview.configure(yscrollcommand=self.targets_treeview_scrollbar.set)
 
-        self.connection_source = astrolock.model.target_sources.opensky.OpenSkyTargetSource(self.tracker)
-        self.connection_source.start()
+        self.target_source = astrolock.model.target_sources.opensky.OpenSkyTargetSource(self.tracker)
+        self.target_source.targets_updated_callback = self.targets_updated
+        self.target_source.start()
 
     
+    def targets_updated(self, targets):
+        try:
+            self.tracker.update_targets(targets)
+
+            self.after(0, self.update_gui)
+        except RuntimeError:
+          # to catch "main thread is not in main loop" on shutdown
+           pass
+
     def update_gui(self):
-        targets = self.connection_source.get_targets()
+        target_map = self.target_source.get_target_map()
+        targets = list(target_map.values())
 
         targets.sort(key = (lambda target : target.score), reverse = True)
 
@@ -69,6 +79,11 @@ class TargetsFrame(tk.Frame):
         except:
             # the old target may have gone away... this is lame, but not worth fixing since eventually we'll have a map and remember targets
             pass
+
+        selected_urls = self.targets_treeview.selection()
+        if len(selected_urls) is 1:
+            self.tracker.set_target(target_map[selected_urls[0]])
+
 
     def set_text(self, widget, text):
         # omfg why is this hard

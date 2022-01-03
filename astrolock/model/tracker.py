@@ -29,6 +29,7 @@ class Tracker(object):
         self.rates = np.zeros(2)
         self.tracker_input = TrackerInput()
         self.smooth_input_mag = 0.0
+        self.target = None
     
     def get_recommended_connection_urls(self):
         with self.lock:
@@ -71,7 +72,20 @@ class Tracker(object):
             if self.primary_telescope_connection is not None:
                 self.primary_telescope_connection.set_axis_rate(0, rates[0])
                 self.primary_telescope_connection.set_axis_rate(1, rates[1])
-            
+
+    def set_target(self, new_target):
+        with self.lock:
+            if new_target is None:
+                self.target = None
+            elif self.target is not None and self.target.url == new_target.url:
+                self.target = self.target.updated_with(new_target)
+            else:
+                self.target = new_target
+
+    def update_targets(self, target_map): 
+        with self.lock:
+            if self.target is not None and self.target.url in target_map:
+                self.target = self.target.updated_with(target_map[self.target.url])
 
     def get_rates(self):
         with self.lock:

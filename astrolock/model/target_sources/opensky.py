@@ -20,12 +20,12 @@ class OpenSkyTargetSource(target_source.TargetSource):
         self.want_to_stop = True
         self.query_range = 20 * u.km
         self.api_url = "https://opensky-network.org/api"
-        self.targets = []
+        self.target_map = {}
         self.tracker = tracker
 
-        
-    def get_targets(self):
-        return self.targets
+    # maps urls to  targets    
+    def get_target_map(self):
+        return self.target_map
 
     def loop(self):
         while not self.want_to_stop:
@@ -36,7 +36,7 @@ class OpenSkyTargetSource(target_source.TargetSource):
                 lat = self.tracker.location_ap.lat
                 lon = self.tracker.location_ap.lon
                 # todo: international date line and north/south pole bugs...
-                earth_circumference = astropy.constants.R_earth * 2.0 * math.pi;
+                earth_circumference = astropy.constants.R_earth * 2.0 * math.pi
                 lat_range = self.query_range * (360.0 * u.deg / earth_circumference)
                 lon_range = lat_range / np.cos(lat)
                 params['lamin'] = (lat - lat_range).to_value(u.deg)
@@ -46,7 +46,12 @@ class OpenSkyTargetSource(target_source.TargetSource):
 
             r = requests.get(url, params = params, timeout = 15)
             if r.status_code == 200:
-                self.targets = self.json_to_targets(r.json())                
+                self.target_map = self.json_to_target_map(r.json())
+                if self.targets_updated_callback is not None:
+                    self.targets_updated_callback(self.target_map)
+            # with no login, can't query more often than this
+            # todo: support authentication
+            # todo: sleep longer to tweak phase to try and reduce latency to target of interest                
             time.sleep(10)
 
     def start(self):
@@ -64,7 +69,7 @@ class OpenSkyTargetSource(target_source.TargetSource):
             "velocity", "heading", "vertical_rate", "sensors",
             "geo_altitude", "squawk", "spi", "position_source"]
 
-    def json_to_targets(self, json):
+    def json_to_target_map(self, json):
         targets = []
 
         json_states = json["states"] or []
@@ -201,6 +206,11 @@ class OpenSkyTargetSource(target_source.TargetSource):
             target.score = scores[target_index]
             for column in display_columns.keys():
                 target.display_columns[column] = display_columns[column][target_index]
-        return targets
+
+        target_map = {}
+        for target in targets:
+            target_map[target.url] = target
+
+        return target_map
         
 
