@@ -25,7 +25,7 @@ class TargetsFrame(tk.Frame):
         self.tracker.location_sfa = skyfield.api.wgs84.latlon(latitude_degrees = [37.510839], longitude_degrees = [-122.272036], elevation_m = [64])
 
         self.targets_treeview = ttk.Treeview(self, show = 'headings')
-        self.targets_treeview['columns'] = ('callsign', 'url', 'latitude', 'longitude', 'altitude', 'azimuth', 'distance')
+        self.targets_treeview['columns'] = ('callsign', 'url', 'latitude', 'longitude', 'altitude', 'azimuth', 'distance', 'age')
         self.targets_treeview.heading('callsign', text = 'Callsign')
         self.targets_treeview.heading('url', text = 'URL')
         self.targets_treeview.heading('latitude', text = 'Latitude')
@@ -33,6 +33,7 @@ class TargetsFrame(tk.Frame):
         self.targets_treeview.heading('altitude', text = 'Altitude')
         self.targets_treeview.heading('azimuth', text = 'Azimuth')
         self.targets_treeview.heading('distance', text = 'Distance')
+        self.targets_treeview.heading('age', text = 'Age')
         self.targets_treeview.pack(side = 'left', fill = 'both', expand = True)
         self.targets_treeview_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.targets_treeview.yview)
         self.targets_treeview_scrollbar.pack(side='right', fill='y')
@@ -66,6 +67,8 @@ class TargetsFrame(tk.Frame):
         # it's insane that this is the best way... seems O(n^2)
         self.targets_treeview.delete(*self.targets_treeview.get_children())
 
+        ap_now = astropy.time.Time.now()
+
         for target in targets:
             values = (target.display_name, target.url)
             self.targets_treeview.insert(parent = '', index = 'end', iid = target.url, values = values)
@@ -73,6 +76,9 @@ class TargetsFrame(tk.Frame):
             for column in self.targets_treeview['columns']:
                 if column in target.display_columns:
                     self.targets_treeview.set(item = target.url, column = column, value = target.display_columns[column])
+
+            age = ap_now - target.last_known_location_time
+            self.targets_treeview.set(item = target.url, column = 'age', value = age.to_value(u.s))
 
         try:
             self.targets_treeview.selection_set(old_selection)

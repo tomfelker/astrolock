@@ -44,11 +44,15 @@ class OpenSkyTargetSource(target_source.TargetSource):
                 params['lomin'] = (lon - lon_range).to_value(u.deg)
                 params['lomax'] = (lon + lon_range).to_value(u.deg)
 
-            r = requests.get(url, params = params, timeout = 15)
-            if r.status_code == 200:
-                self.target_map = self.json_to_target_map(r.json())
-                if self.targets_updated_callback is not None:
-                    self.targets_updated_callback(self.target_map)
+            try:
+                r = requests.get(url, params = params, timeout = 15)
+                if r.status_code == 200:
+                    self.target_map = self.json_to_target_map(r.json())
+                    if self.targets_updated_callback is not None:
+                        self.targets_updated_callback(self.target_map)
+            except requests.ConnectTimeout as e:
+                print(f'OpenSky timed out: {e}')
+                time.sleep(30)
             # with no login, can't query more often than this
             # todo: support authentication
             # todo: sleep longer to tweak phase to try and reduce latency to target of interest                
@@ -106,10 +110,12 @@ class OpenSkyTargetSource(target_source.TargetSource):
         latitudes_deg = np.zeros(len(targets))
         longitudes_deg = np.zeros(len(targets))
         altitudes_m = np.zeros(len(targets))
+        times_unix = np.zeros(len(targets))
         for target_index, target in enumerate(targets):
             latitudes_deg[target_index] = target.latitude_deg
             longitudes_deg[target_index] = target.longitude_deg
             altitudes_m[target_index] = target.altitude_m
+            times_unix[target_index] = target.skyvector_props['time_position']
 
         print(f'Astropy processing {len(targets)} targets')
         start_perf_counter = time.perf_counter()
@@ -117,7 +123,7 @@ class OpenSkyTargetSource(target_source.TargetSource):
         # astropy, with direct model
         if True:
             last_known_locations = astropy.coordinates.EarthLocation.from_geodetic(lon = longitudes_deg * u.deg, lat = latitudes_deg * u.deg, height = altitudes_m * u.m)
-            
+
             # really shouldn't need to specify a time here, but astropy will crash if we don't - presumably it's trying to transform through a solar system barycentric frame
             tracker_altaz = astropy.coordinates.AltAz(location = self.tracker.location_ap, obstime = 'J2000')
 
@@ -128,6 +134,9 @@ class OpenSkyTargetSource(target_source.TargetSource):
             # even that's still 5ish ms
 
             last_known_locations_itrs = last_known_locations.itrs
+
+            times = astropy.time.Time(times_unix, format = 'unix')
+
             altazs_from_tracker = astrolock.model.astropy_util.itrs_to_altaz_direct(last_known_locations_itrs, tracker_altaz)
             
             scores = altazs_from_tracker.alt.to_value(u.deg)
@@ -200,9 +209,10 @@ class OpenSkyTargetSource(target_source.TargetSource):
         print(f'took {(time.perf_counter() - start_perf_counter) * 1e3} ms')
 
         for target_index, target in enumerate(targets):
-            #target.last_known_location = last_known_locations[target_index]
-            #target.last_known_location_itrs = last_known_locations_itrs[target_index]
-            #target.altaz_from_tracker = altazs_from_tracker[target_index]
+            target.last_known_location = last_known_locations[target_index]
+            target.last_known_location_itrs = last_known_locations_itrs[target_index]
+            target.altaz_from_tracker = altazs_from_tracker[target_index]
+            target.last_known_location_time = times[target_index]
             target.score = scores[target_index]
             for column in display_columns.keys():
                 target.display_columns[column] = display_columns[column][target_index]
