@@ -1,6 +1,7 @@
 import requests
 import time
 import astropy.units as u
+import astropy.time
 import math
 
 
@@ -38,6 +39,8 @@ class StellariumConnection(threaded.ThreadedConnection):
                 az_rad = math.atan2(terrestrial_dir_vec[1], -terrestrial_dir_vec[0])
                 self.axis_angles[0] = az_rad * u.rad
                 self.axis_angles[1] = alt_rad * u.rad
+                self.axis_angles_measurement_time[0] = astropy.time.Time.now()
+                self.axis_angles_measurement_time[1] = astropy.time.Time.now()
 
                 # now we will set our rates, which requires knowing the FOV
 

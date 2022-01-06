@@ -1,4 +1,5 @@
 import astropy.units as u
+import astropy.time
 import numpy as np
 
 class TelescopeConnection(object):
@@ -9,6 +10,7 @@ class TelescopeConnection(object):
         self.url = url
         self.url_path = url[len(self.__class__.get_url_scheme()):]
         self.axis_angles = np.zeros(2) * u.rad
+        self.axis_angles_measurement_time = astropy.time.Time(np.zeros(2), format = 'unix')
         self.desired_axis_rates = np.zeros(2) * u.rad / u.s
 
 

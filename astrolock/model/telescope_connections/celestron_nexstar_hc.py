@@ -1,6 +1,7 @@
 import serial
 import serial.tools.list_ports
 import astropy.units as u
+import astropy.time
 import math
 
 import astrolock.model.telescope_connections.com_port
@@ -25,8 +26,10 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
                 self.desired_axis_rates = self.tracker.get_rates()
                 self._serial_send_axis_rate_cmd(1, self.desired_axis_rates[1].to_value(u.arcsec / u.s))
                 self.axis_angles[0] = self._serial_read_axis_position_radians(0) * u.rad
+                self.axis_angles_measurement_time[0] = astropy.time.Time.now()
                 self.tracker.update_gui_callback()
                 self.axis_angles[1] = self._serial_read_axis_position_radians(1) * u.rad
+                self.axis_angles_measurement_time[1] = astropy.time.Time.now()
                 self.tracker.update_gui_callback()
                 
 
