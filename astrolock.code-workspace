@@ -14,6 +14,13 @@
 				"request": "launch",
 				"module": "astrolock",
 				"justMyCode": false
+			},
+			{
+				"name": "Test script",
+				"type": "python",
+				"request": "launch",
+				"program": "astropy_test.py",
+				"justMyCode": false
 			}
 		]
 	}
