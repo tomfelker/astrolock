@@ -1,32 +1,21 @@
-import astropy.coordinates
-#from astropy.coordinates import frame_transform_graph
-import numpy as np
 
-import astropy.units as u
-import time
+import skyfield
+import skyfield.api
 
-home = astropy.coordinates.EarthLocation.from_geodetic(lat = "37d30'39.02\"", lon = "-122d16'19.33\"", height = 64)
-obj = astropy.coordinates.EarthLocation.from_geodetic(lat = 37.45, lon = -122.32, height = 60000 * u.imperial.ft)
+ts = skyfield.api.load.timescale()
+t = ts.J2000
+planets = skyfield.api.load('de440s.bsp')
+earth = planets['earth']
 
-reference_obj_altaz = obj.itrs.transform_to(astropy.coordinates.AltAz(location = home, obstime = 'J2000'))
-print(f"reference_obj_altaz{reference_obj_altaz}")
+obj_geodetic = skyfield.api.wgs84.latlon(52, -1, elevation_m = 1000)
+obj_geometric = earth + obj_geodetic
 
-# this will fix it
-import astrolock.model.astropy_util
+home_geodetic = skyfield.api.wgs84.latlon(52, -1, elevation_m = 0)
+home_geometric = earth + home_geodetic
 
-#astropy.coordinates.TransformGraph().add_transform(astropy.coordinates.ITRS, astropy.coordinates.AltAz, itrs_to_altaz)
+home_astrometric = home_geometric.at(t)
+obj_topocentric = home_astrometric.observe(obj_geometric)
+obj_apparent = obj_topocentric.apparent()
+obj_altaz = obj_apparent.altaz()
 
-start_time_ns = time.monotonic_ns()
-
-# crashes: AttributeError: 'NoneType' object has no attribute 'scale'
-#obj_altaz = obj.itrs.transform_to(astropy.coordinates.AltAz(location = home))
-
-# 500 ms
-obj_altaz = obj.itrs.transform_to(astropy.coordinates.AltAz(location = home, obstime = 'J2000'))
-            
-
-#obj_altaz = obj.transform_to(home)
-
-elapsed_ns = time.monotonic_ns() - start_time_ns
-print(f"took {elapsed_ns * 1e-6} ms")
-print(f"obj_altaz: {obj_altaz}")
+print(obj_altaz)
