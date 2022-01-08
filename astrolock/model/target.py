@@ -1,6 +1,7 @@
 import astrolock.model.astropy_util
 import astropy.coordinates
 import astropy.units as u
+import astropy.units.imperial
 import numpy as np
 
 class Target:
@@ -15,6 +16,15 @@ class Target:
         self.prev_target = None
         self.score = -float('inf')
         self.display_columns = {}
+
+    def get_status(self):
+        return (
+            f'\t{self.display_name}\n'
+            f'\t{self.url}\n'
+            f'\textrapolated speed: {self.extrapolated_velocity_itrs.norm().to(u.imperial.kt) if self.extrapolated_velocity_itrs is not None else ""}\n'
+            f'\textrapolated accel: {self.extrapolated_acceleration_itrs.norm().to(u.m / (u.s * u.s)) if self.extrapolated_acceleration_itrs is not None else ""}\n'
+            f'\t\n'
+        )
 
     # callers will do  target = target.updated_with(new_target)
     def updated_with(self, new_target):

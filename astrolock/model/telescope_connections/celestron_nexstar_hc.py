@@ -31,6 +31,7 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
                 self.axis_angles[1] = self._serial_read_axis_position_radians(1) * u.rad
                 self.axis_angles_measurement_time[1] = astropy.time.Time.now()
                 self.tracker.update_gui_callback()
+                self.record_loop_rate()
                 
 
     # NOTE! Windows Prolific serial drivers suck, and will hang/BSOD if you call this from different threads - be careful

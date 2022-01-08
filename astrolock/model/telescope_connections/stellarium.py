@@ -31,6 +31,11 @@ class StellariumConnection(threaded.ThreadedConnection):
                 self.last_update_utc_str = status_json['time']['utc']
 
                 view = requests.get('http:' + self.url_path + '/api/main/view')
+                
+                measurement_time = astropy.time.Time.now()
+                self.axis_angles_measurement_time[0] = measurement_time
+                self.axis_angles_measurement_time[1] = measurement_time
+
                 view_json = view.json()
                 terrestrial_dir_str = view_json['altAz']
                 terrestrial_dir_vec_str = terrestrial_dir_str.strip('[]').split(',')
@@ -39,12 +44,10 @@ class StellariumConnection(threaded.ThreadedConnection):
                 az_rad = math.atan2(terrestrial_dir_vec[1], -terrestrial_dir_vec[0])
                 self.axis_angles[0] = az_rad * u.rad
                 self.axis_angles[1] = alt_rad * u.rad
-                self.axis_angles_measurement_time[0] = astropy.time.Time.now()
-                self.axis_angles_measurement_time[1] = astropy.time.Time.now()
-
+                
                 # now we will set our rates, which requires knowing the FOV
 
-                self.tracker.update_gui_callback()
+                #self.tracker.update_gui_callback()
                 self.desired_axis_rates = self.tracker.get_rates()
 
 
@@ -63,8 +66,9 @@ class StellariumConnection(threaded.ThreadedConnection):
 
                 requests.post('http:' + self.url_path + '/api/main/move', data = {'x': move_x, 'y': move_y}) 
 
-                self.tracker.update_gui_callback()
+                #self.tracker.update_gui_callback()
                 time.sleep(.1)
+                self.record_loop_rate()
             except ConnectionError:
                 self.want_to_stop = True
                 pass

@@ -59,11 +59,16 @@ class Tracker(object):
     def get_status(self):
         with self.lock:
             s = ""
-            s += "Input: \n"
+            s += "Input:\n"
             s += "\tRate:  " + str(self.tracker_input.rate) + "\n"
             s += "\tSlowdown: " + str(self.tracker_input.slowdown) + "\n"
             s += "\tSpeedup: " + str(self.tracker_input.speedup) + "\n"
             s += "Momentum: " + str(self.momentum) + "\n"
+            s += "Target:\n"
+            if self.target is not None:
+                s += self.target.get_status()
+            else:
+                s += "\tNo Target\n"
 
             if self.primary_telescope_connection:
                 s += "Connected to telescope at " + self.primary_telescope_connection.url + "\n"

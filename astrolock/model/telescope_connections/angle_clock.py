@@ -27,6 +27,7 @@ class AngleClockConnection(astrolock.model.telescope_connections.com_port.ComPor
             self.send_command(.1, .1, .1)
             self.update_callback()
             time.sleep(1)
+            self.record_loop_rate()
             
         self.update_callback()
 
