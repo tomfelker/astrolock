@@ -2,6 +2,7 @@ import astrolock.model.astropy_util
 import astropy.coordinates
 import astropy.units as u
 import astropy.units.imperial
+import astropy.time
 import numpy as np
 
 class Target:
@@ -16,6 +17,14 @@ class Target:
         self.prev_target = None
         self.score = -float('inf')
         self.display_columns = {}
+
+    @classmethod
+    def from_gps(cls, lat_deg, lon_deg, alt_m = 0):
+        ret = cls()
+        ret.last_known_location = astropy.coordinates.EarthLocation.from_geodetic(lon = lon_deg * u.deg, lat = lat_deg * u.deg, height = alt_m * u.m)
+        #todo: is this right with the craziness?
+        ret.last_known_location_itrs = ret.last_known_location.itrs
+        return ret
 
     def get_status(self):
         return (
@@ -45,7 +54,10 @@ class Target:
         return new_target
 
     def altaz_and_rates_at_time(self, tracker, time, dt = 1.0 * u.s, hack = True):
-        time_since_update = time - self.last_known_location_time
+        if self.last_known_location_time is not None:
+            time_since_update = time - self.last_known_location_time
+        else:
+            time_since_update = 0 * u.s
         location_itrs_at_time = self.last_known_location_itrs.cartesian
         
         if self.extrapolated_velocity_itrs is not None:

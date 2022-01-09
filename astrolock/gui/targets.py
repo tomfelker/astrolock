@@ -9,6 +9,7 @@ import skyfield
 import skyfield.api
 
 import astrolock.model.target_sources.opensky
+import astrolock.model.target_sources.kml
 import astrolock.model.astropy_util
 
 import time
@@ -23,6 +24,19 @@ class TargetsFrame(tk.Frame):
         self.tracker.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = 37.510839 * u.deg, lon = -122.272036 * u.deg, height = 64 * u.m)
         self.tracker.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = 37.510839, longitude_degrees = -122.272036, elevation_m = 64)
         self.tracker.location_sfa = skyfield.api.wgs84.latlon(latitude_degrees = [37.510839], longitude_degrees = [-122.272036], elevation_m = [64])
+
+        self.target_source = None
+
+        self.target_source_map = {
+            'OpenSky': astrolock.model.target_sources.opensky.OpenSkyTargetSource(self.tracker),
+            'KML': astrolock.model.target_sources.kml.KmlTargetSource(self.tracker)
+        }
+        self.selected_target_source_name = tk.StringVar()
+        self.selected_target_source_name.trace_add('write', self.selected_target_source_name_changed)
+        self.selected_target_source_name.set(next(iter(self.target_source_map)))
+
+        self.target_source_menu = tk.OptionMenu(self, self.selected_target_source_name, *list(self.target_source_map.keys()))
+        self.target_source_menu.pack()
 
         self.targets_treeview = ttk.Treeview(self, show = 'headings')
         self.targets_treeview['columns'] = ('callsign', 'url', 'latitude', 'longitude', 'altitude', 'azimuth', 'distance', 'age')
@@ -39,11 +53,24 @@ class TargetsFrame(tk.Frame):
         self.targets_treeview_scrollbar.pack(side='right', fill='y')
         self.targets_treeview.configure(yscrollcommand=self.targets_treeview_scrollbar.set)
 
-        self.target_source = astrolock.model.target_sources.opensky.OpenSkyTargetSource(self.tracker)
-        self.target_source.targets_updated_callback = self.targets_updated
-        self.target_source.start()
 
-    
+    def selected_target_source_name_changed(self, *args):
+        print(f'selected {self.selected_target_source_name}')
+        
+        old_target_source = self.target_source
+        new_target_source = self.target_source_map[self.selected_target_source_name.get()]
+        if old_target_source != new_target_source:
+            self.target_source = new_target_source
+
+            if old_target_source:
+                old_target_source.stop()
+                old_target_source.targets_updated_callback = None
+            
+            if new_target_source:
+                new_target_source.targets_updated_callback = self.targets_updated
+                new_target_source.start()
+
+
     def targets_updated(self, targets):
         try:
             self.tracker.update_targets(targets)
@@ -54,41 +81,44 @@ class TargetsFrame(tk.Frame):
            pass
 
     def update_gui(self):
-        target_map = self.target_source.get_target_map()
-        targets = list(target_map.values())
+        if self.target_source is not None:
+            target_map = self.target_source.get_target_map()
+        
+            targets = list(target_map.values())
 
-        targets.sort(key = (lambda target : target.score), reverse = True)
+            targets.sort(key = (lambda target : target.score), reverse = True)
 
-        #hax:
-        #targets = targets[0:5]
+            #hax:
+            #targets = targets[0:5]
 
-        old_selection = self.targets_treeview.selection()
+            old_selection = self.targets_treeview.selection()
 
-        # it's insane that this is the best way... seems O(n^2)
-        self.targets_treeview.delete(*self.targets_treeview.get_children())
+            # it's insane that this is the best way... seems O(n^2)
+            self.targets_treeview.delete(*self.targets_treeview.get_children())
 
-        ap_now = astropy.time.Time.now()
+            ap_now = astropy.time.Time.now()
 
-        for target in targets:
-            values = (target.display_name, target.url)
-            self.targets_treeview.insert(parent = '', index = 'end', iid = target.url, values = values)
+            for target in targets:
+                values = (target.display_name, target.url)
+                self.targets_treeview.insert(parent = '', index = 'end', iid = target.url, values = values)
 
-            for column in self.targets_treeview['columns']:
-                if column in target.display_columns:
-                    self.targets_treeview.set(item = target.url, column = column, value = target.display_columns[column])
+                for column in self.targets_treeview['columns']:
+                    if column in target.display_columns:
+                        self.targets_treeview.set(item = target.url, column = column, value = target.display_columns[column])
 
-            age = ap_now - target.last_known_location_time
-            self.targets_treeview.set(item = target.url, column = 'age', value = age.to_value(u.s))
+                if target.last_known_location_time is not None:
+                    age = ap_now - target.last_known_location_time
+                    self.targets_treeview.set(item = target.url, column = 'age', value = age.to_value(u.s))
 
-        try:
-            self.targets_treeview.selection_set(old_selection)
-        except:
-            # the old target may have gone away... this is lame, but not worth fixing since eventually we'll have a map and remember targets
-            pass
+            try:
+                self.targets_treeview.selection_set(old_selection)
+            except:
+                # the old target may have gone away... this is lame, but not worth fixing since eventually we'll have a map and remember targets
+                pass
 
-        selected_urls = self.targets_treeview.selection()
-        if len(selected_urls) is 1:
-            self.tracker.set_target(target_map[selected_urls[0]])
+            selected_urls = self.targets_treeview.selection()
+            if len(selected_urls) == 1:
+                self.tracker.set_target(target_map[selected_urls[0]])
 
 
     def set_text(self, widget, text):

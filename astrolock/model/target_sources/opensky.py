@@ -16,7 +16,7 @@ import astrolock.model.target
 # this is largely adapted from https://github.com/openskynetwork/opensky-api/blob/master/python/opensky_api.py
 
 class OpenSkyTargetSource(target_source.TargetSource):
-    def __init__(self, tracker = None):
+    def __init__(self, tracker):
         self.want_to_stop = True
         self.query_range = 20 * u.km
         self.api_url = "https://opensky-network.org/api"

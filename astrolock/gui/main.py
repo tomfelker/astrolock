@@ -3,6 +3,7 @@ import tkinter.ttk as ttk
 
 import astrolock.gui.status
 import astrolock.gui.time
+import astrolock.gui.alignment
 import astrolock.gui.input
 import astrolock.gui.targets
 import astrolock.model.tracker as tracker
@@ -25,12 +26,16 @@ class MainWindow(tk.Tk):
         self.time_tab = astrolock.gui.time.TimeFrame(notebook, tracker = self.tracker)
         self.time_tab.pack()
 
+        self.alignment_tab = astrolock.gui.alignment.AlignmentFrame(notebook, tracker = self.tracker)
+        self.alignment_tab.pack()
+
         self.targets_tab = astrolock.gui.targets.TargetsFrame(notebook, tracker = self.tracker)
         self.targets_tab.pack()
 
         notebook.add(self.status_tab, text = "Status")
         notebook.add(self.input_tab, text = "Input")
         notebook.add(self.time_tab, text = "Time")
+        notebook.add(self.alignment_tab, text = "Alignment")
         notebook.add(self.targets_tab, text = "Targets")
 
         notebook.pack(fill = tk.BOTH)
