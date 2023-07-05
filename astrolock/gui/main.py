@@ -14,6 +14,7 @@ class MainWindow(tk.Tk):
 
         self.tracker = tracker.Tracker()
         self.tracker.update_gui_callback = self.update_gui_from_tracker_threads
+        self.gui_update_timer_id = None
 
         notebook = ttk.Notebook(self)
 
@@ -46,18 +47,21 @@ class MainWindow(tk.Tk):
 
     # Trigger UI updates from the main (Tk) thread, for when the tracker is not running
     def ui_update_loop(self):
-        self.after(1000, self.ui_update_loop)
-        self.update_gui()
+        self.after(50, self.ui_update_loop)
+        self.update_gui_from_tracker_threads()
 
     # Called from the telescope connection threads when the status has changed, so we can show the newest info in the UI
     def update_gui_from_tracker_threads(self):
         try:
-            self.after(0, self.update_gui)
+            if self.gui_update_timer_id is not None:
+                self.after_cancel(self.gui_update_timer_id)
+            self.gui_update_timer_id = self.after_idle(self.update_gui)
+            #self.gui_update_timer_id = self.after(100, self.update_gui)
         except RuntimeError:
             # to catch "main thread is not in main loop" on shutdown
             pass
 
-    def update_gui(self):
+    def update_gui(self):        
         self.status_tab.update_gui()
         self.targets_tab.update_gui()
 

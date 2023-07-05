@@ -8,8 +8,7 @@ import astropy.units as u
 import skyfield
 import skyfield.api
 
-import astrolock.model.target_sources.opensky
-import astrolock.model.target_sources.kml
+
 import astrolock.model.astropy_util
 
 import time
@@ -19,24 +18,18 @@ class TargetsFrame(tk.Frame):
         tk.Frame.__init__(self, *args, **kwargs)
 
         self.tracker = tracker
-
-        # hax:
-        self.tracker.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = 37.510839 * u.deg, lon = -122.272036 * u.deg, height = 64 * u.m)
-        self.tracker.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = 37.510839, longitude_degrees = -122.272036, elevation_m = 64)
-        self.tracker.location_sfa = skyfield.api.wgs84.latlon(latitude_degrees = [37.510839], longitude_degrees = [-122.272036], elevation_m = [64])
-
+ 
         self.target_source = None
 
-        self.target_source_map = {
-            'OpenSky': astrolock.model.target_sources.opensky.OpenSkyTargetSource(self.tracker),
-            'KML': astrolock.model.target_sources.kml.KmlTargetSource(self.tracker)
-        }
         self.selected_target_source_name = tk.StringVar()
         self.selected_target_source_name.trace_add('write', self.selected_target_source_name_changed)
-        self.selected_target_source_name.set(next(iter(self.target_source_map)))
+        self.selected_target_source_name.set(next(iter(self.tracker.target_source_map)))
 
-        self.target_source_menu = tk.OptionMenu(self, self.selected_target_source_name, *list(self.target_source_map.keys()))
+        self.target_source_menu = tk.OptionMenu(self, self.selected_target_source_name, *list(self.tracker.target_source_map.keys()))
         self.target_source_menu.pack()
+
+        stop_tracking_button = tk.Button(self, text = "Stop Tracking", command = self.stop_tracking)
+        stop_tracking_button.pack()
 
         self.targets_treeview = ttk.Treeview(self, show = 'headings')
         self.targets_treeview['columns'] = ('callsign', 'url', 'latitude', 'longitude', 'altitude', 'azimuth', 'distance', 'age')
@@ -58,7 +51,7 @@ class TargetsFrame(tk.Frame):
         print(f'selected {self.selected_target_source_name}')
         
         old_target_source = self.target_source
-        new_target_source = self.target_source_map[self.selected_target_source_name.get()]
+        new_target_source = self.tracker.target_source_map[self.selected_target_source_name.get()]
         if old_target_source != new_target_source:
             self.target_source = new_target_source
 
@@ -74,8 +67,8 @@ class TargetsFrame(tk.Frame):
     def targets_updated(self, targets):
         try:
             self.tracker.update_targets(targets)
+            self.tracker.update_gui_callback()
 
-            self.after(0, self.update_gui)
         except RuntimeError:
           # to catch "main thread is not in main loop" on shutdown
            pass
@@ -128,3 +121,8 @@ class TargetsFrame(tk.Frame):
         widget.insert('1.0', text)
         widget.yview_moveto(scroll_first)
 
+    def stop_tracking(self):
+        for selected_item in self.targets_treeview.selection():
+            self.targets_treeview.selection_remove(selected_item)
+        self.tracker.set_target(None)
+        self.tracker.update_gui_callback()

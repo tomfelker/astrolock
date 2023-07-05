@@ -1,7 +1,12 @@
 from astrolock.model.telescope_connection import TelescopeConnection
 from astrolock.model.pid import PIDController
+import astrolock.model.target_sources.opensky
+import astrolock.model.target_sources.kml
+import astrolock.model.target_sources.skyfield
+
 from astropy import units as u
 import astropy.time
+import skyfield
 import time
 import numpy as np
 import threading
@@ -33,10 +38,25 @@ class Tracker(object):
         self.smooth_input_mag = 0.0
         self.target = None
 
+        self.target_source_map = {
+            'OpenSky': astrolock.model.target_sources.opensky.OpenSkyTargetSource(self),
+            'KML': astrolock.model.target_sources.kml.KmlTargetSource(self),
+            'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
+        }
+
         self.pid_controllers = []
         for i in range(2):
             pid_controller = PIDController()
             self.pid_controllers.append(pid_controller)
+
+        # todo: this should come from
+        # the hand controller of the telescope if available, or
+        # from the PC if there were any decent APIs for it, or
+        # the GUI, but for now, hardcode:
+        lat_deg, lon_deg, height_m = 37.51089, -122.2719388888889, 60
+        self.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = lat_deg * u.deg, lon = lon_deg * u.deg, height = height_m * u.m)
+        self.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = lat_deg, longitude_degrees = lon_deg, elevation_m = height_m)
+       
     
     def get_recommended_connection_urls(self):
         with self.lock:
@@ -79,9 +99,9 @@ class Tracker(object):
 
     def set_input(self, tracker_input):
         with self.lock:
-            self.tracker_input = tracker_input
-            rates = self._compute_rates(True)
+            self.tracker_input = tracker_input            
             if self.primary_telescope_connection is not None:
+                rates = self._compute_rates(True)
                 self.primary_telescope_connection.set_axis_rate(0, rates[0])
                 self.primary_telescope_connection.set_axis_rate(1, rates[1])
 
@@ -128,17 +148,18 @@ class Tracker(object):
         desired_axis_rates = altaz_rates
 
         rates = np.zeros(2)
-        for axis_index, pid_controller in enumerate(self.pid_controllers):            
-            control_rate = pid_controller.compute_control_rate(
-                desired_position = desired_axis_positions[axis_index],
-                desired_rate = desired_axis_rates[axis_index],
-                desired_time = now,
-                commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index],
-                measured_position = self.primary_telescope_connection.axis_angles[axis_index],
-                measured_position_time = self.primary_telescope_connection.axis_angles_measurement_time[axis_index],
-                store_state = store
-            ).to_value(u.deg / u.s)
-            rates[axis_index] = control_rate
+        if self.primary_telescope_connection is not None:
+            for axis_index, pid_controller in enumerate(self.pid_controllers):            
+                control_rate = pid_controller.compute_control_rate(
+                    desired_position = desired_axis_positions[axis_index],
+                    desired_rate = desired_axis_rates[axis_index],
+                    desired_time = now,
+                    commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index],
+                    measured_position = self.primary_telescope_connection.axis_angles[axis_index],
+                    measured_position_time = self.primary_telescope_connection.axis_angles_measurement_time[axis_index],
+                    store_state = store
+                ).to_value(u.deg / u.s)
+                rates[axis_index] = control_rate
         return rates
 
     def _compute_rates_momentum(self, dt, store):
@@ -164,7 +185,7 @@ class Tracker(object):
 
             if store:
                 self.momentum = momentum    
-                self.monotonic_time_ns_of_last_input = monotonic_time_ns
+                self.monotonic_time_ns_of_last_input = time.monotonic_ns()
 
             return rate
 

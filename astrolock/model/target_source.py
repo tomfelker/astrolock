@@ -3,6 +3,8 @@ class TargetSource:
         self.observer_location = None
         self.targets_updated_callback = None
         
+        self.use_for_alignment = False
+
     def get_target_map(self):
         raise NotImplementedError
 

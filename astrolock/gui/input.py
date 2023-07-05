@@ -52,19 +52,24 @@ class InputFrame(tk.Frame):
                 left_trigger = (joysticks[0].get_axis(5) + 1.0) / 2.0
                 
                 tracker_input = tracker.TrackerInput()
-                tracker_input.rate = self.apply_deadzone(left_stick) + self.apply_deadzone(right_stick)
+                tracker_input.rate = self.apply_deadzone(left_stick, power=2) + self.apply_deadzone(right_stick,power=4)*.1
                 tracker_input.slowdown = left_trigger
                 tracker_input.speedup = right_trigger
 
                 self.tracker.set_input(tracker_input)
-                self.tracker.update_gui_callback()
+                
+                #self.tracker.update_gui_callback()
 
-    def apply_deadzone(self, vec, deadzone = .1):
-        #todo, haha, whoops, accidental curve on input... maybe good?
-        mag = np.dot(vec, vec)
-        scale = 0
-        if mag > deadzone:
-            new_mag = (mag - deadzone) * (1 - deadzone)
-            scale = new_mag / mag
-        return vec * scale
+    def apply_deadzone(self, vec, deadzone = .1, power = 4):
+        mag = np.math.sqrt(np.dot(vec, vec))
+        if mag < deadzone:
+            return vec * 0
+        dir = vec / mag
+                
+        mag = (mag - deadzone) * (1 - deadzone)
+
+        # a big curve for easy fine adjustment
+        mag = pow(mag, power)
+
+        return dir * mag
 

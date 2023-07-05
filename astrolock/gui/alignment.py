@@ -3,6 +3,9 @@ import tkinter.ttk as ttk
 
 from astrolock.model.alignment import *
 
+import astropy
+from astropy import units as u
+
 class AlignmentFrame(tk.Frame):
     def __init__(self, *args, tracker, **kwargs):        
         tk.Frame.__init__(self, *args, **kwargs)
@@ -11,5 +14,87 @@ class AlignmentFrame(tk.Frame):
 
         label = tk.Label(self, text="Alignment")
         label.pack()
+
+        add_alignment_star_button = tk.Button(self, text = "Add Star", command = self.add_alignment_star)   
+        add_alignment_star_button.pack()
+
+        add_test_alignment_button = tk.Button(self, text = "Add Test Stars", command = self.add_test_alignments)   
+        add_test_alignment_button.pack()
+
+        self.alignment_data = []
+
+        self.alignment_data_treeview = ttk.Treeview(self, show = 'headings')
+        self.alignment_data_treeview['columns'] = ('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
+        self.alignment_data_treeview.heading('target_name', text = 'Target')
+        self.alignment_data_treeview.heading('target_url', text = 'URL')
+        self.alignment_data_treeview.heading('time', text = 'Time')
+        self.alignment_data_treeview.heading('raw_axis_0', text = 'Axis 0')
+        self.alignment_data_treeview.heading('raw_axis_1', text = 'Axis 1')        
+        self.alignment_data_treeview.pack(side = 'left', fill = 'both', expand = True)
+        self.alignment_data_treeview_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.alignment_data_treeview.yview)
+        self.alignment_data_treeview_scrollbar.pack(side='right', fill='y')
+        self.alignment_data_treeview.configure(yscrollcommand=self.alignment_data_treeview.set)
+
+
+    def add_alignment_star(self):
+        if self.tracker.primary_telescope_connection is None:
+            print("You need to connect to a telescope so we can tell where it's pointing.")
+            return
+        
+        estimated_current_axis_angles, current_time = self.tracker.primary_telescope_connection.get_estimated_axis_angles_and_time()
+        new_datum = AlignmentDatum(None, current_time, estimated_current_axis_angles)
+        print(repr(new_datum))
+        self.update_gui()
+
+    def add_test_alignments(self):
+        # these were captured while connected to Stellarium, but they differ in time similarly to how
+        # they would be if from a real telescope.
+        test_alignments = []
+
+        # Spica
+        # astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:01:44.365060>, <Quantity [2.61243707, 0.62959202] rad>)
+        test_alignments.append(AlignmentDatum(
+            None,
+            astropy.time.Time("2023-03-06 09:01:44.365060"),
+            [2.61243707, 0.62959202] * u.rad
+        ))
+
+        # Algorab
+        #astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:03:04.564831>, <Quantity [2.92833387, 0.61100651] rad>)
+        test_alignments.append(AlignmentDatum(
+            None,
+            astropy.time.Time("2023-03-06 09:03:04.564831"),
+            [2.92833387, 0.61100651] * u.rad
+        ))
+
+        # Arcturus
+        #astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:04:56.716076>, <Quantity [1.92051186, 0.93189984] rad>)
+        test_alignments.append(AlignmentDatum(
+            None,
+            astropy.time.Time("2023-03-06 09:04:56.716076"),
+            [1.92051186, 0.93189984] * u.rad
+        ))
+
+        self.alignment_data = test_alignments
+        self.update_gui()
+        
+
+    def update_gui(self):
+        # it's insane that this is the best way... seems O(n^2)
+        self.alignment_data_treeview.delete(*self.alignment_data_treeview.get_children())
+
+    
+        for alignment_datum in self.alignment_data:
+            
+            if alignment_datum.target is not None:
+                target_name = alignment_datum.target.name
+                target_url = alignment_datum.target.url
+            else:
+                target_name = '<unknown>'
+                target_url = ''
+
+            #('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
+            values = (target_name, target_url, str(alignment_datum.time), alignment_datum.raw_axis_values[0], alignment_datum.raw_axis_values[1])
+            self.alignment_data_treeview.insert(parent = '', index = 'end', iid = None, values = values)
 
 

@@ -53,7 +53,7 @@ class Target:
 
         return new_target
 
-    def altaz_and_rates_at_time(self, tracker, time, dt = 1.0 * u.s, hack = True):
+    def altaz_at_time(self, tracker, time):
         if self.last_known_location_time is not None:
             time_since_update = time - self.last_known_location_time
         else:
@@ -68,21 +68,26 @@ class Target:
 
         location_itrs_at_time = astropy.coordinates.ITRS(location_itrs_at_time)
 
+        obstime = astropy.time.Time('J2000')
+
         # todo: fix this...
         # really shouldn't need to specify a time here, but astropy will crash if we don't - presumably it's trying to transform through a solar system barycentric frame
         #todo: cache this
-        tracker_altaz = astropy.coordinates.AltAz(location = tracker.location_ap, obstime = 'J2000')
+        tracker_altaz = astropy.coordinates.AltAz(location = tracker.location_ap, obstime = obstime)
 
-        altaz = astrolock.model.astropy_util.itrs_to_altaz_direct(location_itrs_at_time, tracker_altaz)
+        #altaz = astrolock.model.astropy_util.itrs_to_altaz_direct(location_itrs_at_time, tracker_altaz)
+        altaz = astrolock.model.astropy_util.itrs_to_altaz_new_recommended(location_itrs_at_time, tracker_altaz, t=obstime)
+
+    def altaz_and_rates_at_time(self, tracker, time, dt = 1.0 * u.s):
         
-        rates = np.zeros(2) * u.deg / u.s
-        if hack:
-            future_altaz, dummy_rates = self.altaz_and_rates_at_time(tracker = tracker, time = time + dt, hack = False)
-            rates = [
-                (future_altaz.az - altaz.az).wrap_at(180 * u.deg) / dt,
-                (future_altaz.alt - altaz.alt).wrap_at(180 * u.deg) / dt
-            ]
-            
+        altaz = self.altaz_at_time(tracker, time)       
+
+        future_altaz = self.altaz_at_time(tracker=tracker, time=time + dt)
+        rates = [
+            (future_altaz.az - altaz.az).wrap_at(180 * u.deg) / dt,
+            (future_altaz.alt - altaz.alt).wrap_at(180 * u.deg) / dt
+        ]
+        
         return altaz, rates
                 
 

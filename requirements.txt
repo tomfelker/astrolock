@@ -1,5 +1,7 @@
-astropy
+astropy >= 5.2
 tkinter
 pygame
 requests
 pyserial
+skyfield
+

@@ -30,33 +30,55 @@ class OpenSkyTargetSource(target_source.TargetSource):
     def loop(self):
         while not self.want_to_stop:
             url = self.api_url + "/states/all"
-            params = {'time': 0}
+            params = {}
+            # this used to work, but now I'm getting old vectors that don't change?
+            # try again?
+            params['time']=0
+            # passing nothing for time also didn't work
+            # how about
+            #params['time'] = int(time.time())
 
-            if self.query_range > 0:
-                lat = self.tracker.location_ap.lat
-                lon = self.tracker.location_ap.lon
-                # todo: international date line and north/south pole bugs...
-                earth_circumference = astropy.constants.R_earth * 2.0 * math.pi
-                lat_range = self.query_range * (360.0 * u.deg / earth_circumference)
-                lon_range = lat_range / np.cos(lat)
-                params['lamin'] = (lat - lat_range).to_value(u.deg)
-                params['lamax'] = (lat + lat_range).to_value(u.deg)
-                params['lomin'] = (lon - lon_range).to_value(u.deg)
-                params['lomax'] = (lon + lon_range).to_value(u.deg)
+            sleep_time = 10
+            
+            lat = self.tracker.location_ap.lat
+            lon = self.tracker.location_ap.lon
+            # todo: international date line and north/south pole bugs...
+            earth_circumference = astropy.constants.R_earth * 2.0 * math.pi
+            lat_range = self.query_range * (360.0 * u.deg / earth_circumference)
+            lon_range = lat_range / np.cos(lat)
+            params['lamin'] = (lat - lat_range).to_value(u.deg)
+            params['lamax'] = (lat + lat_range).to_value(u.deg)
+            params['lomin'] = (lon - lon_range).to_value(u.deg)
+            params['lomax'] = (lon + lon_range).to_value(u.deg)
 
             try:
-                r = requests.get(url, params = params, timeout = 15)
+                r = requests.get(url, params = params, timeout = 15, headers={
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache"
+                })
                 if r.status_code == 200:
                     self.target_map = self.json_to_target_map(r.json())
                     if self.targets_updated_callback is not None:
                         self.targets_updated_callback(self.target_map)
-            except requests.ConnectTimeout as e:
+                    try:
+                        print(f"Opensky credits: {r.headers['X-Rate-Limit-Remaining']}")
+                    except:
+                        pass
+                else:
+                    print(f'OpenSky API status {r.status_code}: {r.content}, {str(r.headers)}')
+                    sleep_time = 30
+                    try:
+                        sleep_time += int(r.headers['X-Rate-Limit-Retry-After-Seconds'])
+                    except:
+                        pass
+                    print(f'Pausing OpenSky requests for {sleep_time} s.')
+            except (requests.ConnectTimeout, requests.exceptions.ReadTimeout) as e:
                 print(f'OpenSky timed out: {e}')
-                time.sleep(30)
+                sleep_time = 30
             # with no login, can't query more often than this
             # todo: support authentication
             # todo: sleep longer to tweak phase to try and reduce latency to target of interest                
-            time.sleep(10)
+            time.sleep(sleep_time)
 
     def start(self):
         self.want_to_stop = False
@@ -81,29 +103,30 @@ class OpenSkyTargetSource(target_source.TargetSource):
         print(f'Parsing {len(json_states)} targets')
         start_perf_counter = time.perf_counter()
 
-        for state_vector_array in json["states"]:
-            props = dict(zip(self.json_keys, state_vector_array))
-            # can't do much if it doesn't at least have these...
-            if props['latitude'] is not None and props['longitude'] is not None:
-                new_target = astrolock.model.target.Target()
-                new_target.display_name = props["callsign"]
-                new_target.url = 'astrolock://skyvector/icao24/' + props['icao24']
-                new_target.skyvector_props = props
+        if json["states"] is not None:
+            for state_vector_array in json["states"]:
+                props = dict(zip(self.json_keys, state_vector_array))
+                # can't do much if it doesn't at least have these...
+                if props['latitude'] is not None and props['longitude'] is not None:
+                    new_target = astrolock.model.target.Target()
+                    new_target.display_name = props["callsign"]
+                    new_target.url = 'astrolock://skyvector/icao24/' + props['icao24']
+                    new_target.skyvector_props = props
 
-                new_target.latitude_deg = float(props['latitude'])
-                new_target.longitude_deg = float(props['longitude'])
-                new_target.altitude_m = 0
-                if props['geo_altitude'] is not None:
-                    new_target.altitude_m = float(props['geo_altitude']) 
-                if props['baro_altitude'] is not None:
-                    new_target.altitude_m = float(props['baro_altitude']) 
+                    new_target.latitude_deg = float(props['latitude'])
+                    new_target.longitude_deg = float(props['longitude'])
+                    new_target.altitude_m = 0
+                    if props['geo_altitude'] is not None:
+                        new_target.altitude_m = float(props['geo_altitude']) 
+                    if props['baro_altitude'] is not None:
+                        new_target.altitude_m = float(props['baro_altitude']) 
 
-                # want this, but it's too slow to do one-by-one                
-                #new_target.location = astropy.coordinates.EarthLocation.from_geodetic(lon = new_target.longitudes_deg * u.deg, lat = new_target.latitudes_deg * u.deg, height = new_target.altitudes_m * u.m)
-                # so we'll do it below in a big array
+                    # want this, but it's too slow to do one-by-one                
+                    #new_target.location = astropy.coordinates.EarthLocation.from_geodetic(lon = new_target.longitudes_deg * u.deg, lat = new_target.latitudes_deg * u.deg, height = new_target.altitudes_m * u.m)
+                    # so we'll do it below in a big array
 
-                targets.append(new_target)
-        
+                    targets.append(new_target)
+            
         print(f'took {(time.perf_counter() - start_perf_counter) * 1e3} ms')
         
         # doing this in one big array for performance reasons

@@ -15,6 +15,12 @@ class TelescopeConnection(object):
         self.axis_angles_measurement_time = astropy.time.Time(np.zeros(2), format = 'unix')
         self.desired_axis_rates = np.zeros(2) * u.rad / u.s
         
+        # could be false if you're using a radio telescope,
+        # or Stellarium, which can't tell us the current angles _without_ refaction, so we need to turn it off
+        self.want_atmospheric_refaction = True
+        # it'd be neat if the hand controller could tell us...
+        self.current_temperature_C = 10.0
+
         # state for record_loop_rate()
         self.last_loop_performance_time_ns = None
         self.loop_time_s = 0
@@ -77,5 +83,12 @@ class TelescopeConnection(object):
 
     def set_axis_rate(self, axis, angular_rate_deg_per_s):
         self.desired_axis_rates[axis] = angular_rate_deg_per_s * (u.deg / u.s)
+        
+    def get_estimated_axis_angles_and_time(self):
+        current_time = astropy.time.Time.now()
+        times_since_measurement = current_time - self.axis_angles_measurement_time
+        estimated_current_axis_angles = self.axis_angles + self.desired_axis_rates * times_since_measurement
+        return estimated_current_axis_angles, current_time
+
 
 from astrolock.model.telescope_connections import *

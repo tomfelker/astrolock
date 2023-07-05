@@ -18,6 +18,9 @@ class StellariumConnection(threaded.ThreadedConnection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # this API can't easily tell us the AltAz without refraction, so we'll just have to turn off refraction in the GUI
+        # and request refraction not be used when giving us coordinates
+        self.want_atmospheric_refaction = False
 
     def loop(self):
         while not self.want_to_stop:
@@ -30,7 +33,7 @@ class StellariumConnection(threaded.ThreadedConnection):
 
                 self.last_update_utc_str = status_json['time']['utc']
 
-                view = requests.get('http:' + self.url_path + '/api/main/view')
+                view = requests.get('http:' + self.url_path + '/api/main/view?ref=on')
                 
                 measurement_time = astropy.time.Time.now()
                 self.axis_angles_measurement_time[0] = measurement_time
