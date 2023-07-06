@@ -74,24 +74,32 @@ Algorithm:
 
 
 """
-
-def dirs_to_mutual_angles(dirs):
-    dirs = dirs / torch.linalg.norm(dirs, dim=-1, keepdims=True)
+def dirs_to_mutual_angles(dirs, as_matrix = False):
+    """
+    Given a list of directions, returns a list the angles (in radians) between each pair of directions.
+    """
     num_dims = dirs.shape[-1]
     num_dirs = dirs.shape[-2]
-    dir_indices = torch.arange(0, num_dirs)
-    dir_indices_pairs = torch.cartesian_prod(dir_indices, dir_indices)
-    from_indices = dir_indices_pairs[:, 0]
-    to_indices = dir_indices_pairs[:, 1]
-    num_indices = num_dirs * num_dirs
+
+    # TODO: this normalize could move higher in the call tree
+    dirs = dirs / torch.linalg.norm(dirs, dim=-1, keepdims=True)
+
+    dir_indices = torch.tril_indices(num_dirs, num_dirs, offset=-1)
+    from_indices = dir_indices[0, :]
+    to_indices = dir_indices[1, :]
+    num_indices = dir_indices.shape[-1]
     from_indices = from_indices.reshape(num_indices, 1).expand(num_indices, num_dims)
     to_indices = to_indices.reshape(num_indices, 1).expand(num_indices, num_dims)
+
     from_dirs = torch.gather(dirs, -2, from_indices)
     to_dirs = torch.gather(dirs, -2, to_indices)
+
     dots = torch.linalg.vecdot(from_dirs, to_dirs, dim=-1)
     angles = torch.acos(torch.clamp(dots, -1.0, 1.0))
-    angles = angles.reshape(num_dirs, num_dirs)
+
     return angles
+
+
 
 def score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, time_to_target):
     num_assigned_targets = len(time_to_target)
@@ -107,7 +115,7 @@ def score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, 
     time_to_predicted_angles = dirs_to_mutual_angles(time_to_predicted_dir)
     time_to_observed_angles = dirs_to_mutual_angles(time_to_observed_dir[0:num_assigned_targets, :])
 
-    error = torch.square(time_to_predicted_angles - time_to_observed_angles).mean().sqrt()
+    error = (time_to_predicted_angles - time_to_observed_angles).square().mean().sqrt()
 
     print(f"Tried {time_to_target}, error {error}")
 
@@ -126,12 +134,14 @@ def rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_
             new_error = score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, new_time_to_target)
             incremental_time_to_target_and_error_pairs.append((new_time_to_target, new_error))
 
-        # we have to try all initial pairs, but after that, though, we can take only the top ones so far.
+        # We have to try all initial pairs, but after that, I think we can take only the top ones so far.
+        # Not sure how many - taking num_observations feels right, but I don't have a rigorous proof.
+        # In practice, fewer would probably be okay, especially for high numbers of observations.
         if num_known_targets > 1:
             incremental_time_to_target_and_error_pairs = sorted(incremental_time_to_target_and_error_pairs, key = lambda pair: pair[1])
             incremental_time_to_target_and_error_pairs = incremental_time_to_target_and_error_pairs[0:num_observations]
 
-        print(f"Best few so far is {incremental_time_to_target_and_error_pairs}")
+        print(f"Best few so far are {incremental_time_to_target_and_error_pairs}")
 
         full_time_to_target_and_error_pairs = []
         for partial_time_to_target, partial_error in incremental_time_to_target_and_error_pairs:
