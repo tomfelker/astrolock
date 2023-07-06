@@ -1,3 +1,5 @@
+import math
+import random
 import tkinter as tk
 import tkinter.ttk as ttk
 
@@ -20,6 +22,9 @@ class AlignmentFrame(tk.Frame):
 
         add_test_alignment_button = tk.Button(self, text = "Add Test Stars", command = self.add_test_alignments)   
         add_test_alignment_button.pack()
+
+        align_button =  tk.Button(self, text = "align", command = self.align)
+        align_button.pack()
 
         self.alignment_data = []
 
@@ -50,7 +55,7 @@ class AlignmentFrame(tk.Frame):
         # these were captured while connected to Stellarium, but they differ in time similarly to how
         # they would be if from a real telescope.
         test_alignments = []
-
+        
         # Spica
         # astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:01:44.365060>, <Quantity [2.61243707, 0.62959202] rad>)
         test_alignments.append(AlignmentDatum(
@@ -75,6 +80,11 @@ class AlignmentFrame(tk.Frame):
             [1.92051186, 0.93189984] * u.rad
         ))
 
+        test_stepper_offsets = [random.random() * 2.0 * math.pi, random.random() * 2.0 * math.pi] * u.rad
+        for alignment in test_alignments:
+            alignment.raw_axis_values += test_stepper_offsets
+            alignment.ground_truth_stepper_offset = test_stepper_offsets
+
         self.alignment_data = test_alignments
         self.update_gui()
         
@@ -97,4 +107,5 @@ class AlignmentFrame(tk.Frame):
             values = (target_name, target_url, str(alignment_datum.time), alignment_datum.raw_axis_values[0], alignment_datum.raw_axis_values[1])
             self.alignment_data_treeview.insert(parent = '', index = 'end', iid = None, values = values)
 
-
+    def align(self):
+        pass

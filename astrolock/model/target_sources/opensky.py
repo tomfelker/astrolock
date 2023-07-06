@@ -33,10 +33,10 @@ class OpenSkyTargetSource(target_source.TargetSource):
             params = {}
             # this used to work, but now I'm getting old vectors that don't change?
             # try again?
-            params['time']=0
+            #params['time']=0
             # passing nothing for time also didn't work
             # how about
-            #params['time'] = int(time.time())
+            params['time'] = int(time.time())
 
             sleep_time = 10
             

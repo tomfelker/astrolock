@@ -1,2 +1,4 @@
 **/__pycache__/**
 **/*.bsp
+.vs/**
+hip_main.dat

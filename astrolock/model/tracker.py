@@ -39,9 +39,9 @@ class Tracker(object):
         self.target = None
 
         self.target_source_map = {
+            'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
             'OpenSky': astrolock.model.target_sources.opensky.OpenSkyTargetSource(self),
             'KML': astrolock.model.target_sources.kml.KmlTargetSource(self),
-            'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
         }
 
         self.pid_controllers = []

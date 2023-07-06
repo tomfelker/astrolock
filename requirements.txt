@@ -4,4 +4,6 @@ pygame
 requests
 pyserial
 skyfield
+torch
+
 
