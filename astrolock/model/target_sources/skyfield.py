@@ -42,6 +42,8 @@ class SkyfieldTargetSource(target_source.TargetSource):
         super().__init__()
         self.target_map = {}
         self.tracker = tracker
+        self.use_for_alignment = True
+        self.started = False
 
     def start(self):
         self.load_targets()

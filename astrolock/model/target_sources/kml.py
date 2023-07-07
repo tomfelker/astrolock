@@ -14,8 +14,11 @@ class KmlTargetSource(target_source.TargetSource):
     }
 
     def __init__(self, tracker):
+        super().__init__()
         self.target_map = {}
         self.tracker = tracker
+
+        self.use_for_alignment = True
 
         self.filename = os.path.join('data', 'alignment_landmarks.kmz')
 

@@ -78,6 +78,8 @@ class Target:
         #altaz = astrolock.model.astropy_util.itrs_to_altaz_direct(location_itrs_at_time, tracker_altaz)
         altaz = astrolock.model.astropy_util.itrs_to_altaz_new_recommended(location_itrs_at_time, tracker_altaz, t=obstime)
 
+        return altaz
+
     def altaz_and_rates_at_time(self, tracker, time, dt = 1.0 * u.s):
         
         altaz = self.altaz_at_time(tracker, time)       

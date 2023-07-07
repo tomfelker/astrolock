@@ -3,7 +3,8 @@ import random
 import tkinter as tk
 import tkinter.ttk as ttk
 
-from astrolock.model.alignment import *
+import astrolock.model.alignment
+from astrolock.model.alignment import AlignmentDatum
 
 import astropy
 from astropy import units as u
@@ -108,4 +109,23 @@ class AlignmentFrame(tk.Frame):
             self.alignment_data_treeview.insert(parent = '', index = 'end', iid = None, values = values)
 
     def align(self):
-        pass
+        if len(self.alignment_data) is 0:
+            print("Can't align without any alignment data.")
+            return
+
+        targets = []
+        for target_source in self.tracker.target_source_map.values():
+            if target_source.use_for_alignment:
+                target_source.start()
+                target_map = target_source.get_target_map()
+                for target in target_map.values():
+                    targets.append(target)
+        
+        if len(targets) is 0:
+            print("Couldn't find any targets to align to.")
+            return
+
+        targetnames = '\n\t'.join(map((lambda t: t.display_name), targets))
+        print(f"Aligning with { len(targets) } targets:\n{targetnames}")
+
+        astrolock.model.alignment.align(self.tracker, self.alignment_data, targets)

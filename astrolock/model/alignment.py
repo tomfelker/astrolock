@@ -1,7 +1,12 @@
+import math
 import astropy.units as u
 import torch
 
 class AlignmentDatum:
+    """
+    The user will point the telescope at a star and click a button to collect these data.  Given a few of them, we can align the telescope.
+    """
+
     def __init__(self, target, time, raw_axis_values):
         self.target = target
         self.time = time
@@ -12,8 +17,7 @@ class AlignmentDatum:
     
 
 """
-Okay so how to do this?  Probably gonna use Tensorflow to paper over my lack of calculus knowledge...
-
+Okay so how to do this?
 
 What are the variables?
 
@@ -22,6 +26,7 @@ What are the variables?
     - axis misalignments (2 numbers, can assume zeros if telescope didn't fall off back of truck)
     - incorrect lattitude / longitude (2 numbers - for distant targets, degenerate with roll and pitch of azimuth axis)
     - incorrect time (1 number - for distant targets, degenerate with roll of azimuth)
+    - various fudge factors for mirror flop, 
 
 What should be possible?
 - 1 datum for a known target: can get stepper offsets
@@ -117,7 +122,7 @@ def score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, 
 
     error = (time_to_predicted_angles - time_to_observed_angles).square().mean().sqrt()
 
-    print(f"Tried {time_to_target}, error {error}")
+    #print(f"Tried {time_to_target}, error {error}")
 
     return error
 
@@ -139,9 +144,10 @@ def rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_
         # In practice, fewer would probably be okay, especially for high numbers of observations.
         if num_known_targets > 1:
             incremental_time_to_target_and_error_pairs = sorted(incremental_time_to_target_and_error_pairs, key = lambda pair: pair[1])
-            incremental_time_to_target_and_error_pairs = incremental_time_to_target_and_error_pairs[0:num_observations]
+            to_take = 1 # num_observations
+            incremental_time_to_target_and_error_pairs = incremental_time_to_target_and_error_pairs[0:to_take]
 
-        print(f"Best few so far are {incremental_time_to_target_and_error_pairs}")
+        #print(f"Best few so far are {incremental_time_to_target_and_error_pairs}")
 
         full_time_to_target_and_error_pairs = []
         for partial_time_to_target, partial_error in incremental_time_to_target_and_error_pairs:
@@ -156,12 +162,97 @@ def rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_
         #return known_time_to_target, score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, known_time_to_target)
     
 
-def rough_align(target_time_to_dir, time_to_raw_axis_values, known_time_to_target = []):
-    num_targets, num_observations, num_spatial_dimensions = target_time_to_dir.shape
+def rough_align(target_time_to_predicted_dir, time_to_raw_axis_values, known_time_to_target = [], alt_steps = 360):
+    num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
     num_observations, num_raw_values = time_to_raw_axis_values.shape
 
-        
+    best_error = math.inf
+    best_time_to_target = None
+    best_alignment_model = None    
+    for alt_index in range(alt_steps):
+        alt = (alt_index + 0.5) / alt_steps * 2.0 * math.pi
+        alignment_model = AlignmentModel()
+        alignment_model.stepper_offsets[1] = alt
+
+        time_to_observed_dir = alignment_model.dir_given_raw_axis_values(time_to_raw_axis_values)
+
+        time_to_target, error = rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_dir)
+        if error < best_error:
+            best_error = error
+            best_time_to_target = time_to_target
+            best_alignment_model = alignment_model
+
+    print(f"Targets were {best_time_to_target}, error {error}")
+
+    # TODO: compute azimuth...
+
+    return best_alignment_model 
+
+
+
+
+def align(tracker, alignment_data, targets):
+    num_observations = len(alignment_data)
+    num_targets = len(targets)
+
+    print(f"Running alignment with {num_observations} observations and {num_targets} targets...")
+
+    times = []
+    time_to_raw_axis_values = torch.zeros([num_observations, 2])
+    for time_index, alignment_datum in enumerate(alignment_data):
+        times.append(alignment_datum.time)
+        time_to_raw_axis_values[time_index, :] = torch.tensor(alignment_datum.raw_axis_values.to_value(u.rad))
+
+    print("Looking up target directions...")
+
+    target_time_to_predicted_dir = torch.zeros([num_targets, num_observations, 3])
+    for target_index, target in enumerate(targets):
+        for time_index, time in enumerate(times):
+            altaz = target.altaz_at_time(tracker, time)
+            dir = torch.tensor(altaz.cartesian.xyz.to_value())
+            dir = dir / torch.linalg.norm(dir, dim=-1, keepdims=True)
+            #print(dir)
+            target_time_to_predicted_dir[target_index, time_index, :] = dir
+    #print(target_time_to_dir)
+
+    print("Running rough alignment...")
     
+    rough_alignment = rough_align(target_time_to_predicted_dir, time_to_raw_axis_values)
+
+    # TODO:
+    final_alignment = rough_alignment
+
+    print(f"Done!\nFinal alignment:\n{final_alignment}")
+
+def rotation_matrix_around_x(theta):
+    zero = torch.zeros_like(theta)
+    one = torch.ones_like(theta)
+    m = torch.stack([
+        one,                zero,               zero,
+        zero,               torch.cos(theta),   -torch.sin(theta),
+        zero,               torch.sin(theta),   torch.cos(theta)
+    ]).reshape(theta.shape + (3,3))
+    return m
+
+def rotation_matrix_around_y(theta):
+    zero = torch.zeros_like(theta)
+    one = torch.ones_like(theta)
+    m = torch.stack([
+        torch.cos(theta),   zero,               torch.sin(theta),
+        zero,               one,                zero,
+        -torch.sin(theta),  zero,               torch.cos(theta)
+    ]).reshape(theta.shape + (3,3))
+    return m
+
+def rotation_matrix_around_z(theta):
+    zero = torch.zeros_like(theta)
+    one = torch.ones_like(theta)    
+    m = torch.stack([
+        torch.cos(theta),   -torch.sin(theta),  zero,
+        torch.sin(theta),   torch.cos(theta),   zero,
+        zero,               zero,               one
+    ]).reshape(theta.shape + (3,3))
+    return m
 
 
 class AlignmentModel:
@@ -171,11 +262,11 @@ class AlignmentModel:
 
         # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
         # axis 1 is altitude, pitch, or declination (which needs no compensation)
-        self.stepper_offsets = [0.0, 0.0] * u.rad
-        self.azimuth_roll = 0 * u.rad
-        self.azimuth_pitch = 0 * u.rad
-        self.non_perpendicular_axes_error = 0 * u.rad
-        self.collimation_error_in_azimuth = 0 * u.rad
+        self.stepper_offsets = torch.tensor([0.0, 0.0])
+        self.azimuth_roll = torch.tensor(0.0)
+        self.azimuth_pitch = torch.tensor(0.0)
+        self.non_perpendicular_axes_error = torch.tensor(0.0)
+        self.collimation_error_in_azimuth = torch.tensor(0.0)
 
         # How does the telescope move?  Imagine it's sitting on the ground, pointed at the horizon to the north (looking along +x in the North East Down frame)
         # - rotate it around local Y by self.azimuth_pitch
@@ -185,28 +276,52 @@ class AlignmentModel:
         # - rotate it around local Y by self.raw_axis_values[1] - self.stepper_offsets[1]  (altitude)
         # - rotate it around local Z by self.collimation_error_in_azimuth
 
-    def errors_to_matrix(self):
-        pass
+    def matrix_given_raw_axis_values(self, raw_axis_values):
+        return (
+            rotation_matrix_around_y(self.azimuth_pitch) @
+            rotation_matrix_around_x(self.azimuth_roll) @
+            rotation_matrix_around_z(raw_axis_values[..., 0] - self.stepper_offsets[0]) @
+            rotation_matrix_around_x(self.non_perpendicular_axes_error) @
+            rotation_matrix_around_y(raw_axis_values[..., 1] - self.stepper_offsets[1]) @
+            rotation_matrix_around_z(self.collimation_error_in_azimuth)
+        )
+    
+    def dir_given_raw_axis_values(self, raw_axis_values):
+        dirs = self.matrix_given_raw_axis_values(raw_axis_values) @ torch.tensor([[1.0], [0.0], [0.0]])
+        
+        # back to row vectors
+        dirs = dirs.reshape(dirs.shape[:-1])
+
+        print(dirs.shape)
+
+        return dirs
 
 
-target_time_to_predicted_dir = torch.tensor([
-    [[.1, .2, .3], [.11, .2, .3], [.12, .2, .3]],  # first  target at .1 .2 .3, moving +x at .01 per sample
-    [[.4, .5, .6], [.4, .51, .6], [.4, .52, .6]],  # second target at .4 .5 .6, moving +y at .01 per sample
-    [[.7, .8, .9], [.7, .8, .91], [.7, .8, .92]],  # third  target at .7 .8 .9, moving +z at .01 per sample
-    [[.1, .1, .1], [.1, .1, .2], [.1, .1, .3]],  # more bogus targets
-    [[.2, .2, .2], [.2, .2, .3], [.2, .2, .4]],  # more bogus targets
-])
+if __name__ == "__main__":
+    """
+    Testing stuff
+    """
 
-time_to_observed_dir = torch.tensor([
-    [.1, .2, .3],
-    [.7, .8, .91],
-    [.4, .52, .6]
-])
+    target_time_to_predicted_dir = torch.tensor([
+        [[.1, .2, .3], [.11, .2, .3], [.12, .2, .3]],  # first  target at .1 .2 .3, moving +x at .01 per sample
+        [[.4, .5, .6], [.4, .51, .6], [.4, .52, .6]],  # second target at .4 .5 .6, moving +y at .01 per sample
+        [[.7, .8, .9], [.7, .8, .91], [.7, .8, .92]],  # third  target at .7 .8 .9, moving +z at .01 per sample
+        [[.1, .1, .1], [.1, .1, .2], [.1, .1, .3]],  # more bogus targets
+        [[.2, .2, .2], [.2, .2, .3], [.2, .2, .4]],  # more bogus targets
+    ])
 
-time_to_target = torch.tensor([0, 2, 1])
+    time_to_observed_dir = torch.tensor([
+        [.1, .2, .3],
+        [.7, .8, .91],
+        [.4, .52, .6]
+    ])
 
-error = score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, time_to_target)
-print(error)
+    time_to_target = torch.tensor([0, 2, 1])
 
-rough_align_result = rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_dir)
-print(rough_align_result)
+    error = score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, time_to_target)
+    print(error)
+
+    rough_align_result = rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_dir)
+    print(rough_align_result)
+
+    print(rotation_matrix_around_z(torch.tensor(math.pi/20)))
