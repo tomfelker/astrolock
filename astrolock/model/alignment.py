@@ -91,7 +91,7 @@ def euler_align(target_time_to_predicted_dir, time_to_raw_axis_values):
             model = AlignmentModel()
             # true = raw - offsets
             # offsets = raw - true
-            model.stepper_offsets[:] =  time_to_raw_axis_values[0, :] - target_time_to_predicted_azalt[trusted_target, time_to_trust, :]
+            model.stepper_offsets[:] =  time_to_raw_axis_values[time_to_trust, :] - target_time_to_predicted_azalt[trusted_target, time_to_trust, :]
             models.append(model)
 
     # figure out where those models pointed at each observation

@@ -41,7 +41,8 @@ class Target:
         old_target.prev_target = None
         new_target.prev_target = old_target
         
-        
+        if old_target.last_known_location_time is None or new_target.last_known_location_time is None:
+            return new_target
 
         time_between_updates = new_target.last_known_location_time - old_target.last_known_location_time
         if time_between_updates > 0 * u.s:

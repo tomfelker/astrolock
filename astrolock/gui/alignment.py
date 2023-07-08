@@ -51,6 +51,7 @@ class AlignmentFrame(tk.Frame):
         estimated_current_axis_angles, current_time = self.tracker.primary_telescope_connection.get_estimated_axis_angles_and_time()
         new_datum = AlignmentDatum(None, current_time, estimated_current_axis_angles)
         print(repr(new_datum))
+        self.alignment_data.append(new_datum)
         self.update_gui()
 
     def add_test_alignments(self):
@@ -82,6 +83,26 @@ class AlignmentFrame(tk.Frame):
                 None,
                 astropy.time.Time("2023-03-06 09:04:56.716076"),
                 [1.92051186, 0.93189984] * u.rad
+            ))
+
+        #  the moon
+        # astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-07-08 06:51:50.532457>, <Quantity [-2.26993803,  1.01434353] rad>)
+        # but really
+        # astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:16:56.716076>, <Quantity [-2.26993803,  1.01434353] rad>)
+        test_alignments.append(AlignmentDatum(
+                None,
+                astropy.time.Time("2023-03-06 09:16:56.716076"),
+                [-2.26993803,  1.01434353] * u.rad
+            ))
+        
+        # mars, 3 hours before:
+        # astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-07-08 06:55:51.437480>, <Quantity [-1.53162858,  0.73345739] rad>)
+        # but really:
+        # astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 06:16:56.716076>, <Quantity [-1.53162858,  0.73345739] rad>)
+        test_alignments.append(AlignmentDatum(
+                None,
+                astropy.time.Time("2023-03-06 06:16:56.716076"),
+                [-1.53162858,  0.73345739] * u.rad
             ))
 
         fuzz_offsets = True
