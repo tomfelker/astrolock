@@ -42,66 +42,7 @@ What should be possible?
     - can solve for axis offsets (2 numbers)
         - need to assume everything else is perfect
 
-So the real problem is identifying stars, O(S^N)
-    - 1000 bright stars, to the three points...
-
-Algorithm:
-    given S stars and N observations (time and raw axis values):
-    foreach star:
-        foreach time:
-            compute direction_to(star, time)
-
-    foreach star_at_t0:
-        foreach star_at_t1:
-            compute angular distance between these observations
-            find the top-n that match the distance between our measurements
-    
-    that's enough to establish our frame, then we can just keep adding nearest stars
-    only problem is we're assuming the first two times are sufficiently accurate, if not, we may name the third stars wrongly...
-
-But, hmm - until we know stepper_offset[1], we actually _don't_ know angular distances between our measurements... 
-    i.e., if our measurements differ in az, if alt was near horizon, that's a larger distance than if it was near the zenith
-
-
-Algorithm:
-    with T targets and N observations:
-    
-    compute directions for all targets at all observation times (shape: T, N, 3)
-
-    for stepper_offset[1] ranging from 0 to 2pi step whatever:  (technically also ranges for the geometric errors, leaving only stepper_offset[0], azimuth_roll, and azimuth_pitch, which is just an unknown orientation)
-        plug all raw values into the model, to get directions (shape: N, 3)
-        for K = 0 to N-1
-            we know the identities of the first K targets, so:
-            compute dot products for all pairs of K targets (shape [K, K+1] with dot products 
-
-Okay, so that's working, but it's waaaaaay too slow for reasonable numbers (~200) of targets... even one iteration is like an hour,
-and we need many because of the unknown altitude thing.  Need some more elegant ideas...
-
-Algorithm:
-    if we assume:
-        mount is roughly level
-        targets have different altitudes
-    then we don't need to care about azimuth difference (which we can't know without knowing our altitude stepper offsets)
-    so we can just find pairs of targets with the correct altitude differences...
-
-
-Algorithm:
-    this can fail for small n, but how about:
-        compute 'mutual angles' for all pairs of targets  (  O(num_observations * num_targets^2)  )
-        for each possible altitude stepper offset:
-            compute mutual angles between each observation (instantaneous...)
-            find closest N matches
-                no good bound on n, but in practice, likely small...
-                now have a more reasonable set of assignments to check as before   O(N^num_observations)
-
-Hmm, also that altitude problem really only exists if we don't assume we're relatively horizontal...
-    if the tripod is decently aligned (even if we don't know the stepper offsets), then we can:
-        convert all the targets to altaz representation
-        do similar distance stuff, but instead of distance being actual dot products, have it be alt az differences
-            sort of distance in a cylindrical projection map
-
-Okay, this is all dumb... here's a dead simple, low memory, embarassingly parallel method:
-
+Here's a dead simple, low memory, embarassingly parallel method:
     - choose samples of the parameters we're interested in:
         - can be random so that we just choose how long to wait for a better solution
         - can easily make assumptions like "nearly level tripod"
@@ -116,119 +57,7 @@ Okay, this is all dumb... here's a dead simple, low memory, embarassingly parall
     whole thing is naiively O(acceptable_error^-1 * num_observations * num_targets)
         could probably throw a log in there with a better nearest neighbor search...
         but conversely, more targets means we probably need lower acceptable error
-
-
 """
-def dirs_to_mutual_angles(dirs, as_matrix = False):
-    """
-    Given a list of directions, returns a list the angles (in radians) between each pair of directions.
-    """
-    num_dims = dirs.shape[-1]
-    num_dirs = dirs.shape[-2]
-
-    # TODO: this normalize could move higher in the call tree
-    dirs = dirs / torch.linalg.norm(dirs, dim=-1, keepdims=True)
-
-    dir_indices = torch.tril_indices(num_dirs, num_dirs, offset=-1)
-    from_indices = dir_indices[0, :]
-    to_indices = dir_indices[1, :]
-    num_indices = dir_indices.shape[-1]
-    from_indices = from_indices.reshape(num_indices, 1).expand(num_indices, num_dims)
-    to_indices = to_indices.reshape(num_indices, 1).expand(num_indices, num_dims)
-
-    from_dirs = torch.gather(dirs, -2, from_indices)
-    to_dirs = torch.gather(dirs, -2, to_indices)
-
-    dots = torch.linalg.vecdot(from_dirs, to_dirs, dim=-1)
-    angles = torch.acos(torch.clamp(dots, -1.0, 1.0))
-
-    return angles
-
-
-
-def score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, time_to_target):
-    num_assigned_targets = len(time_to_target)
-    
-    if num_assigned_targets < 2:
-        return 0.0   
-
-    #print(f"Trying {time_to_target}")
-
-    # there's probably a more optimizable way to write this:
-    time_to_predicted_dir = torch.stack([target_time_to_predicted_dir[target_index, time_index, :] for time_index, target_index in enumerate(time_to_target)])
-    
-    time_to_predicted_angles = dirs_to_mutual_angles(time_to_predicted_dir)
-    time_to_observed_angles = dirs_to_mutual_angles(time_to_observed_dir[0:num_assigned_targets, :])
-
-    error = (time_to_predicted_angles - time_to_observed_angles).square().mean().sqrt()
-
-    #print(f"Tried {time_to_target}, error {error}")
-
-    return error
-
-def rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_dir, known_time_to_target = [], known_time_to_target_error = 0.0):
-    num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
-    assert((num_observations, num_spatial_dimensions) == time_to_observed_dir.shape)
-    num_known_targets = len(known_time_to_target)
-
-    if num_known_targets < num_observations:
-        incremental_time_to_target_and_error_pairs = []
-        for target_index in range(num_targets):
-            new_time_to_target = known_time_to_target.copy()
-            new_time_to_target.append(target_index)
-            new_error = score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, new_time_to_target)
-            incremental_time_to_target_and_error_pairs.append((new_time_to_target, new_error))
-
-        # We have to try all initial pairs, but after that, I think we can take only the top ones so far.
-        # Not sure how many - taking num_observations feels right, but I don't have a rigorous proof.
-        # In practice, fewer would probably be okay, especially for high numbers of observations.
-        if num_known_targets > 1:
-            incremental_time_to_target_and_error_pairs = sorted(incremental_time_to_target_and_error_pairs, key = lambda pair: pair[1])
-            to_take = 1 # num_observations
-            incremental_time_to_target_and_error_pairs = incremental_time_to_target_and_error_pairs[0:to_take]
-
-        #print(f"Best few so far are {incremental_time_to_target_and_error_pairs}")
-
-        full_time_to_target_and_error_pairs = []
-        for partial_time_to_target, partial_error in incremental_time_to_target_and_error_pairs:
-            full_time_to_target_and_error_pair = rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_dir, partial_time_to_target, partial_error)
-            full_time_to_target_and_error_pairs.append(full_time_to_target_and_error_pair)
-
-        full_time_to_target_and_error_pairs = sorted(full_time_to_target_and_error_pairs, key = lambda pair: pair[1])
-        best_full_time_to_target_and_error_pair = full_time_to_target_and_error_pairs[0]
-        return best_full_time_to_target_and_error_pair
-    else:
-        return known_time_to_target, known_time_to_target_error
-        #return known_time_to_target, score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, known_time_to_target)
-    
-
-def rough_align(target_time_to_predicted_dir, time_to_raw_axis_values, known_time_to_target = [], alt_steps = 360):
-    num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
-    num_observations, num_raw_values = time_to_raw_axis_values.shape
-
-    best_error = math.inf
-    best_time_to_target = None
-    best_alignment_model = None    
-    for alt_index in range(alt_steps):
-        alt = (alt_index + 0.5) / alt_steps * 2.0 * math.pi
-        alignment_model = AlignmentModel()
-        alignment_model.stepper_offsets[1] = alt
-
-        time_to_observed_dir = alignment_model.dir_given_raw_axis_values(time_to_raw_axis_values)
-
-        time_to_target, error = rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_dir)
-        if error < best_error:
-            best_error = error
-            best_time_to_target = time_to_target
-            best_alignment_model = alignment_model
-
-    print(f"Targets were {best_time_to_target}, error {error}")
-
-    # TODO: compute azimuth...
-
-    return best_alignment_model 
-
-
 
 def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_samples = 100000, max_batch_size = 10000):
     """
@@ -236,46 +65,46 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_samp
 
     Hopefully, if it's good enough, it will be in the watershed of the global optimum.
     """
-    num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
+    with torch.no_grad():
+        num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
+        
+        best_loss = math.inf
+        best_time_to_target = None
+        best_model = None
 
-    
-    best_loss = math.inf
-    best_time_to_target = None
-    best_model = None
+        for first_sample in range(0, num_samples, max_batch_size):
+            batch_size = min(max_batch_size, num_samples - first_sample)
 
-    for first_sample in range(0, num_samples, max_batch_size):
-        batch_size = min(max_batch_size, num_samples - first_sample)
+            print(f"Calculating guesses {first_sample + 1}-{first_sample + batch_size} of {num_samples}...", end='')
 
-        print(f"Calculating guesses {first_sample + 1}-{first_sample + batch_size} of {num_samples}...", end='')
+            models = []
+            batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
+            for batch_index in range(0, batch_size):
+                model = AlignmentModel()
+                model.stepper_offsets = torch.rand(2) * (2.0 * math.pi)
+                # TODO: could sample other things here, but probably not necessary
 
-        models = []
-        batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
-        for batch_index in range(0, batch_size):
-            model = AlignmentModel()
-            model.stepper_offsets = torch.rand(2) * (2.0 * math.pi)
-            # TODO: could sample other things here, but probably not necessary
+                batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
+                models.append(model)
 
-            batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
-            models.append(model)
+            batch_target_time_to_dot = torch.einsum('...tod,...od->...to', target_time_to_predicted_dir, batch_time_to_observed_dir)
 
-        batch_target_time_to_dot = torch.einsum('...tod,...od->...to', target_time_to_predicted_dir, batch_time_to_observed_dir)
+            (batch_time_to_best_dot, batch_time_to_best_target) = torch.max(batch_target_time_to_dot, dim=-2)
 
-        (batch_time_to_best_dot, batch_time_to_best_target) = torch.max(batch_target_time_to_dot, dim=-2)
+            batch_time_to_lowest_angle = torch.acos(torch.clamp(batch_time_to_best_dot, -1.0, 1.0))
 
-        batch_time_to_lowest_angle = torch.acos(torch.clamp(batch_time_to_best_dot, -1.0, 1.0))
+            batch_to_loss = batch_time_to_lowest_angle.square().mean(dim=-1).sqrt()
 
-        batch_to_loss = batch_time_to_lowest_angle.square().mean(dim=-1).sqrt()
+            (best_loss_in_batch, best_batch_index) = torch.min(batch_to_loss, dim=-1)
 
-        (best_loss_in_batch, best_batch_index) = torch.min(batch_to_loss, dim=-1)
+            if best_loss_in_batch < best_loss:
+                best_loss = best_loss_in_batch
+                best_time_to_target = batch_time_to_best_target[best_batch_index, :]
+                best_model = models[best_batch_index]
 
-        if best_loss_in_batch < best_loss:
-            best_loss = best_loss_in_batch
-            best_time_to_target = batch_time_to_best_target[best_batch_index, :]
-            best_model = models[best_batch_index]
+            print(f" loss {best_loss} with assignments {best_time_to_target}")
 
-        print(f" loss {best_loss} with assignments {best_time_to_target}")
-
-    return best_model, best_time_to_target
+        return best_model, best_time_to_target
 
 
 
