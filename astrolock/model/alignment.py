@@ -1,6 +1,7 @@
 import math
 import astropy.units as u
 import torch
+import torch.nn
 
 class AlignmentDatum:
     """
@@ -10,6 +11,9 @@ class AlignmentDatum:
     def __init__(self, target, time, raw_axis_values):
         self.target = target
         self.time = time
+
+        # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
+        # axis 1 is altitude, pitch, or declination (which needs no compensation)
         self.raw_axis_values = raw_axis_values
 
     def __repr__(self):
@@ -59,60 +63,111 @@ Here's a dead simple, low memory, embarassingly parallel method:
         but conversely, more targets means we probably need lower acceptable error
 """
 
+def xyz_to_azalt(xyz):
+    x = xyz[..., 0]
+    y = xyz[..., 1]
+    z = xyz[..., 2]    
+    xy_len = (x.square() + y.square()).sqrt()
+    alt = torch.atan2(z, xy_len)
+    az = torch.atan2(y, x)
+    return torch.stack([az, alt], dim = -1)
+
+@torch.no_grad()
+def euler_align(target_time_to_predicted_dir, time_to_raw_axis_values):
+    """
+    A super lame version that assumes we're perfectly horizontal and the axes are perfectly aligned.
+    """
+    num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
+
+    target_time_to_predicted_azalt = xyz_to_azalt(target_time_to_predicted_dir)
+    
+    
+    models = []
+    # this outer loop isn't strictly necessary and multiplies the amount of work, but makes us
+    # resilient to the case where our first observation was further off than the others were.
+    for time_to_trust in range(num_observations):
+        # for each target, make a model based on the assumption that our trusted observation was of that target.
+        for trusted_target in range(num_targets):
+            model = AlignmentModel()
+            # true = raw - offsets
+            # offsets = raw - true
+            model.stepper_offsets[:] =  time_to_raw_axis_values[0, :] - target_time_to_predicted_azalt[trusted_target, time_to_trust, :]
+            models.append(model)
+
+    # figure out where those models pointed at each observation
+    batch_size = num_targets
+    batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
+    for batch_index in range(0, batch_size):            
+        batch_time_to_observed_dir[batch_index, :, :] = models[batch_index].dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
+    
+    batch_target_time_to_dot = torch.einsum('...tod,...od->...to', target_time_to_predicted_dir[:, :, :], batch_time_to_observed_dir)
+
+    (batch_time_to_best_dot, batch_time_to_best_target) = torch.max(batch_target_time_to_dot, dim=-2)
+
+    batch_time_to_lowest_angle = torch.acos(torch.clamp(batch_time_to_best_dot, -1.0, 1.0))
+
+    batch_to_loss = batch_time_to_lowest_angle.square().mean(dim=-1).sqrt()
+
+    (best_loss_in_batch, best_batch_index) = torch.min(batch_to_loss, dim=-1)
+
+    best_loss = best_loss_in_batch
+    best_time_to_target = batch_time_to_best_target[best_batch_index, :]
+    best_model = models[best_batch_index]
+
+    print(f" loss {best_loss} with assignments {best_time_to_target}")
+
+    return best_model, best_time_to_target
+
+
+@torch.no_grad()
 def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_samples = 100000, max_batch_size = 10000):
     """
-    Try many random guesses for alignment, and return the best one.
+    Try many random guesses for alignment, and return the best one.  Hopefully, if it's good enough, it will be in the watershed of the global optimum.
 
-    Hopefully, if it's good enough, it will be in the watershed of the global optimum.
+    This currently assumes we're level, but it doesn't have to, it could easily sample all parameters of the model.
+
+    It is, however, quite slow.
     """
-    with torch.no_grad():
-        num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
-        
-        best_loss = math.inf
-        best_time_to_target = None
-        best_model = None
 
-        for first_sample in range(0, num_samples, max_batch_size):
-            batch_size = min(max_batch_size, num_samples - first_sample)
+    num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
+    
+    best_loss = math.inf
+    best_time_to_target = None
+    best_model = None
 
-            print(f"Calculating guesses {first_sample + 1}-{first_sample + batch_size} of {num_samples}...", end='')
+    for first_sample in range(0, num_samples, max_batch_size):
+        batch_size = min(max_batch_size, num_samples - first_sample)
 
-            models = []
-            batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
-            for batch_index in range(0, batch_size):
-                model = AlignmentModel()
-                model.stepper_offsets = torch.rand(2) * (2.0 * math.pi)
-                # TODO: could sample other things here, but probably not necessary
+        print(f"Calculating guesses {first_sample + 1}-{first_sample + batch_size} of {num_samples}...", end='')
 
-                batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
-                models.append(model)
+        models = []
+        batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
+        for batch_index in range(0, batch_size):
+            model = AlignmentModel()
+            model.stepper_offsets[:] = torch.rand(2) * (2.0 * math.pi)
+            # TODO: could sample other things here, but probably not necessary
 
-            batch_target_time_to_dot = torch.einsum('...tod,...od->...to', target_time_to_predicted_dir, batch_time_to_observed_dir)
+            batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
+            models.append(model)
 
-            (batch_time_to_best_dot, batch_time_to_best_target) = torch.max(batch_target_time_to_dot, dim=-2)
+        batch_target_time_to_dot = torch.einsum('...tod,...od->...to', target_time_to_predicted_dir, batch_time_to_observed_dir)
 
-            batch_time_to_lowest_angle = torch.acos(torch.clamp(batch_time_to_best_dot, -1.0, 1.0))
+        (batch_time_to_best_dot, batch_time_to_best_target) = torch.max(batch_target_time_to_dot, dim=-2)
 
-            batch_to_loss = batch_time_to_lowest_angle.square().mean(dim=-1).sqrt()
+        batch_time_to_lowest_angle = torch.acos(torch.clamp(batch_time_to_best_dot, -1.0, 1.0))
 
-            (best_loss_in_batch, best_batch_index) = torch.min(batch_to_loss, dim=-1)
+        batch_to_loss = batch_time_to_lowest_angle.square().mean(dim=-1).sqrt()
 
-            if best_loss_in_batch < best_loss:
-                best_loss = best_loss_in_batch
-                best_time_to_target = batch_time_to_best_target[best_batch_index, :]
-                best_model = models[best_batch_index]
+        (best_loss_in_batch, best_batch_index) = torch.min(batch_to_loss, dim=-1)
 
-            print(f" loss {best_loss} with assignments {best_time_to_target}")
+        if best_loss_in_batch < best_loss:
+            best_loss = best_loss_in_batch
+            best_time_to_target = batch_time_to_best_target[best_batch_index, :]
+            best_model = models[best_batch_index]
 
-        return best_model, best_time_to_target
+        print(f" loss {best_loss} with assignments {best_time_to_target}")
 
-
-
-
-            
-
-
-
+    return best_model, best_time_to_target
 
 
 def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 85.0 * u.deg):
@@ -154,15 +209,17 @@ def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 8
 
     print(f"Filtered down to {len(filtered_targets)} targets.");
 
-    #print("Running rough alignment...")
-    #rough_alignment = rough_align(target_time_to_predicted_dir, time_to_raw_axis_values)
+    #print("Running random alignment...")
+    #rough_alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values)
 
-    print("Running random alignment...")
-    rough_alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values)
+    print("Running euler alignment...")
+    rough_alignment, time_to_target = euler_align(target_time_to_predicted_dir, time_to_raw_axis_values)
 
     print("Identification:")
-    for target in time_to_target:
-        print(f"target {target} is {filtered_targets[target].display_name}")
+    for time_index, filtered_target_index in enumerate(time_to_target):
+        target = filtered_targets[filtered_target_index]
+        print(f"\tObservation {time_index} was {target.display_name}")
+        alignment_data[time_index].target = target
 
     # TODO:
     final_alignment = rough_alignment
@@ -200,18 +257,23 @@ def rotation_matrix_around_z(theta):
     return m
 
 
-class AlignmentModel:
+class AlignmentModel(torch.nn.Module):
     def __init__(self):
         # see https://www.wildcard-innovations.com.au/geometric_mount_errors.html
         # for helpful pictures and names.
 
         # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
         # axis 1 is altitude, pitch, or declination (which needs no compensation)
-        self.stepper_offsets = torch.tensor([0.0, 0.0])
-        self.azimuth_roll = torch.tensor(0.0)
-        self.azimuth_pitch = torch.tensor(0.0)
-        self.non_perpendicular_axes_error = torch.tensor(0.0)
-        self.collimation_error_in_azimuth = torch.tensor(0.0)
+        super().__init__()
+
+        # the az and alt that the steppers read when the telescope is pointing at 0,0 (due north on horizon)
+        # so, true = raw - offsets
+        self.stepper_offsets = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
+
+        self.azimuth_roll = torch.nn.Parameter(torch.tensor(0.0))
+        self.azimuth_pitch = torch.nn.Parameter(torch.tensor(0.0))
+        self.non_perpendicular_axes_error = torch.nn.Parameter(torch.tensor(0.0))
+        self.collimation_error_in_azimuth = torch.nn.Parameter(torch.tensor(0.0))
 
         # How does the telescope move?  Imagine it's sitting on the ground, pointed at the horizon to the north (looking along +x in the North East Down frame)
         # - rotate it around local Y by self.azimuth_pitch
@@ -222,7 +284,10 @@ class AlignmentModel:
         # - rotate it around local Z by self.collimation_error_in_azimuth
 
     def __repr__(self):
-        return f"stepper offsets: {self.stepper_offsets}"
+        ret = "AlignmentModel\n"
+        for name, param in self.named_parameters():
+            ret += f"\t{name}: {param.data}\n"
+        return ret
 
     def matrix_given_raw_axis_values(self, raw_axis_values):
         return (
@@ -233,43 +298,21 @@ class AlignmentModel:
             rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.stepper_offsets[1])) @
             rotation_matrix_around_z(self.collimation_error_in_azimuth)
         )
-        
-    
+            
     def dir_given_raw_axis_values(self, raw_axis_values):
         dirs = self.matrix_given_raw_axis_values(raw_axis_values) @ torch.tensor([[1.0], [0.0], [0.0]])
         # back to row vectors
         dirs = dirs.reshape(dirs.shape[:-1])
         return dirs
+    
+    def forward(self, raw_axis_values):
+        return self.dir_given_raw_axis_values(raw_axis_values)
 
 
 if __name__ == "__main__":
     """
     Testing stuff
     """
-    if False:
-        target_time_to_predicted_dir = torch.tensor([
-            [[.1, .2, .3], [.11, .2, .3], [.12, .2, .3]],  # first  target at .1 .2 .3, moving +x at .01 per sample
-            [[.4, .5, .6], [.4, .51, .6], [.4, .52, .6]],  # second target at .4 .5 .6, moving +y at .01 per sample
-            [[.7, .8, .9], [.7, .8, .91], [.7, .8, .92]],  # third  target at .7 .8 .9, moving +z at .01 per sample
-            [[.1, .1, .1], [.1, .1, .2], [.1, .1, .3]],  # more bogus targets
-            [[.2, .2, .2], [.2, .2, .3], [.2, .2, .4]],  # more bogus targets
-        ])
-
-        time_to_observed_dir = torch.tensor([
-            [.1, .2, .3],
-            [.7, .8, .91],
-            [.4, .52, .6]
-        ])
-
-        time_to_target = torch.tensor([0, 2, 1])
-
-        error = score_target_assignment(target_time_to_predicted_dir, time_to_observed_dir, time_to_target)
-        print(error)
-
-        rough_align_result = rough_align_with_predictions(target_time_to_predicted_dir, time_to_observed_dir)
-        print(rough_align_result)
-
-        print(rotation_matrix_around_z(torch.tensor(math.pi/20)))
 
     test_model = AlignmentModel()
 

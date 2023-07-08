@@ -39,7 +39,8 @@ class AlignmentFrame(tk.Frame):
         self.alignment_data_treeview.pack(side = 'left', fill = 'both', expand = True)
         self.alignment_data_treeview_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.alignment_data_treeview.yview)
         self.alignment_data_treeview_scrollbar.pack(side='right', fill='y')
-        self.alignment_data_treeview.configure(yscrollcommand=self.alignment_data_treeview.set)
+        # TODO: hmm, what was this for?  it errors...
+        #self.alignment_data_treeview.configure(yscrollcommand=self.alignment_data_treeview.set)
 
 
     def add_alignment_star(self):
@@ -73,18 +74,20 @@ class AlignmentFrame(tk.Frame):
             [2.92833387, 0.61100651] * u.rad
         ))
 
-        # Arcturus (HIP 69673)
-        # probably was az. 109d15m34.6s alt 52d46m55.9
-        #astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:04:56.716076>, <Quantity [1.92051186, 0.93189984] rad>)
-        test_alignments.append(AlignmentDatum(
-            None,
-            astropy.time.Time("2023-03-06 09:04:56.716076"),
-            [1.92051186, 0.93189984] * u.rad
-        ))
+        if True:
+            # Arcturus (HIP 69673)
+            # probably was az. 109d15m34.6s alt 52d46m55.9
+            #astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:04:56.716076>, <Quantity [1.92051186, 0.93189984] rad>)
+            test_alignments.append(AlignmentDatum(
+                None,
+                astropy.time.Time("2023-03-06 09:04:56.716076"),
+                [1.92051186, 0.93189984] * u.rad
+            ))
 
         fuzz_offsets = True
         if fuzz_offsets:
             test_stepper_offsets = [random.random() * 2.0 * math.pi, random.random() * 2.0 * math.pi] * u.rad
+            print(f"Fuzzing offsets by {test_stepper_offsets}")
             for alignment in test_alignments:
                 alignment.raw_axis_values += test_stepper_offsets
                 alignment.ground_truth_stepper_offset = test_stepper_offsets
@@ -101,7 +104,7 @@ class AlignmentFrame(tk.Frame):
         for alignment_datum in self.alignment_data:
             
             if alignment_datum.target is not None:
-                target_name = alignment_datum.target.name
+                target_name = alignment_datum.target.display_name
                 target_url = alignment_datum.target.url
             else:
                 target_name = '<unknown>'
@@ -112,7 +115,7 @@ class AlignmentFrame(tk.Frame):
             self.alignment_data_treeview.insert(parent = '', index = 'end', iid = None, values = values)
 
     def align(self):
-        if len(self.alignment_data) is 0:
+        if len(self.alignment_data) == 0:
             print("Can't align without any alignment data.")
             return
 
@@ -124,11 +127,16 @@ class AlignmentFrame(tk.Frame):
                 for target in target_map.values():
                     targets.append(target)
         
-        if len(targets) is 0:
+        if len(targets) == 0:
             print("Couldn't find any targets to align to.")
             return
 
-        targetnames = '\n\t'.join(map((lambda t: t.display_name), targets))
-        print(f"Aligning with { len(targets) } targets:\n{targetnames}")
+        
+        print(f"Aligning with { len(targets) } targets.")
+        if False:
+            for target in targets:
+                print(f'\n\t{target.display_name}')            
 
         astrolock.model.alignment.align(self.tracker, self.alignment_data, targets)
+
+        self.update_gui()
