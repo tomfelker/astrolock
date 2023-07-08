@@ -81,6 +81,9 @@ class SkyfieldTargetSource(target_source.TargetSource):
             planet_names = planet_id_to_names[planet_id]
             planet_name = planet_names[0]
             planet_displayname = planet_names[-1]
+
+            if 'EARTH' in planet_displayname:
+                continue
             
             url = f'skyfield://planets/{planet_ephemeris}/{planet_name}'
             

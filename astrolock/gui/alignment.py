@@ -57,7 +57,7 @@ class AlignmentFrame(tk.Frame):
         # they would be if from a real telescope.
         test_alignments = []
         
-        # Spica
+        # Spica (HIP 65474)
         # astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:01:44.365060>, <Quantity [2.61243707, 0.62959202] rad>)
         test_alignments.append(AlignmentDatum(
             None,
@@ -65,7 +65,7 @@ class AlignmentFrame(tk.Frame):
             [2.61243707, 0.62959202] * u.rad
         ))
 
-        # Algorab
+        # Algorab (HIP 60965)
         #astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:03:04.564831>, <Quantity [2.92833387, 0.61100651] rad>)
         test_alignments.append(AlignmentDatum(
             None,
@@ -73,7 +73,8 @@ class AlignmentFrame(tk.Frame):
             [2.92833387, 0.61100651] * u.rad
         ))
 
-        # Arcturus
+        # Arcturus (HIP 69673)
+        # probably was az. 109d15m34.6s alt 52d46m55.9
         #astrolock.model.alignment.AlignmentDatum(None, <Time object: scale='utc' format='datetime' value=2023-03-06 09:04:56.716076>, <Quantity [1.92051186, 0.93189984] rad>)
         test_alignments.append(AlignmentDatum(
             None,
@@ -81,10 +82,12 @@ class AlignmentFrame(tk.Frame):
             [1.92051186, 0.93189984] * u.rad
         ))
 
-        test_stepper_offsets = [random.random() * 2.0 * math.pi, random.random() * 2.0 * math.pi] * u.rad
-        for alignment in test_alignments:
-            alignment.raw_axis_values += test_stepper_offsets
-            alignment.ground_truth_stepper_offset = test_stepper_offsets
+        fuzz_offsets = True
+        if fuzz_offsets:
+            test_stepper_offsets = [random.random() * 2.0 * math.pi, random.random() * 2.0 * math.pi] * u.rad
+            for alignment in test_alignments:
+                alignment.raw_axis_values += test_stepper_offsets
+                alignment.ground_truth_stepper_offset = test_stepper_offsets
 
         self.alignment_data = test_alignments
         self.update_gui()
