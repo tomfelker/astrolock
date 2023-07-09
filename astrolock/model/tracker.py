@@ -3,6 +3,7 @@ from astrolock.model.pid import PIDController
 import astrolock.model.target_sources.opensky
 import astrolock.model.target_sources.kml
 import astrolock.model.target_sources.skyfield
+import astrolock.model.alignment
 
 from astropy import units as u
 import astropy.time
@@ -31,6 +32,7 @@ class Tracker(object):
     def __init__(self):
         self.lock = threading.RLock()
         self.primary_telescope_connection = None
+        self.primary_telescope_alignment = astrolock.model.alignment.AlignmentModel()
         self.monotonic_time_ns_of_last_input = None
         self.momentum = np.zeros(2)
         self.rates = np.zeros(2)

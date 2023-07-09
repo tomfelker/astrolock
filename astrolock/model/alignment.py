@@ -1,5 +1,7 @@
 import math
 import astropy.units as u
+import astropy.time
+import numpy as np
 import torch
 import torch.nn
 
@@ -11,7 +13,6 @@ class AlignmentDatum:
     def __init__(self, target, time, raw_axis_values):
         self.target = target
         self.time = time
-
         # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
         # axis 1 is altitude, pitch, or declination (which needs no compensation)
         self.raw_axis_values = raw_axis_values
@@ -19,6 +20,19 @@ class AlignmentDatum:
     def __repr__(self):
         return f'astrolock.model.alignment.AlignmentDatum({repr(self.target)}, {repr(self.time)}, {repr(self.raw_axis_values)})'
     
+    def to_json(self):
+        return {
+            "time": str(self.time),
+            "raw_axis_values": self.raw_axis_values.to_value(u.rad).tolist()
+        }
+
+    @classmethod
+    def from_json(cls, json_obj):
+        return cls(
+            target=None,
+            time=astropy.time.Time(json_obj["time"]),
+            raw_axis_values = np.array(json_obj["raw_axis_values"]) * u.rad
+        )
 
 """
 Okay so how to do this?
@@ -225,6 +239,8 @@ def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 8
     final_alignment = rough_alignment
 
     print(f"Done!\nFinal alignment:\n{final_alignment}")
+
+    return final_alignment
 
 def rotation_matrix_around_x(theta):
     zero = torch.zeros_like(theta)

@@ -8,10 +8,12 @@ import astrolock.gui.input
 import astrolock.gui.targets
 import astrolock.model.tracker as tracker
 
+
+
 class MainWindow(tk.Tk):
     def __init__(self, *args, **kwargs):        
         tk.Tk.__init__(self, *args, **kwargs)
-
+           
         self.tracker = tracker.Tracker()
         self.tracker.update_gui_callback = self.update_gui_from_tracker_threads
         self.gui_update_timer_id = None
@@ -39,7 +41,7 @@ class MainWindow(tk.Tk):
         notebook.add(self.alignment_tab, text = "Alignment")
         notebook.add(self.targets_tab, text = "Targets")
 
-        notebook.pack(fill = tk.BOTH)
+        notebook.pack(fill = tk.BOTH, expand=True)
 
         self.bind("<Destroy>", self._destroy)
 
