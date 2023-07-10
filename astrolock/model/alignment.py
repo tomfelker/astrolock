@@ -346,44 +346,53 @@ class AlignmentModel(torch.nn.Module):
         (B'A'r).y   =   sin(c)  cos(c)  0   *   0   cos(d)  -sin(d) *   0       1   0       *   (F p).y
         (B'A'r).z       0       0       1       0   sin(d)  cos(d)      -sin(e) 0   cos(e)      (F p).z
 
-        But that probably gets crazy when D is non-identity, which means we have cross-axis error.
-        If instead we assume D is identity, we just have:
-
-            r = A B C E F p
-            (B' A' r) = C E (F p)
+        Which could probably be solved, but I'm thinking of it in a geometric way.  C is a yaw that we
+        can choose, D is a roll we are given, and E is a pitch that we can choose.  Together, they must
+        bring (F p) into (B' A' R).
         
-        Which we could also figure symbolically, but really, since we can compute the values in parens,
-        we just need to formulate C E in terms of a yaw and pitch so that it solves that equation.
-
         Think of it like you're flying a plane.  You have a bug on your windshield at some point off to
-        the side of your crosshairs, (F p), that you'd like to point in some arbitrary direction (B' A' r),
-        using only yaw and pitch (no roll).  It'd normally be possible, but if the bug was very far off to
-        the side (like near your wing), and the target point was very high, you might not get the high
-        enough no matter how you pitch.  (You'd also need roll...)
+        the side of your crosshairs, at point (F p) in the plane's coordinate system.  You'd like to
+        point it at a target, which is at point (B' A' r) in the plane's coordinate system.  You can do
+        any yaw, but then must roll by non_perpendicular_axes_error, and then can do any pitch.
 
-        cos(self.collimation_error_in_azimuth) determines the 'arm' of your bug
-        lhs[2] is how high we need the bug
-        pitch is acos(lhs[2] / cos(self.collimation_error_in_azimuth))   # can be nan if that's > 1
+        Look at the plane from the back.  You must bring the bug up to a horizontal line at z, but that
+        line will move as you roll.  The height of the line in the center will be higher: its original
+        height over the cosine of the roll angle.  But then it will slope down, at a slope of the
+        tangent of the roll angle, as you move sideways to reach the y coordinate of the bug.
 
+        So now you have rolled, we know the z coordinate (in the plane's rolled coordinate frame) you
+        must bring the bug up to via pitching.  Consider a view from the side of the (now rolled) plane.
+        The bug is not all the way at the front, rather its x is only cos(collimation_error_in_azimuth),
+        and we need to bring it to the z we computed (which may be more than that), so we might fail,
+        but in any case we can compute it with arccos.
+
+        Then it's a simple matter of inverting some things and subtracting to figure the yaw.
         """
 
+        # These should match what they are in matrix_given_raw_axis_values()
         A = rotation_matrix_around_y(self.azimuth_pitch)
         B = rotation_matrix_around_x(self.azimuth_roll)
+        D = rotation_matrix_around_x(self.non_perpendicular_axes_error)
         F = rotation_matrix_around_z(self.collimation_error_in_azimuth)
         
         Bt_At_r = (B.mT @ A.mT @ dir.unsqueeze(-1)).squeeze(-1)
 
         p = torch.tensor([1.0, 0.0, 0.0])
         F_p = (F @ p.unsqueeze(-1)).squeeze(-1)
-       
-        
-        # note that this can NaN if the collimation error is too great, so you can't get the 'bug' high enough with any pitch.
-        E_alt = torch.asin(Bt_At_r[..., 2] / torch.cos(self.collimation_error_in_azimuth))
+      
+        B_At_r_z = Bt_At_r[..., 2]
+        bug_x = torch.cos(self.collimation_error_in_azimuth)
+        bug_y = torch.sin(self.collimation_error_in_azimuth)        
+        center_z = B_At_r_z / torch.cos(self.non_perpendicular_axes_error)
+        bug_z = center_z - bug_y * torch.tan(self.non_perpendicular_axes_error)
+        # note that this could NaN if bug_z / bug_x is outside (-1, 1), which means you can't get the bug 'high enough' no matter what you do.
+        # let's clamp it, so we'll try as hard as possible.
+        E_alt = torch.asin(torch.clamp(bug_z / bug_x, -1.0, 1.0))
         E = rotation_matrix_around_y(-E_alt)  # minus because our handedness is weird
-        E_F_p = (E @ F_p.unsqueeze(-1)).squeeze(-1)
-        E_F_p_az = torch.atan2(E_F_p[..., 1], E_F_p[..., 0])
+        D_E_F_p = (D @ E @ F_p.unsqueeze(-1)).squeeze(-1)
+        D_E_F_p_az = torch.atan2(D_E_F_p[..., 1], D_E_F_p[..., 0])
         Bt_At_r_az = torch.atan2(Bt_At_r[..., 1], Bt_At_r[..., 0])
-        C_az = Bt_At_r_az - E_F_p_az
+        C_az = Bt_At_r_az - D_E_F_p_az
 
         # if we didn't care about collimation_error, the simpler version of the above would be:
         #   Bt_At_r_azalt = xyz_to_azalt(Bt_At_r)
@@ -400,13 +409,13 @@ class AlignmentModel(torch.nn.Module):
             C = rotation_matrix_around_z(C_az)
             C_retcon = rotation_matrix_around_z(raw_axis_values[..., 0] - self.stepper_offsets[0])
             E_retcon = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.stepper_offsets[1]))
-            C_E_retcon = C_retcon @ E_retcon
-            C_E_F_p_retcon = (C_E_retcon @ F_p.unsqueeze(-1)).squeeze(-1)
+            C_D_E_retcon = C_retcon @ D @ E_retcon
+            C_D_E_F_p_retcon = (C_D_E_retcon @ F_p.unsqueeze(-1)).squeeze(-1)
 
             assert E_retcon.allclose(E, atol=1e-4, equal_nan=True)
             assert C_retcon.allclose(C, atol=1e-5, equal_nan=True)
-            assert C_E_retcon.allclose(C @ E, atol=1e-5, equal_nan=True)
-            assert Bt_At_r.allclose(C_E_F_p_retcon, atol=1e-3, equal_nan=True) or torch.isnan(C_E_F_p_retcon).any()
+            assert C_D_E_retcon.allclose(C @ D @ E, atol=1e-5, equal_nan=True)
+            assert Bt_At_r.allclose(C_D_E_F_p_retcon, atol=1e-3, equal_nan=True) or torch.isnan(C_D_E_F_p_retcon).any()
 
         return raw_axis_values
     
@@ -451,13 +460,9 @@ if __name__ == "__main__":
         with torch.no_grad():
             test_model.stepper_offsets[:] = torch.rand((2)) * 2 * math.pi
             test_model.azimuth_pitch[...] = torch.randn([]) * 2.0
-            test_model.azimuth_roll[...] = torch.rand([]) * 2.0
-            
-            test_model.collimation_error_in_azimuth[...] = torch.rand([]) * 0.1
-            
-
-            # note that this would fail for analytic, but should work for numeric
-            #test_model.non_perpendicular_axes_error[...] = torch.rand([]) * 0.5
+            test_model.azimuth_roll[...] = torch.rand([]) * 2.0            
+            test_model.collimation_error_in_azimuth[...] = torch.rand([]) * 0.1            
+            test_model.non_perpendicular_axes_error[...] = torch.rand([]) * 0.1
             pass
 
         raw = test_model.raw_axis_values_given_dir_analytic(arcturus_dir)
