@@ -34,16 +34,19 @@ class AlignmentFrame(tk.Frame):
         tab_frame = ttk.Frame(self)
         tab_frame.grid(sticky='nsew')
         tab_frame.grid_rowconfigure(1, weight=1)
-        tab_frame.grid_columnconfigure(1, weight=1)
+        tab_frame.grid_columnconfigure(2, weight=1)
         
         command_frame = ttk.LabelFrame(tab_frame, text="Commands")
         command_frame.grid(row=0, column=0, sticky='nw')        
+
+        dev_command_frame = ttk.LabelFrame(tab_frame, text="Dev")
+        dev_command_frame.grid(row=0, column=1, sticky='nw')        
         
         status_frame = ttk.LabelFrame(tab_frame, text="Current Alignment")
-        status_frame.grid(row=0, column=1, sticky='w')        
+        status_frame.grid(row=0, column=2, sticky='we')        
         
         observations_frame = ttk.LabelFrame(tab_frame, text="Observations")        
-        observations_frame.grid(row=1, column=0, columnspan=2, sticky='nsew')
+        observations_frame.grid(row=1, column=0, columnspan=3, sticky='nsew')
         observations_frame.grid_rowconfigure(1, weight=1)
         observations_frame.grid_columnconfigure(0, weight=1)
 
@@ -52,10 +55,15 @@ class AlignmentFrame(tk.Frame):
         button = ttk.Button(command_frame, text = "Add Current Observation", command = self.add_observation)   
         button.grid(sticky='w')
 
-        button = ttk.Button(command_frame, text = "Add Test Observations", command = self.add_test_observations)   
+        button = ttk.Button(command_frame, text = "Perform Alignment", command = self.align)
         button.grid(sticky='w')
 
-        button = ttk.Button(command_frame, text = "Perform Alignment", command = self.align)
+        # dev command frame
+
+        button = ttk.Button(dev_command_frame, text = "Add Test Observations", command = self.add_test_observations)   
+        button.grid(sticky='w')
+
+        button = ttk.Button(dev_command_frame, text = "Add Random Stepper Offsets", command = self.add_random_stepper_offsets)   
         button.grid(sticky='w')
 
         # status frame
@@ -173,17 +181,16 @@ class AlignmentFrame(tk.Frame):
                 [-1.53162858,  0.73345739] * u.rad
             ))
 
-        fuzz_offsets = True
-        if fuzz_offsets:
-            test_stepper_offsets = [random.random() * 2.0 * math.pi, random.random() * 2.0 * math.pi] * u.rad
-            print(f"Fuzzing offsets by {test_stepper_offsets}")
-            for alignment in test_alignments:
-                alignment.raw_axis_values += test_stepper_offsets
-                alignment.ground_truth_stepper_offset = test_stepper_offsets
-
         for alignment_datum in test_alignments:
             self.observation_items.append(AlignmentDatumTreeviewItem(alignment_datum))
         self.update_gui()        
+
+    def add_random_stepper_offsets(self):
+        test_stepper_offsets = [random.random() * 2.0 * math.pi, random.random() * 2.0 * math.pi] * u.rad
+        print(f"Fuzzing offsets by {test_stepper_offsets}")
+        for item in self.observation_items:
+            item.datum.raw_axis_values += test_stepper_offsets
+        self.update_gui()
 
     def update_gui(self):
         self.current_alignment_label.config(text = str(self.tracker.primary_telescope_alignment))

@@ -65,7 +65,8 @@ class MainWindow(tk.Tk):
 
     def update_gui(self):        
         self.status_tab.update_gui()
-        self.targets_tab.update_gui()
+        self.alignment_tab.update_gui()
+        self.targets_tab.update_gui()        
 
     def _destroy(self, *args, **kwargs):
         self.tracker.disconnect_from_telescope()

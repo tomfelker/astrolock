@@ -1,4 +1,5 @@
 import math
+import time
 import astropy.units as u
 import astropy.time
 import numpy as np
@@ -81,10 +82,14 @@ def xyz_to_azalt(xyz):
     x = xyz[..., 0]
     y = xyz[..., 1]
     z = xyz[..., 2]    
-    xy_len = (x.square() + y.square()).sqrt()
+    xy_len = torch.hypot(x, y)
     alt = torch.atan2(z, xy_len)
     az = torch.atan2(y, x)
     return torch.stack([az, alt], dim = -1)
+
+def wrap_to_pi(theta):
+    ret = torch.atan2(torch.sin(theta), torch.cos(theta))
+    return ret
 
 @torch.no_grad()
 def euler_align(target_time_to_predicted_dir, time_to_raw_axis_values):
@@ -282,8 +287,10 @@ class AlignmentModel(torch.nn.Module):
         # axis 1 is altitude, pitch, or declination (which needs no compensation)
         super().__init__()
 
-        # the az and alt that the steppers read when the telescope is pointing at 0,0 (due north on horizon)
-        # so, true = raw - offsets
+        # the az and alt that the steppers read when the telescope is pointing at 0,0 (due north on horizon), so:
+        #   true = raw - offsets
+        #   raw = true + offsets
+        #   offsets = raw - true
         self.stepper_offsets = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
 
         self.azimuth_roll = torch.nn.Parameter(torch.tensor(0.0))
@@ -306,21 +313,118 @@ class AlignmentModel(torch.nn.Module):
         return ret
 
     def matrix_given_raw_axis_values(self, raw_axis_values):
-        return (
-            rotation_matrix_around_y(self.azimuth_pitch) @
-            rotation_matrix_around_x(self.azimuth_roll) @
-            rotation_matrix_around_z(raw_axis_values[..., 0] - self.stepper_offsets[0]) @
-            rotation_matrix_around_x(self.non_perpendicular_axes_error) @
-            rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.stepper_offsets[1])) @
-            rotation_matrix_around_z(self.collimation_error_in_azimuth)
-        )
+        A = rotation_matrix_around_y(self.azimuth_pitch)
+        B = rotation_matrix_around_x(self.azimuth_roll)
+        C = rotation_matrix_around_z(raw_axis_values[..., 0] - self.stepper_offsets[0])     # azimuth
+        D = rotation_matrix_around_x(self.non_perpendicular_axes_error)
+        E = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.stepper_offsets[1]))  # altitude
+        F = rotation_matrix_around_z(self.collimation_error_in_azimuth)        
+        return A @ B @ C @ D @ E @ F
             
     def dir_given_raw_axis_values(self, raw_axis_values):
-        dirs = self.matrix_given_raw_axis_values(raw_axis_values) @ torch.tensor([[1.0], [0.0], [0.0]])
+        p = torch.tensor([[1.0], [0.0], [0.0]])
+        d = self.matrix_given_raw_axis_values(raw_axis_values) @ p
         # back to row vectors
-        dirs = dirs.reshape(dirs.shape[:-1])
-        return dirs
+        d = d.reshape(d.shape[:-1])
+        return d
+        
+    def raw_axis_values_given_dir_analytic(self, dir):
+        """
+        When going from raw axis values and the rest of our model to a direction, we have:
+
+            r = A B C D E F p
+
+        Where r is the direction we want, p is just a forward vector, and all the matrices ABCDEF
+        are dependent on our model's parameters, with particularly C and E dependent on the raw axis values.
+        Here, we are given everything except C and E, which we want to solve for.
+
+            (B' A' r) = C D E (F p)
+
+        The quantities in parens are vectors we can compute directly, so we could symbolically expand
+
+        (B'A'r).x       cos(c)  -sin(c) 0       1   0       0           cos(e)  0   sin(e)      (F p).x
+        (B'A'r).y   =   sin(c)  cos(c)  0   *   0   cos(d)  -sin(d) *   0       1   0       *   (F p).y
+        (B'A'r).z       0       0       1       0   sin(d)  cos(d)      -sin(e) 0   cos(e)      (F p).z
+
+        But that probably gets crazy when D is non-identity, which means we have cross-axis error.
+        If instead we assume D is identity, we just have:
+
+            r = A B C E F p
+            (B' A' r) = C E (F p)
+        
+        Which we could also figure symbolically, but really, since we can compute the values in parens,
+        we just need to formulate C E in terms of a yaw and pitch so that it solves that equation.
+
+        Think of it like you're flying a plane.  You have a bug on your windshield at some point off to
+        the side of your crosshairs, (F p), that you'd like to point in some arbitrary direction (B' A' r),
+        using only yaw and pitch (no roll).  It'd normally be possible, but if the bug was very far off to
+        the side (like near your wing), and the target point was very high, you might not get the high
+        enough no matter how you pitch.  (You'd also need roll...)
+
+        cos(self.collimation_error_in_azimuth) determines the 'arm' of your bug
+        lhs[2] is how high we need the bug
+        pitch is acos(lhs[2] / cos(self.collimation_error_in_azimuth))   # can be nan if that's > 1
+
+        """
+
+        A = rotation_matrix_around_y(self.azimuth_pitch)
+        B = rotation_matrix_around_x(self.azimuth_roll)
+        F = rotation_matrix_around_z(self.collimation_error_in_azimuth)
+        
+        Bt_At_r = (B.mT @ A.mT @ dir.unsqueeze(-1)).squeeze(-1)
+
+        p = torch.tensor([1.0, 0.0, 0.0])
+        F_p = (F @ p.unsqueeze(-1)).squeeze(-1)
+       
+        
+        # note that this can NaN if the collimation error is too great, so you can't get the 'bug' high enough with any pitch.
+        E_alt = torch.asin(Bt_At_r[..., 2] / torch.cos(self.collimation_error_in_azimuth))
+        E = rotation_matrix_around_y(-E_alt)  # minus because our handedness is weird
+        E_F_p = (E @ F_p.unsqueeze(-1)).squeeze(-1)
+        E_F_p_az = torch.atan2(E_F_p[..., 1], E_F_p[..., 0])
+        Bt_At_r_az = torch.atan2(Bt_At_r[..., 1], Bt_At_r[..., 0])
+        C_az = Bt_At_r_az - E_F_p_az
+
+        # if we didn't care about collimation_error, the simpler version of the above would be:
+        #   Bt_At_r_azalt = xyz_to_azalt(Bt_At_r)
+        #   C_az = Bt_At_r_azalt[..., 0]
+        #   E_alt = Bt_At_r_azalt[..., 1]
+
+        raw_axis_values = torch.stack([
+            C_az + self.stepper_offsets[0],
+            E_alt + self.stepper_offsets[1]
+        ], dim=-1)
+
+        if True:
+            # check:
+            C = rotation_matrix_around_z(C_az)
+            C_retcon = rotation_matrix_around_z(raw_axis_values[..., 0] - self.stepper_offsets[0])
+            E_retcon = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.stepper_offsets[1]))
+            C_E_retcon = C_retcon @ E_retcon
+            C_E_F_p_retcon = (C_E_retcon @ F_p.unsqueeze(-1)).squeeze(-1)
+
+            assert E_retcon.allclose(E, atol=1e-5)
+            assert C_retcon.allclose(C, atol=1e-5)
+            assert C_E_retcon.allclose(C @ E, atol=1e-5)
+            assert Bt_At_r.allclose(C_E_F_p_retcon, atol=1e-3)
+
+        return raw_axis_values
     
+    def raw_axis_values_given_dir_numeric(self, dir):
+        raw_axis_values = torch.zeros(2, requires_grad=True)
+        optimizer = torch.optim.Adam([raw_axis_values], lr=0.1)
+        for _ in range(1000):
+            optimizer.zero_grad()
+            loss = torch.sum((self.dir_given_raw_axis_values(raw_axis_values) - dir.detach())**2)
+            loss.backward()
+            optimizer.step()
+
+        print(loss)
+        # Return the optimized raw axis values
+        return raw_axis_values.detach()
+
+    
+
     def forward(self, raw_axis_values):
         return self.dir_given_raw_axis_values(raw_axis_values)
 
@@ -335,9 +439,35 @@ if __name__ == "__main__":
     #should match:
     #time 2 Arcturus at tensor([-0.2043,  0.5604,  0.8026], dtype=torch.float64)
 
-    print(test_model.dir_given_raw_axis_values(torch.tensor([1.92051186, 0.93189984])))
+    arcturus_altaz = torch.tensor([1.92051186, 0.93189984])
+    arcturus_dir = torch.tensor([-0.2043,  0.5604,  0.8026])
+    reconstructed_arcturus_dir = test_model.dir_given_raw_axis_values(arcturus_altaz)
+    #print(reconstructed_arcturus_dir)
+    #print(arcturus_dir)
+    assert reconstructed_arcturus_dir.allclose(arcturus_dir, atol=1e-3)
 
-    # should just double, but matrix mult is being funky...
-    print(test_model.dir_given_raw_axis_values(torch.tensor(
-        [[1.92051186, 0.93189984],
-         [1.92051186, 0.93189984]])))
+    test_model = AlignmentModel()
+    for _ in range(100):
+        with torch.no_grad():
+            test_model.stepper_offsets[:] = torch.rand((2)) * 2 * math.pi
+            test_model.azimuth_pitch[...] = torch.randn([]) * 2.0
+            test_model.azimuth_roll[...] = torch.rand([]) * 2.0
+            
+            
+            # my confusion is why I can't uncomment this:
+            #test_model.collimation_error_in_azimuth[...] = .69 #torch.rand([]) * 0.5
+            
+
+            # note that this would fail for analytic, but should work for numeric
+            #test_model.non_perpendicular_axes_error[...] = torch.rand([]) * 0.5
+            pass
+
+        raw = test_model.raw_axis_values_given_dir_analytic(arcturus_dir)
+        reconstructed_arcturus_dir = test_model.dir_given_raw_axis_values(raw)
+        print(reconstructed_arcturus_dir)
+        print(arcturus_dir)
+        assert reconstructed_arcturus_dir.allclose(arcturus_dir, atol=1e-3)
+
+    print("Tests passed!")
+
+
