@@ -40,7 +40,7 @@ Okay so how to do this?
 
 What are the variables?
 
-    - stepper offsets (2 numbers)
+    - encoder offsets (2 numbers)
     - roll and pitch of azimuth axis (2 numbers, can assume zeros if you leveled/polar aligned it well)
     - axis misalignments (2 numbers, can assume zeros if telescope didn't fall off back of truck)
     - incorrect lattitude / longitude (2 numbers - for distant targets, degenerate with roll and pitch of azimuth axis)
@@ -48,7 +48,7 @@ What are the variables?
     - various fudge factors for mirror flop, 
 
 What should be possible?
-- 1 datum for a known target: can get stepper offsets
+- 1 datum for a known target: can get encoder offsets
 - 2 data points for known targets: can correct for imperfect leveling/polar alignment
 - 2 data points for unknown targets:
     - should be able to deduce targets if accurate enough / not unlucky with targets of the same separation
@@ -110,7 +110,7 @@ def euler_align(target_time_to_predicted_dir, time_to_raw_axis_values):
             model = AlignmentModel()
             # true = raw - offsets
             # offsets = raw - true
-            model.stepper_offsets[:] =  time_to_raw_axis_values[time_to_trust, :] - target_time_to_predicted_azalt[trusted_target, time_to_trust, :]
+            model.encoder_offsets[:] =  time_to_raw_axis_values[time_to_trust, :] - target_time_to_predicted_azalt[trusted_target, time_to_trust, :]
             models.append(model)
 
     # figure out where those models pointed at each observation
@@ -163,7 +163,7 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_samp
         batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
         for batch_index in range(0, batch_size):
             model = AlignmentModel()
-            model.stepper_offsets[:] = torch.rand(2) * (2.0 * math.pi)
+            model.encoder_offsets[:] = torch.rand(2) * (2.0 * math.pi)
             # TODO: could sample other things here, but probably not necessary
 
             batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
@@ -280,31 +280,41 @@ def rotation_matrix_around_z(theta):
 
 class AlignmentModel(torch.nn.Module):
     def __init__(self):
-        # see https://www.wildcard-innovations.com.au/geometric_mount_errors.html
-        # for helpful pictures and names.
-
-        # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
-        # axis 1 is altitude, pitch, or declination (which needs no compensation)
         super().__init__()
 
-        # the az and alt that the steppers read when the telescope is pointing at 0,0 (due north on horizon), so:
+        # The az and alt that the encoders would read if the telescope were pointing at 0,0 (due north on horizon).  Thus:
         #   true = raw - offsets
         #   raw = true + offsets
         #   offsets = raw - true
-        self.stepper_offsets = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
+        # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
+        # axis 1 is altitude, pitch, or declination (which needs no compensation)
+        self.encoder_offsets = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
 
-        self.azimuth_roll = torch.nn.Parameter(torch.tensor(0.0))
-        self.azimuth_pitch = torch.nn.Parameter(torch.tensor(0.0))
+        self.zenith_roll = torch.nn.Parameter(torch.tensor(0.0))
+        self.zenith_pitch = torch.nn.Parameter(torch.tensor(0.0))
+        # see https://www.wildcard-innovations.com.au/geometric_mount_errors.html
+        # for helpful pictures and names.
         self.non_perpendicular_axes_error = torch.nn.Parameter(torch.tensor(0.0))
         self.collimation_error_in_azimuth = torch.nn.Parameter(torch.tensor(0.0))
+        
+    def randomize(self):
+        self.randomize_encoder_offsets()
+        self.randomize_zenith_error()
+        self.randomize_mount_errors()
 
-        # How does the telescope move?  Imagine it's sitting on the ground, pointed at the horizon to the north (looking along +x in the North East Down frame)
-        # - rotate it around local Y by self.azimuth_pitch
-        # - rotate it around local X by self.azimuth_roll
-        # - rotate it around local Z by self.raw_axis_values[0] - self.stepper_offsets[0]  (azimuth)
-        # - rotate it around local X by self.non_perpendicular_axes_error
-        # - rotate it around local Y by self.raw_axis_values[1] - self.stepper_offsets[1]  (altitude)
-        # - rotate it around local Z by self.collimation_error_in_azimuth
+    def randomize_encoder_offsets(self):
+        with torch.no_grad():
+            self.encoder_offsets[:] = torch.rand((2)) * 2 * math.pi
+
+    def randomize_zenith_error(self, stdev_radians = math.radians(5.0)):
+        with torch.no_grad():
+            self.zenith_pitch[...] = torch.randn([]) * stdev_radians
+            self.zenith_roll[...] = torch.rand([]) * stdev_radians
+
+    def randomize_mount_errors(self, stdev_radians = math.radians(1.0)):
+        with torch.no_grad():
+            self.collimation_error_in_azimuth[...] = torch.rand([]) * stdev_radians
+            self.non_perpendicular_axes_error[...] = torch.rand([]) * stdev_radians
 
     def __repr__(self):
         ret = "AlignmentModel\n"
@@ -313,19 +323,33 @@ class AlignmentModel(torch.nn.Module):
         return ret
 
     def matrix_given_raw_axis_values(self, raw_axis_values):
-        A = rotation_matrix_around_y(self.azimuth_pitch)
-        B = rotation_matrix_around_x(self.azimuth_roll)
-        C = rotation_matrix_around_z(raw_axis_values[..., 0] - self.stepper_offsets[0])     # azimuth
+        # How does the telescope move?  Imagine it's sitting on the ground, pointed at the horizon to the north (looking along +x in the North East Down frame).
+        # It then undergoes the following rotations:
+
+        # These two are caused by the tripod not being level.  Or, if this were an eqatorial mount rather than AltAz,
+        # it would also include the lattitude, such that the zenith would coincide with the celestial pole.
+        A = rotation_matrix_around_y(self.zenith_pitch)
+        B = rotation_matrix_around_x(self.zenith_roll)
+
+        # This is the azimuth (yaw) of the telescope, including both what the encoders measure, and also the initially-unknown offset.
+        C = rotation_matrix_around_z(raw_axis_values[..., 0] - self.encoder_offsets[0])
+
+        # This would be if one of the fork arms were slightly longer than the other, so that when we pitch the telescope, it's not moving straight up.
         D = rotation_matrix_around_x(self.non_perpendicular_axes_error)
-        E = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.stepper_offsets[1]))  # altitude
+
+        # This is the altitude (pitch) of the telescope, including both what the encoders measure, and also the initially-unknown offset.
+        # Note the minus sign, because of the handedness of our coordinate system.
+        E = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.encoder_offsets[1]))
+
+        # This would be if the optical tube were pointing slightly to the right or left, so that when we pitch, it moves in a cone rather than a plane.
         F = rotation_matrix_around_z(self.collimation_error_in_azimuth)        
+        
         return A @ B @ C @ D @ E @ F
             
     def dir_given_raw_axis_values(self, raw_axis_values):
         p = torch.tensor([[1.0], [0.0], [0.0]])
         d = self.matrix_given_raw_axis_values(raw_axis_values) @ p
-        # back to row vectors
-        d = d.reshape(d.shape[:-1])
+        d = d.squeeze(-1)
         return d
         
     def raw_axis_values_given_dir_analytic(self, dir):
@@ -370,8 +394,8 @@ class AlignmentModel(torch.nn.Module):
         """
 
         # These should match what they are in matrix_given_raw_axis_values()
-        A = rotation_matrix_around_y(self.azimuth_pitch)
-        B = rotation_matrix_around_x(self.azimuth_roll)
+        A = rotation_matrix_around_y(self.zenith_pitch)
+        B = rotation_matrix_around_x(self.zenith_roll)
         D = rotation_matrix_around_x(self.non_perpendicular_axes_error)
         F = rotation_matrix_around_z(self.collimation_error_in_azimuth)
         
@@ -383,32 +407,32 @@ class AlignmentModel(torch.nn.Module):
         B_At_r_z = Bt_At_r[..., 2]
         bug_x = torch.cos(self.collimation_error_in_azimuth)
         bug_y = torch.sin(self.collimation_error_in_azimuth)        
-        center_z = B_At_r_z / torch.cos(self.non_perpendicular_axes_error)
-        bug_z = center_z - bug_y * torch.tan(self.non_perpendicular_axes_error)
-        # note that this could NaN if bug_z / bug_x is outside (-1, 1), which means you can't get the bug 'high enough' no matter what you do.
-        # let's clamp it, so we'll try as hard as possible.
-        E_alt = torch.asin(torch.clamp(bug_z / bug_x, -1.0, 1.0))
+        target_z_at_center = B_At_r_z / torch.cos(self.non_perpendicular_axes_error)
+        target_z_at_bug = target_z_at_center - bug_y * torch.tan(self.non_perpendicular_axes_error)
+        # Note that this could NaN if target_z_at_bug / bug_x is outside (-1, 1), which means you can't get the bug 'high enough' no matter what you do.
+        # Let's clamp it, which geomerically means that we'll pitch fully up or down to get as close as possible.
+        E_alt = torch.asin(torch.clamp(target_z_at_bug / bug_x, -1.0, 1.0))
         E = rotation_matrix_around_y(-E_alt)  # minus because our handedness is weird
         D_E_F_p = (D @ E @ F_p.unsqueeze(-1)).squeeze(-1)
         D_E_F_p_az = torch.atan2(D_E_F_p[..., 1], D_E_F_p[..., 0])
         Bt_At_r_az = torch.atan2(Bt_At_r[..., 1], Bt_At_r[..., 0])
         C_az = Bt_At_r_az - D_E_F_p_az
 
-        # if we didn't care about collimation_error, the simpler version of the above would be:
+        # if we didn't care about the errors, the simpler version of the above would be:
         #   Bt_At_r_azalt = xyz_to_azalt(Bt_At_r)
         #   C_az = Bt_At_r_azalt[..., 0]
         #   E_alt = Bt_At_r_azalt[..., 1]
 
         raw_axis_values = torch.stack([
-            C_az + self.stepper_offsets[0],
-            E_alt + self.stepper_offsets[1]
+            C_az + self.encoder_offsets[0],
+            E_alt + self.encoder_offsets[1]
         ], dim=-1)
 
         if True:
             # check:
             C = rotation_matrix_around_z(C_az)
-            C_retcon = rotation_matrix_around_z(raw_axis_values[..., 0] - self.stepper_offsets[0])
-            E_retcon = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.stepper_offsets[1]))
+            C_retcon = rotation_matrix_around_z(raw_axis_values[..., 0] - self.encoder_offsets[0])
+            E_retcon = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.encoder_offsets[1]))
             C_D_E_retcon = C_retcon @ D @ E_retcon
             C_D_E_F_p_retcon = (C_D_E_retcon @ F_p.unsqueeze(-1)).squeeze(-1)
 
@@ -451,22 +475,17 @@ if __name__ == "__main__":
     arcturus_altaz = torch.tensor([1.92051186, 0.93189984])
     arcturus_dir = torch.tensor([-0.2043,  0.5604,  0.8026])
     reconstructed_arcturus_dir = test_model.dir_given_raw_axis_values(arcturus_altaz)
-    #print(reconstructed_arcturus_dir)
-    #print(arcturus_dir)
-    assert reconstructed_arcturus_dir.allclose(arcturus_dir, atol=1e-3)
+    print(reconstructed_arcturus_dir)
+    print(arcturus_dir)
+    assert reconstructed_arcturus_dir.allclose(arcturus_dir, rtol=1e-4, atol=1e-3)
 
     test_model = AlignmentModel()
     for _ in range(100):
-        with torch.no_grad():
-            test_model.stepper_offsets[:] = torch.rand((2)) * 2 * math.pi
-            test_model.azimuth_pitch[...] = torch.randn([]) * 2.0
-            test_model.azimuth_roll[...] = torch.rand([]) * 2.0            
-            test_model.collimation_error_in_azimuth[...] = torch.rand([]) * 0.1            
-            test_model.non_perpendicular_axes_error[...] = torch.rand([]) * 0.1
-            pass
+        test_model.randomize()
 
         raw = test_model.raw_axis_values_given_dir_analytic(arcturus_dir)
         reconstructed_arcturus_dir = test_model.dir_given_raw_axis_values(raw)
+
         print(reconstructed_arcturus_dir)
         print(arcturus_dir)
         assert reconstructed_arcturus_dir.allclose(arcturus_dir, atol=1e-3) or torch.isnan(reconstructed_arcturus_dir).any()
