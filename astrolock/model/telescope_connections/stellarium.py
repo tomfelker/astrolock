@@ -3,7 +3,8 @@ import time
 import astropy.units as u
 import astropy.time
 import math
-
+import astrolock.model.alignment
+import numpy as np
 
 import astrolock.model.telescope_connections.threaded as threaded
 
@@ -21,6 +22,11 @@ class StellariumConnection(threaded.ThreadedConnection):
         # this API can't easily tell us the AltAz without refraction, so we'll just have to turn off refraction in the GUI
         # and request refraction not be used when giving us coordinates
         self.want_atmospheric_refaction = False
+
+        self.fake_misalignment = astrolock.model.alignment.AlignmentModel()
+        if True:
+            self.fake_misalignment.randomize_encoder_offsets()
+
 
     def loop(self):
         while not self.want_to_stop:
@@ -43,11 +49,14 @@ class StellariumConnection(threaded.ThreadedConnection):
                 terrestrial_dir_str = view_json['altAz']
                 terrestrial_dir_vec_str = terrestrial_dir_str.strip('[]').split(',')
                 terrestrial_dir_vec = list(map(lambda s: float(s), terrestrial_dir_vec_str))
-                alt_rad = math.asin(terrestrial_dir_vec[2])
-                az_rad = math.atan2(terrestrial_dir_vec[1], -terrestrial_dir_vec[0])
-                self.axis_angles[0] = az_rad * u.rad
-                self.axis_angles[1] = alt_rad * u.rad
-                
+                # terrestrial_dir_vec is (South?, East, Up) ?
+
+                terrestrial_dir_vec = np.array(terrestrial_dir_vec, dtype=np.float32) * np.array([-1.0, 1.0, 1.0], dtype=np.float32)
+                #alt_rad = math.asin(terrestrial_dir_vec[2])
+                #az_rad = math.atan2(terrestrial_dir_vec[1], -terrestrial_dir_vec[0])
+
+                self.axis_angles = self.fake_misalignment.raw_axis_values_given_dir(terrestrial_dir_vec) * u.rad
+               
                 # now we will set our rates, which requires knowing the FOV
 
                 #self.tracker.update_gui_callback()

@@ -351,7 +351,12 @@ class AlignmentModel(torch.nn.Module):
         d = self.matrix_given_raw_axis_values(raw_axis_values) @ p
         d = d.squeeze(-1)
         return d
-        
+
+    def raw_axis_values_given_dir(self, dir):
+        dir = torch.tensor(dir)
+        # for now, the analytic version encompasses everything!
+        return self.raw_axis_values_given_dir_analytic(dir).detach()
+
     def raw_axis_values_given_dir_analytic(self, dir):
         """
         When going from raw axis values and the rest of our model to a direction, we have:
@@ -392,6 +397,8 @@ class AlignmentModel(torch.nn.Module):
 
         Then it's a simple matter of inverting some things and subtracting to figure the yaw.
         """
+
+        dir = dir / torch.norm(dir, dim=-1, keepdim=True)
 
         # These should match what they are in matrix_given_raw_axis_values()
         A = rotation_matrix_around_y(self.zenith_pitch)

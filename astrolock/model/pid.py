@@ -1,4 +1,5 @@
 import astropy.units as u
+from astropy.coordinates import Angle
 
 class PIDController:
     def __init__(self):
@@ -20,7 +21,7 @@ class PIDController:
         predicted_position_at_desired_time = measured_position + commanded_rate * measured_to_desired_time
 
         error = desired_position - predicted_position_at_desired_time
-        error = error.wrap_at(180 * u.deg)
+        error = Angle(error).wrap_at(180 * u.deg)
 
         control_rate = desired_rate + error * self.proportional_gain
         return control_rate

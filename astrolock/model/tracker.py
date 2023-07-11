@@ -128,7 +128,7 @@ class Tracker(object):
     def _compute_rates(self, store):
         with self.lock:
             monotonic_time_ns = time.monotonic_ns()
-            dt = 0
+            dt = 1.0
             if self.monotonic_time_ns_of_last_input is not None:
                 elapsed_since_last_input_ns = monotonic_time_ns - self.monotonic_time_ns_of_last_input
                 dt = elapsed_since_last_input_ns * 1e-9
@@ -140,21 +140,25 @@ class Tracker(object):
 
     def _compute_rates_with_target(self, dt, store):
         now = astropy.time.Time.now()
-        altaz, altaz_rates = self.target.altaz_and_rates_at_time(tracker = self, time = now)
+        dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = now)
+
+        desired_true_axis_positions = np.array(dir, dtype=np.float32)
+        desired_true_axis_rates = np.array(rates, dtype=np.float32)
+
+        desired_raw_axis_positions = self.primary_telescope_alignment.raw_axis_values_given_dir(desired_true_axis_positions)
+
+        # haha, just inverting was hard enough, let's differentiate numerically...
+        desired_true_axis_positions_after_dt = desired_true_axis_positions + desired_true_axis_rates * dt
+        desired_raw_axis_positions_after_dt = self.primary_telescope_alignment.raw_axis_values_given_dir(desired_true_axis_positions_after_dt)
+        desired_raw_axis_rates = (desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / dt
         
-        desired_axis_positions = [
-            altaz.az,
-            altaz.alt
-        ] 
-        # swizzle?
-        desired_axis_rates = altaz_rates
 
         rates = np.zeros(2)
         if self.primary_telescope_connection is not None:
             for axis_index, pid_controller in enumerate(self.pid_controllers):            
                 control_rate = pid_controller.compute_control_rate(
-                    desired_position = desired_axis_positions[axis_index],
-                    desired_rate = desired_axis_rates[axis_index],
+                    desired_position = desired_raw_axis_positions[axis_index] * u.rad,
+                    desired_rate = desired_raw_axis_rates[axis_index] * u.rad / u.s,
                     desired_time = now,
                     commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index],
                     measured_position = self.primary_telescope_connection.axis_angles[axis_index],

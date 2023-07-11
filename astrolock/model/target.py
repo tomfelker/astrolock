@@ -83,16 +83,26 @@ class Target:
 
     def altaz_and_rates_at_time(self, tracker, time, dt = 1.0 * u.s):
         
-        altaz = self.altaz_at_time(tracker, time)       
-
+        altaz = self.altaz_at_time(tracker=tracker, time=time)
         future_altaz = self.altaz_at_time(tracker=tracker, time=time + dt)
+
         rates = [
             (future_altaz.az - altaz.az).wrap_at(180 * u.deg) / dt,
             (future_altaz.alt - altaz.alt).wrap_at(180 * u.deg) / dt
         ]
         
         return altaz, rates
-                
+    
+    def dir_and_rates_at_time(self, tracker, time, dt = 1.0 * u.s):
 
+        altaz = self.altaz_at_time(tracker=tracker, time=time)
+        future_altaz = self.altaz_at_time(tracker=tracker, time=time + dt)
+
+        dir = altaz.cartesian.xyz.to_value()
+        future_dir = future_altaz.cartesian.xyz.to_value()
+
+        rates = (future_dir - dir) / dt.to_value(u.s)
+
+        return dir, rates
                 
     
