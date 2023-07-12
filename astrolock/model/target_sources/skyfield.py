@@ -56,6 +56,24 @@ class SkyfieldTargetSource(target_source.TargetSource):
 
         stars_df = stars_df[stars_df['magnitude'] <= mag_limit]
 
+        star_names_url = 'https://www.pas.rochester.edu/~emamajek/WGSN/IAU-CSN.txt'
+        hip_to_name = {}
+        with loader.open(star_names_url) as f:
+            # Sigh, have they not heard the gospel of JSON?  Or even CSV?  It's {datetime.date.today().year}!
+            # The encoding is based on fixed columns, yet also it's UTF-8 encoded, so even that's complex!
+            f_str = f.read().decode('UTF-8')
+            for line in f_str.split('\n'):
+                # omfg
+                if len(line) < 1 or line[0] in ('#', '$'):
+                    continue
+                name = line[18:36].rstrip()
+                hip = line[90:96]
+                if '_' in hip:
+                    continue
+                hip = int(hip)
+                hip_to_name[hip] = name
+
+
         planet_ephemeris = 'de440.bsp'
         planets = loader(planet_ephemeris)
 
@@ -70,7 +88,11 @@ class SkyfieldTargetSource(target_source.TargetSource):
 
             new_target = SkyfieldTarget(star)
             new_target.url = url
+
             new_target.display_name = f"HIP {star_index}"
+            if star_index in hip_to_name:
+                new_target.display_name = f'{hip_to_name[star_index]} ({new_target.display_name})'
+
 
             self.target_map[url] = new_target
             

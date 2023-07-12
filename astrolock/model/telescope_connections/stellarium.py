@@ -5,6 +5,7 @@ import astropy.time
 import math
 import astrolock.model.alignment
 import numpy as np
+import torch
 
 import astrolock.model.telescope_connections.threaded as threaded
 
@@ -25,7 +26,8 @@ class StellariumConnection(threaded.ThreadedConnection):
 
         self.fake_misalignment = astrolock.model.alignment.AlignmentModel()
         if True:
-            self.fake_misalignment.randomize_encoder_offsets()
+            self.fake_misalignment.randomize()
+            print(f"Stellarium connection using random fake misalignment: {self.fake_misalignment}")
 
 
     def loop(self):
@@ -55,7 +57,7 @@ class StellariumConnection(threaded.ThreadedConnection):
                 #alt_rad = math.asin(terrestrial_dir_vec[2])
                 #az_rad = math.atan2(terrestrial_dir_vec[1], -terrestrial_dir_vec[0])
 
-                self.axis_angles = self.fake_misalignment.raw_axis_values_given_dir(terrestrial_dir_vec) * u.rad
+                self.axis_angles = self.fake_misalignment.raw_axis_values_given_dir(torch.tensor(terrestrial_dir_vec)).detach().numpy() * u.rad
                
                 # now we will set our rates, which requires knowing the FOV
 

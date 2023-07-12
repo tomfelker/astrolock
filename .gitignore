@@ -2,3 +2,4 @@
 **/*.bsp
 .vs/**
 hip_main.dat
+data/skyfield_cache/**

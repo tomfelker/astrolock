@@ -277,12 +277,12 @@ class AlignmentFrame(tk.Frame):
 
     def load_observations(self):
         filename = tkinter.filedialog.askopenfilename(defaultextension='json', filetypes=[('JSON','*.json')], initialdir=os.path.join('data', 'alignments'))
-        if filename is not None:
+        if filename is not '':
             self.load_observations_from_filename(filename)
 
     def save_observations(self):
         filename = tkinter.filedialog.asksaveasfilename(defaultextension='json', filetypes=[('JSON','*.json')], initialdir=os.path.join('data', 'alignments'))
-        if filename is not None:
+        if filename is not '':
             self.save_observations_to_filename(filename)
 
     def set_selection_enabled(self, enabled):

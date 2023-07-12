@@ -139,7 +139,7 @@ def euler_align(target_time_to_predicted_dir, time_to_raw_axis_values):
 
 
 @torch.no_grad()
-def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_samples = 100000, max_batch_size = 10000):
+def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batches = 10):
     """
     Try many random guesses for alignment, and return the best one.  Hopefully, if it's good enough, it will be in the watershed of the global optimum.
 
@@ -154,20 +154,31 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_samp
     best_time_to_target = None
     best_model = None
 
-    for first_sample in range(0, num_samples, max_batch_size):
-        batch_size = min(max_batch_size, num_samples - first_sample)
+    for batch in range(0, num_batches):
+        batch_size = num_targets * num_observations
 
-        print(f"Calculating guesses {first_sample + 1}-{first_sample + batch_size} of {num_samples}...", end='')
+        print(f"Calculating batch {batch} of {num_batches}...", end='')
 
         models = []
         batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
-        for batch_index in range(0, batch_size):
-            model = AlignmentModel()
-            model.encoder_offsets[:] = torch.rand(2) * (2.0 * math.pi)
-            # TODO: could sample other things here, but probably not necessary
+        
+        # this outer loop isn't strictly necessary and multiplies the amount of work, but makes us
+        # resilient to the case where our first observation was further off than the others were.
+        for time_to_trust in range(num_observations):
+            # for each target, make a model based on the assumption that our trusted observation was of that target.
+            for trusted_target in range(num_targets):
+                batch_index = time_to_trust * num_targets + trusted_target
+    
+                model = AlignmentModel()
+                model.randomize_zenith_error()
+                model.randomize_mount_errors()
 
-            batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
-            models.append(model)
+                model.encoder_offsets[:] = time_to_raw_axis_values[time_to_trust] - model.raw_axis_values_given_dir(target_time_to_predicted_dir[trusted_target, time_to_trust])
+                
+                batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
+                models.append(model)
+
+        print(f".", end='')
 
         batch_target_time_to_dot = torch.einsum('...tod,...od->...to', target_time_to_predicted_dir, batch_time_to_observed_dir)
 
@@ -189,6 +200,7 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_samp
     return best_model, best_time_to_target
 
 
+@torch.no_grad()
 def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 85.0 * u.deg):
     num_observations = len(alignment_data)
     num_targets = len(targets)
@@ -228,11 +240,11 @@ def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 8
 
     print(f"Filtered down to {len(filtered_targets)} targets.");
 
-    #print("Running random alignment...")
-    #rough_alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values)
+    print("Running random alignment...")
+    rough_alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values)
 
-    print("Running euler alignment...")
-    rough_alignment, time_to_target = euler_align(target_time_to_predicted_dir, time_to_raw_axis_values)
+    #print("Running euler alignment...")
+    #rough_alignment, time_to_target = euler_align(target_time_to_predicted_dir, time_to_raw_axis_values)
 
     print("Identification:")
     for time_index, filtered_target_index in enumerate(time_to_target):
@@ -306,12 +318,12 @@ class AlignmentModel(torch.nn.Module):
         with torch.no_grad():
             self.encoder_offsets[:] = torch.rand((2)) * 2 * math.pi
 
-    def randomize_zenith_error(self, stdev_radians = math.radians(5.0)):
+    def randomize_zenith_error(self, stdev_radians = math.radians(1.0)):
         with torch.no_grad():
             self.zenith_pitch[...] = torch.randn([]) * stdev_radians
             self.zenith_roll[...] = torch.rand([]) * stdev_radians
 
-    def randomize_mount_errors(self, stdev_radians = math.radians(1.0)):
+    def randomize_mount_errors(self, stdev_radians = math.radians(0.1)):
         with torch.no_grad():
             self.collimation_error_in_azimuth[...] = torch.rand([]) * stdev_radians
             self.non_perpendicular_axes_error[...] = torch.rand([]) * stdev_radians
@@ -353,9 +365,8 @@ class AlignmentModel(torch.nn.Module):
         return d
 
     def raw_axis_values_given_dir(self, dir):
-        dir = torch.tensor(dir)
         # for now, the analytic version encompasses everything!
-        return self.raw_axis_values_given_dir_analytic(dir).detach()
+        return self.raw_axis_values_given_dir_analytic(dir)
 
     def raw_axis_values_given_dir_analytic(self, dir):
         """
