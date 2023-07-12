@@ -139,7 +139,7 @@ def euler_align(target_time_to_predicted_dir, time_to_raw_axis_values):
 
 
 @torch.no_grad()
-def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batches = 10):
+def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batches = 5):
     """
     Try many random guesses for alignment, and return the best one.  Hopefully, if it's good enough, it will be in the watershed of the global optimum.
 
@@ -155,32 +155,31 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
     best_model = None
 
     for batch in range(0, num_batches):
-        batch_size = num_targets * num_observations
-
         print(f"Calculating batch {batch} of {num_batches}...", end='')
 
-        models = []
-        batch_time_to_observed_dir = torch.zeros((batch_size, num_observations, num_spatial_dimensions))
+        # Make a batch of models, one for each guess of the form "we were looking directly at this target index at this time index"
+        batch_size = num_targets * num_observations
+        batch_to_model = AlignmentModel((batch_size,))
+
+        # If we're doing many batches, we want to be resilient to these possible errors.  (With just one, we can't be, or the model could fit anything.)
+        if num_batches > 1:            
+            batch_to_model.randomize_zenith_error()
+            batch_to_model.randomize_mount_errors()
+
+        # This is copying our raw axis values (with known times but unknown target) into each target.
+        target_time_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(0).expand((num_targets, -1, -1))
+
+        # Reshape these so we can jam them through the batched model.
+        batch_to_raw_axis_values = target_time_to_raw_axis_values.reshape((batch_size, 2))
+        batch_to_predicted_dir = target_time_to_predicted_dir.reshape(batch_size, num_spatial_dimensions)
         
-        # this outer loop isn't strictly necessary and multiplies the amount of work, but makes us
-        # resilient to the case where our first observation was further off than the others were.
-        for time_to_trust in range(num_observations):
-            # for each target, make a model based on the assumption that our trusted observation was of that target.
-            for trusted_target in range(num_targets):
-                batch_index = time_to_trust * num_targets + trusted_target
-    
-                model = AlignmentModel()
-                model.randomize_zenith_error()
-                model.randomize_mount_errors()
+        # For each element in the batch (each assumption about which target and time we were looking at), what would our encoder offsets have needed to be?
+        batch_to_model.encoder_offsets[:] = batch_to_raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
 
-                model.encoder_offsets[:] = time_to_raw_axis_values[time_to_trust] - model.raw_axis_values_given_dir(target_time_to_predicted_dir[trusted_target, time_to_trust])
-                
-                batch_time_to_observed_dir[batch_index, :, :] = model.dir_given_raw_axis_values(time_to_raw_axis_values[:, :])
-                models.append(model)
+        time_batch_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(1)
+        time_batch_to_observed_dir = batch_to_model.dir_given_raw_axis_values(time_batch_to_raw_axis_values)
 
-        print(f".", end='')
-
-        batch_target_time_to_dot = torch.einsum('...tod,...od->...to', target_time_to_predicted_dir, batch_time_to_observed_dir)
+        batch_target_time_to_dot = torch.einsum('tod,obd->bto', target_time_to_predicted_dir, time_batch_to_observed_dir)
 
         (batch_time_to_best_dot, batch_time_to_best_target) = torch.max(batch_target_time_to_dot, dim=-2)
 
@@ -193,7 +192,7 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
         if best_loss_in_batch < best_loss:
             best_loss = best_loss_in_batch
             best_time_to_target = batch_time_to_best_target[best_batch_index, :]
-            best_model = models[best_batch_index]
+            best_model = AlignmentModel.choose_submodel(batch_to_model, best_batch_index)
 
         print(f" loss {best_loss} with assignments {best_time_to_target}")
 
@@ -291,8 +290,10 @@ def rotation_matrix_around_z(theta):
 
 
 class AlignmentModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, batch_shape = ()):
         super().__init__()
+
+        self.batch_shape = batch_shape
 
         # The az and alt that the encoders would read if the telescope were pointing at 0,0 (due north on horizon).  Thus:
         #   true = raw - offsets
@@ -300,15 +301,22 @@ class AlignmentModel(torch.nn.Module):
         #   offsets = raw - true
         # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
         # axis 1 is altitude, pitch, or declination (which needs no compensation)
-        self.encoder_offsets = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
+        self.encoder_offsets = torch.nn.Parameter(torch.zeros(batch_shape + (2,)))
 
-        self.zenith_roll = torch.nn.Parameter(torch.tensor(0.0))
-        self.zenith_pitch = torch.nn.Parameter(torch.tensor(0.0))
+        self.zenith_roll = torch.nn.Parameter(torch.zeros(batch_shape))
+        self.zenith_pitch = torch.nn.Parameter(torch.zeros(batch_shape))
         # see https://www.wildcard-innovations.com.au/geometric_mount_errors.html
         # for helpful pictures and names.
-        self.non_perpendicular_axes_error = torch.nn.Parameter(torch.tensor(0.0))
-        self.collimation_error_in_azimuth = torch.nn.Parameter(torch.tensor(0.0))
+        self.non_perpendicular_axes_error = torch.nn.Parameter(torch.zeros(batch_shape))
+        self.collimation_error_in_azimuth = torch.nn.Parameter(torch.zeros(batch_shape))
         
+    @classmethod
+    def choose_submodel(cls, model, index):
+        self = cls()
+        for name, param in model.named_parameters():
+            self.__dict__[name] = torch.nn.Parameter(param.data[index,...])
+        return self
+
     def randomize(self):
         self.randomize_encoder_offsets()
         self.randomize_zenith_error()
@@ -316,17 +324,17 @@ class AlignmentModel(torch.nn.Module):
 
     def randomize_encoder_offsets(self):
         with torch.no_grad():
-            self.encoder_offsets[:] = torch.rand((2)) * 2 * math.pi
+            self.encoder_offsets[:] = torch.rand(self.batch_shape + (2,)) * 2 * math.pi
 
     def randomize_zenith_error(self, stdev_radians = math.radians(1.0)):
         with torch.no_grad():
-            self.zenith_pitch[...] = torch.randn([]) * stdev_radians
-            self.zenith_roll[...] = torch.rand([]) * stdev_radians
+            self.zenith_pitch[...] = torch.randn(self.batch_shape) * stdev_radians
+            self.zenith_roll[...] = torch.rand(self.batch_shape) * stdev_radians
 
     def randomize_mount_errors(self, stdev_radians = math.radians(0.1)):
         with torch.no_grad():
-            self.collimation_error_in_azimuth[...] = torch.rand([]) * stdev_radians
-            self.non_perpendicular_axes_error[...] = torch.rand([]) * stdev_radians
+            self.collimation_error_in_azimuth[...] = torch.rand(self.batch_shape) * stdev_radians
+            self.non_perpendicular_axes_error[...] = torch.rand(self.batch_shape) * stdev_radians
 
     def __repr__(self):
         ret = "AlignmentModel\n"
@@ -344,14 +352,14 @@ class AlignmentModel(torch.nn.Module):
         B = rotation_matrix_around_x(self.zenith_roll)
 
         # This is the azimuth (yaw) of the telescope, including both what the encoders measure, and also the initially-unknown offset.
-        C = rotation_matrix_around_z(raw_axis_values[..., 0] - self.encoder_offsets[0])
+        C = rotation_matrix_around_z(raw_axis_values[..., 0] - self.encoder_offsets[..., 0])
 
         # This would be if one of the fork arms were slightly longer than the other, so that when we pitch the telescope, it's not moving straight up.
         D = rotation_matrix_around_x(self.non_perpendicular_axes_error)
 
         # This is the altitude (pitch) of the telescope, including both what the encoders measure, and also the initially-unknown offset.
         # Note the minus sign, because of the handedness of our coordinate system.
-        E = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.encoder_offsets[1]))
+        E = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.encoder_offsets[..., 1]))
 
         # This would be if the optical tube were pointing slightly to the right or left, so that when we pitch, it moves in a cone rather than a plane.
         F = rotation_matrix_around_z(self.collimation_error_in_azimuth)        
@@ -442,15 +450,15 @@ class AlignmentModel(torch.nn.Module):
         #   E_alt = Bt_At_r_azalt[..., 1]
 
         raw_axis_values = torch.stack([
-            C_az + self.encoder_offsets[0],
-            E_alt + self.encoder_offsets[1]
+            C_az + self.encoder_offsets[..., 0],
+            E_alt + self.encoder_offsets[..., 1]
         ], dim=-1)
 
         if True:
             # check:
             C = rotation_matrix_around_z(C_az)
-            C_retcon = rotation_matrix_around_z(raw_axis_values[..., 0] - self.encoder_offsets[0])
-            E_retcon = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.encoder_offsets[1]))
+            C_retcon = rotation_matrix_around_z(raw_axis_values[..., 0] - self.encoder_offsets[..., 0])
+            E_retcon = rotation_matrix_around_y(-(raw_axis_values[..., 1] - self.encoder_offsets[..., 1]))
             C_D_E_retcon = C_retcon @ D @ E_retcon
             C_D_E_F_p_retcon = (C_D_E_retcon @ F_p.unsqueeze(-1)).squeeze(-1)
 
