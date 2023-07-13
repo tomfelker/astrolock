@@ -139,13 +139,15 @@ def euler_align(target_time_to_predicted_dir, time_to_raw_axis_values):
 
 
 @torch.no_grad()
-def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batches = 5):
+def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batches = 10, full_random = False, full_random_batch_size=100000):
     """
     Try many random guesses for alignment, and return the best one.  Hopefully, if it's good enough, it will be in the watershed of the global optimum.
 
-    This currently assumes we're level, but it doesn't have to, it could easily sample all parameters of the model.
+    
 
-    It is, however, quite slow.
+    If num_batches is more than 1 (as it is by default), we will sample the default distribution of non-level tripods and non-perpendicular mount axes.
+
+    TODO: Could support EQ mounts by initting zenith_pitch roughly to 90 deg minus latitude.
     """
 
     num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
@@ -154,11 +156,16 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
     best_time_to_target = None
     best_model = None
 
-    for batch in range(0, num_batches):
-        print(f"Calculating batch {batch} of {num_batches}...", end='')
-
+    if full_random:
+        # We will just randomize encoder_offsets, rather then computing ones good for each target/time.
+        batch_size = full_random_batch_size
+    else:
         # Make a batch of models, one for each guess of the form "we were looking directly at this target index at this time index"
         batch_size = num_targets * num_observations
+
+    for batch in range(0, num_batches):
+        print(f"Evaluating {batch_size} models, batch {batch} of {num_batches}...", end='')
+
         batch_to_model = AlignmentModel((batch_size,))
 
         # If we're doing many batches, we want to be resilient to these possible errors.  (With just one, we can't be, or the model could fit anything.)
@@ -166,15 +173,18 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
             batch_to_model.randomize_zenith_error()
             batch_to_model.randomize_mount_errors()
 
-        # This is copying our raw axis values (with known times but unknown target) into each target.
-        target_time_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(0).expand((num_targets, -1, -1))
+        if full_random:
+            batch_to_model.randomize_encoder_offsets()
+        else:
+            # This is copying our raw axis values (with known times but unknown target) into each target.
+            target_time_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(0).expand((num_targets, -1, -1))
 
-        # Reshape these so we can jam them through the batched model.
-        batch_to_raw_axis_values = target_time_to_raw_axis_values.reshape((batch_size, 2))
-        batch_to_predicted_dir = target_time_to_predicted_dir.reshape(batch_size, num_spatial_dimensions)
-        
-        # For each element in the batch (each assumption about which target and time we were looking at), what would our encoder offsets have needed to be?
-        batch_to_model.encoder_offsets[:] = batch_to_raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
+            # Reshape these so we can jam them through the batched model.
+            batch_to_raw_axis_values = target_time_to_raw_axis_values.reshape((batch_size, 2))
+            batch_to_predicted_dir = target_time_to_predicted_dir.reshape(batch_size, num_spatial_dimensions)
+            
+            # For each element in the batch (each assumption about which target and time we were looking at), what would our encoder offsets have needed to be?
+            batch_to_model.encoder_offsets[:] = batch_to_raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
 
         time_batch_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(1)
         time_batch_to_observed_dir = batch_to_model.dir_given_raw_axis_values(time_batch_to_raw_axis_values)
@@ -199,7 +209,29 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
     return best_model, best_time_to_target
 
 
-@torch.no_grad()
+def refine_alignment(model, time_to_raw_axis_values, time_to_predicted_dir, num_steps = 1000):
+    num_observations, num_axes = time_to_raw_axis_values.shape
+    num_observations, num_spatial_dims = time_to_predicted_dir.shape
+
+    params_to_optimize = [model.encoder_offsets]
+
+    if num_observations > 1:
+        params_to_optimize.append(model.zenith_pitch)
+        params_to_optimize.append(model.zenith_roll)
+    if num_observations > 2:
+        params_to_optimize.append(model.collimation_error_in_azimuth)
+        params_to_optimize.append(model.non_perpendicular_axes_error)
+
+    optimizer = torch.optim.Adam(params_to_optimize, lr=0.001)
+    for step in range(num_steps):
+        optimizer.zero_grad()
+        loss = torch.sum((model.dir_given_raw_axis_values(time_to_raw_axis_values) - time_to_predicted_dir.detach())**2)
+        loss.backward()
+        optimizer.step()
+
+        if step < 10 or step % int(num_steps / 10) == int(num_steps / 10) - 1 or step == num_steps - 1:
+            print(f'Step {step + 1} of {num_steps}, loss was {loss.item()}')
+
 def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 85.0 * u.deg):
     num_observations = len(alignment_data)
     num_targets = len(targets)
@@ -240,7 +272,7 @@ def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 8
     print(f"Filtered down to {len(filtered_targets)} targets.");
 
     print("Running random alignment...")
-    rough_alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values)
+    alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values)
 
     #print("Running euler alignment...")
     #rough_alignment, time_to_target = euler_align(target_time_to_predicted_dir, time_to_raw_axis_values)
@@ -251,12 +283,18 @@ def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 8
         print(f"\tObservation {time_index} was {target.display_name}")
         alignment_data[time_index].target = target
 
-    # TODO:
-    final_alignment = rough_alignment
+    # maybe todo: figure out a fancy gather for this
+    time_to_predicted_dir = []
+    for time in range(num_observations):
+        target = time_to_target[time]
+        time_to_predicted_dir.append(target_time_to_predicted_dir[target, time])
+    time_to_predicted_dir = torch.stack(time_to_predicted_dir)
 
-    print(f"Done!\nFinal alignment:\n{final_alignment}")
+    refine_alignment(alignment, time_to_raw_axis_values, time_to_predicted_dir)
 
-    return final_alignment
+    print(f"Done!\nFinal alignment:\n{alignment}")
+
+    return alignment
 
 def rotation_matrix_around_x(theta):
     zero = torch.zeros_like(theta)
@@ -311,11 +349,11 @@ class AlignmentModel(torch.nn.Module):
         self.collimation_error_in_azimuth = torch.nn.Parameter(torch.zeros(batch_shape))
         
     @classmethod
-    def choose_submodel(cls, model, index):
-        self = cls()
-        for name, param in model.named_parameters():
-            self.__dict__[name] = torch.nn.Parameter(param.data[index,...])
-        return self
+    def choose_submodel(cls, batched_model, index):
+        single_model = cls()
+        for name, param in single_model.named_parameters():
+            param[...] = getattr(batched_model, name)[index, ...]
+        return single_model
 
     def randomize(self):
         self.randomize_encoder_offsets()

@@ -263,7 +263,7 @@ class AlignmentFrame(tk.Frame):
                 datum = astrolock.model.alignment.AlignmentDatum.from_json(alignment_datum_dict)
                 item = AlignmentDatumTreeviewItem(datum)
                 self.observation_items.append(item)
-            self.update_gui()
+        self.update_gui()
 
 
     def save_observations_to_filename(self, filename):
