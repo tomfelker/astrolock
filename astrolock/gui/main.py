@@ -49,7 +49,7 @@ class MainWindow(tk.Tk):
 
     # Trigger UI updates from the main (Tk) thread, for when the tracker is not running
     def ui_update_loop(self):
-        self.after(50, self.ui_update_loop)
+        self.after(100, self.ui_update_loop)
         self.update_gui_from_tracker_threads()
 
     # Called from the telescope connection threads when the status has changed, so we can show the newest info in the UI
@@ -65,6 +65,7 @@ class MainWindow(tk.Tk):
 
     def update_gui(self):        
         self.status_tab.update_gui()
+        self.time_tab.update_gui()
         self.alignment_tab.update_gui()
         self.targets_tab.update_gui()        
 

@@ -1,3 +1,4 @@
+import os
 import astrolock.model.target_source as target_source
 import astrolock.model.target as target
 
@@ -18,8 +19,19 @@ class SkyfieldTarget(target.Target):
         observatory = tracker.home_planet_sf + tracker.location_sf
         time_sf = tracker.ts.from_astropy(time)
         observatory_barycentric = observatory.at(time_sf)
-        target_astrometric = observatory_barycentric.observe(self.sf_target)
-        target_apparent = target_astrometric.apparent()
+
+        if isinstance(self.sf_target, skyfield.api.EarthSatellite):
+            accurate_but_slow = True
+            if accurate_but_slow:
+                # they tell me this way is slower, but - doesn't seem too bad.
+                # TODO: measure
+                ssb_satellite = tracker.home_planet_sf + self.sf_target
+                target_apparent = observatory.at(time_sf).observe(ssb_satellite).apparent()
+            else:
+                target_apparent = (self.sf_target - tracker.location_sf).at(time_sf)
+        else:
+            target_astrometric = observatory_barycentric.observe(self.sf_target)
+            target_apparent = target_astrometric.apparent()
 
         
         if tracker.primary_telescope_connection is not None:
@@ -48,9 +60,21 @@ class SkyfieldTargetSource(target_source.TargetSource):
     def start(self):
         self.load_targets()
 
-    def load_targets(self, mag_limit = 3.0):
+    def load_targets(self):
 
         loader = skyfield.api.Loader('./data/skyfield_cache')
+
+        # This is also needed to determine the directions to things, so we need it even if we're not interested in the planets as targets.
+        self.planet_ephemeris = 'de440.bsp'
+        self.planets = loader(self.planet_ephemeris)
+        self.tracker.home_planet_sf = self.planets['EARTH']
+        self.tracker.ts = skyfield.api.load.timescale()
+
+        self.load_stars(loader)
+        self.load_planets(loader)
+        self.load_satellites(loader)
+
+    def load_stars(self, loader, mag_limit = 3.0):
         with loader.open(skyfield.data.hipparcos.URL) as f:
             stars_df = skyfield.data.hipparcos.load_dataframe(f)
 
@@ -73,14 +97,6 @@ class SkyfieldTargetSource(target_source.TargetSource):
                 hip = int(hip)
                 hip_to_name[hip] = name
 
-
-        planet_ephemeris = 'de440.bsp'
-        planets = loader(planet_ephemeris)
-
-        # 'global' variables heh heh
-        self.tracker.home_planet_sf = planets['EARTH']
-        self.tracker.ts = skyfield.api.load.timescale()
-
         for star_index in stars_df.index:
             star = skyfield.api.Star.from_dataframe(stars_df.loc[star_index])
 
@@ -95,8 +111,11 @@ class SkyfieldTargetSource(target_source.TargetSource):
 
 
             self.target_map[url] = new_target
+        
+
+    def load_planets(self, loader):
             
-        planet_id_to_names = planets.names()
+        planet_id_to_names = self.planets.names()
         for planet_id in planet_id_to_names.keys():
             if planet_id == 0:
                 continue
@@ -107,9 +126,9 @@ class SkyfieldTargetSource(target_source.TargetSource):
             if 'EARTH' in planet_displayname:
                 continue
             
-            url = f'skyfield://planets/{planet_ephemeris}/{planet_name}'
+            url = f'skyfield://planets/{self.planet_ephemeris}/{planet_name}'
             
-            new_target = SkyfieldTarget(planets[planet_name])
+            new_target = SkyfieldTarget(self.planets[planet_name])
             new_target.url = url
             new_target.display_name = planet_displayname
 
@@ -124,10 +143,27 @@ class SkyfieldTargetSource(target_source.TargetSource):
                 if url_with_barycenter in self.target_map:
                     del self.target_map[url_with_barycenter]
 
-
+    def load_satellites(self, loader, force_reload=False):
+        celestrak_groups = [
+            'visual',
+            'stations',
+            'last-30-days',
+        ]
+        for group in celestrak_groups:
+            tle_url = f'https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle'
+            # by including date in the filename, we'll hopefully download new TLEs once per day.
+            date=skyfield.api.datetime.today().date().isoformat()
+            filename = os.path.join(loader.directory, f'celestrack_{date}_{group}.txt')
+            satellites = skyfield.api.load.tle_file(tle_url, filename=filename, reload=force_reload)
+            for satellite in satellites:
+                url = f'skyfield://satellites/celestrak/{group}/{satellite.name}'
+                new_target = SkyfieldTarget(satellite)
+                new_target.url = url
+                new_target.display_name = satellite.name
+                self.target_map[url] = new_target
             
 
 
-    # maps urls to  targets    
+    # maps urls to targets    
     def get_target_map(self):
         return self.target_map

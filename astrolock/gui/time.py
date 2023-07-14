@@ -5,5 +5,10 @@ class TimeFrame(tk.Frame):
     def __init__(self, *args, tracker, **kwargs):        
         tk.Frame.__init__(self, *args, **kwargs)
 
-        label = tk.Label(self, text="Time")
-        label.pack()
+        self.tracker = tracker
+
+        self.label = tk.Label(self, text="Time")
+        self.label.pack()
+
+    def update_gui(self):
+        self.label.config(text=str(self.tracker.get_time()))

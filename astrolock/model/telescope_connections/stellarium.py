@@ -25,7 +25,7 @@ class StellariumConnection(threaded.ThreadedConnection):
         self.want_atmospheric_refaction = False
 
         self.fake_misalignment = astrolock.model.alignment.AlignmentModel()
-        if True:
+        if False:
             self.fake_misalignment.randomize()
             print(f"Stellarium connection using random fake misalignment: {self.fake_misalignment}")
 
@@ -36,16 +36,27 @@ class StellariumConnection(threaded.ThreadedConnection):
                 #first we read some information, both to display, and because it's needed to set the rates
                 
                 status = requests.get('http:' + self.url_path + '/api/main/status')
+                measurement_time = astropy.time.Time.now()
+
                 status_json = status.json()
                 fov_deg = float(status_json['view']['fov'])
 
-                self.last_update_utc_str = status_json['time']['utc']
+                # Stellarium seems to have a bug where they missed a format specifier
+                self.last_update_utc_str = status_json['time']['utc'].replace('.%1', '.0')
+                gps_time = astropy.time.Time(self.last_update_utc_str, format='isot', scale='utc')
+                if self.gps_time != gps_time:
+                    self.gps_time = gps_time
+                    # a bit of a hack - since they only give second precision for this, only record the measurement time when the second changes,
+                    # so that it should be right to within our update loop time.
+                    self.gps_measurement_time = measurement_time
 
                 view = requests.get('http:' + self.url_path + '/api/main/view?ref=on')
                 
                 measurement_time = astropy.time.Time.now()
                 self.axis_angles_measurement_time[0] = measurement_time
                 self.axis_angles_measurement_time[1] = measurement_time
+
+                
 
                 view_json = view.json()
                 terrestrial_dir_str = view_json['altAz']
@@ -57,7 +68,7 @@ class StellariumConnection(threaded.ThreadedConnection):
                 #alt_rad = math.asin(terrestrial_dir_vec[2])
                 #az_rad = math.atan2(terrestrial_dir_vec[1], -terrestrial_dir_vec[0])
 
-                self.axis_angles = self.fake_misalignment.raw_axis_values_given_dir(torch.tensor(terrestrial_dir_vec)).detach().numpy() * u.rad
+                self.axis_angles = self.fake_misalignment.raw_axis_values_given_numpy_dir(terrestrial_dir_vec) * u.rad
                
                 # now we will set our rates, which requires knowing the FOV
 

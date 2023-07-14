@@ -10,7 +10,7 @@ class StatusFrame(tk.Frame):
         self.tracker = tracker
 
         connections = self.tracker.get_recommended_connection_urls()
-        if len(connections) is 0:
+        if len(connections) == 0:
             connections = ["No connections found"]
         print('\n'.join(connections))
         self.connections_dropdown_choice = tk.StringVar(self, connections[0])
@@ -29,7 +29,7 @@ class StatusFrame(tk.Frame):
         self.az_rate_slider = tk.Scale(self, from_ = -5, to = 5, resolution = .1, length = 130, sliderlength = 30, orient = tk.HORIZONTAL, command = self.sliders_changed)
         self.az_rate_slider.pack()
 
-        #hmm, how to do sizes in inches?
+        #hmm, how to do sizes in cm?
         self.label = tk.Label(self, text="Status", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 80, height = 25)
         self.label.pack()
 

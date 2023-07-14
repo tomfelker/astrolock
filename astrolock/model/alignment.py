@@ -162,7 +162,7 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
     """
 
     num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
-    
+
     best_loss = math.inf
     best_time_to_target = None
     best_model = None
@@ -181,9 +181,9 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
 
         batch_to_model = AlignmentModel((batch_size,))
 
-        # If we're doing many batches, we want to be resilient to these possible errors.  (With just one, we can't be, or the model could fit anything.)
-        if num_batches > 1:            
+        if num_observations >= 3:
             batch_to_model.randomize_zenith_error()
+        if num_observations >= 4:
             batch_to_model.randomize_mount_errors()
 
         if full_random:
@@ -234,7 +234,7 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, num_batc
         else:
             print(" kept old", end='')
 
-        print(f" loss {best_loss} with assignments {best_time_to_target} at {best_batch_index}")
+        print(f" loss {best_loss} with assignments {best_time_to_target} with model {best_batch_index}")
 
     return best_model, best_time_to_target
 
@@ -244,10 +244,10 @@ def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_
 
     params_to_optimize = [model.encoder_offsets]
 
-    if num_observations > 1:
+    if num_observations >= 3:
         params_to_optimize.append(model.zenith_pitch)
         params_to_optimize.append(model.zenith_roll)
-    if num_observations > 2:
+    if num_observations >= 4:
         params_to_optimize.append(model.collimation_error_in_azimuth)
         params_to_optimize.append(model.non_perpendicular_axes_error)
 
@@ -258,21 +258,21 @@ def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_
         optimizer.zero_grad()
         time_modelbatch_to_observed_dir = model.dir_given_raw_axis_values(time_modelbatch_to_raw_axis_values)
         time_modelbatch_to_dot = torch.einsum('...d,...d->...', time_modelbatch_to_observed_dir, time_modelbatch_to_predicted_dir)
-        time_modelbatch_to_angle = torch.acos(torch.clamp(time_modelbatch_to_dot, -1.0, 1.0))
-    
-        # Hmm - I'd think this angle based loss would be better, but it gives NaNs on Adam and RMSProp,
-        # and doesn't behave well with SGD
-        modelbatch_to_loss_sq = time_modelbatch_to_angle.square().mean(dim=0)
-        #loss_sq = modelbatch_to_loss_sq.mean()
-        #loss = loss_sq.sqrt()
+        
+        # dividing by num_observations rather than taking mean so that the learning rate works similarly regardless of batch size       
         loss = torch.sum((time_modelbatch_to_observed_dir - time_modelbatch_to_predicted_dir).square()) / num_observations
         
         loss.backward()
         optimizer.step()
 
         if step < 10 or step % int(num_steps / 10) == int(num_steps / 10) - 1 or step == num_steps - 1:
+            # Hmm - I'd think this angle based loss would be better, but it gives NaNs on Adam and RMSProp,
+            # and doesn't behave well with SGD.  So just use it for printing...
+            time_modelbatch_to_angle = torch.acos(torch.clamp(time_modelbatch_to_dot, -1.0, 1.0))
+            modelbatch_to_loss_sq = time_modelbatch_to_angle.square().mean(dim=0)
             min_loss_sq, min_loss_sq_index = modelbatch_to_loss_sq.min(dim=-1)
-            print(f'Step {step + 1} of {num_steps}, best angle loss was {min_loss_sq.sqrt()} at {min_loss_sq_index}')
+
+            print(f'Step {step + 1} of {num_steps}, loss {loss}, best angle loss was {min_loss_sq.sqrt()} with model {min_loss_sq_index}')
 
 def align(tracker, alignment_data, targets, min_alt = -20.0 * u.deg, max_alt = 85.0 * u.deg):
     num_observations = len(alignment_data)
@@ -449,7 +449,9 @@ class AlignmentModel(torch.nn.Module):
         # This would be if the optical tube were pointing slightly to the right or left, so that when we pitch, it moves in a cone rather than a plane.
         F = rotation_matrix_around_z(self.collimation_error_in_azimuth)        
         
-        return A @ B @ C @ D @ E @ F
+        dir = A @ B @ C @ D @ E @ F
+        dir = dir / torch.linalg.norm(dir, dim=-1, keepdims=True)
+        return dir
             
     def dir_given_raw_axis_values(self, raw_axis_values):
         p = torch.tensor([[1.0], [0.0], [0.0]])
@@ -457,11 +459,10 @@ class AlignmentModel(torch.nn.Module):
         d = d.squeeze(-1)
         return d
 
-    def raw_axis_values_given_dir(self, dir):
-        # for now, the analytic version encompasses everything!
-        return self.raw_axis_values_given_dir_analytic(dir)
+    def raw_axis_values_given_numpy_dir(self, dir):        
+        return self.raw_axis_values_given_dir(torch.tensor(dir)).detach().numpy()
 
-    def raw_axis_values_given_dir_analytic(self, dir):
+    def raw_axis_values_given_dir(self, dir):
         """
         When going from raw axis values and the rest of our model to a direction, we have:
 
@@ -539,7 +540,7 @@ class AlignmentModel(torch.nn.Module):
             E_alt + self.encoder_offsets[..., 1]
         ], dim=-1)
 
-        if True:
+        if False:
             # check:
             C = rotation_matrix_around_z(C_az)
             C_retcon = rotation_matrix_around_z(raw_axis_values[..., 0] - self.encoder_offsets[..., 0])
@@ -554,6 +555,7 @@ class AlignmentModel(torch.nn.Module):
 
         return raw_axis_values
     
+    
     def raw_axis_values_given_dir_numeric(self, dir):
         raw_axis_values = torch.zeros(2, requires_grad=True)
         optimizer = torch.optim.Adam([raw_axis_values], lr=0.1)
@@ -564,7 +566,6 @@ class AlignmentModel(torch.nn.Module):
             optimizer.step()
 
         print(loss)
-        # Return the optimized raw axis values
         return raw_axis_values.detach()
 
     
@@ -594,7 +595,7 @@ if __name__ == "__main__":
     for _ in range(100):
         test_model.randomize()
 
-        raw = test_model.raw_axis_values_given_dir_analytic(arcturus_dir)
+        raw = test_model.raw_axis_values_given_dir(arcturus_dir)
         reconstructed_arcturus_dir = test_model.dir_given_raw_axis_values(raw)
 
         print(reconstructed_arcturus_dir)

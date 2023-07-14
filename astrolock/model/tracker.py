@@ -34,11 +34,14 @@ class Tracker(object):
         self.primary_telescope_connection = None
         self.primary_telescope_alignment = astrolock.model.alignment.AlignmentModel()
         self.monotonic_time_ns_of_last_input = None
+        self.axis_angles_measurement_time = None
         self.momentum = np.zeros(2)
         self.rates = np.zeros(2)
         self.tracker_input = TrackerInput()
         self.smooth_input_mag = 0.0
         self.target = None
+        self.use_telescope_time = True
+        self.user_time_offset = astropy.time.TimeDelta(0 * u.s)
 
         self.target_source_map = {
             'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
@@ -139,17 +142,16 @@ class Tracker(object):
                 return self._compute_rates_momentum(dt, store)
 
     def _compute_rates_with_target(self, dt, store):
-        now = astropy.time.Time.now()
-        dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = now)
+        dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
 
         desired_true_axis_positions = np.array(dir, dtype=np.float32)
         desired_true_axis_rates = np.array(rates, dtype=np.float32)
 
-        desired_raw_axis_positions = self.primary_telescope_alignment.raw_axis_values_given_dir(desired_true_axis_positions)
+        desired_raw_axis_positions = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_true_axis_positions)
 
         # haha, just inverting was hard enough, let's differentiate numerically...
         desired_true_axis_positions_after_dt = desired_true_axis_positions + desired_true_axis_rates * dt
-        desired_raw_axis_positions_after_dt = self.primary_telescope_alignment.raw_axis_values_given_dir(desired_true_axis_positions_after_dt)
+        desired_raw_axis_positions_after_dt = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_true_axis_positions_after_dt)
         desired_raw_axis_rates = (desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / dt
         
 
@@ -159,7 +161,7 @@ class Tracker(object):
                 control_rate = pid_controller.compute_control_rate(
                     desired_position = desired_raw_axis_positions[axis_index] * u.rad,
                     desired_rate = desired_raw_axis_rates[axis_index] * u.rad / u.s,
-                    desired_time = now,
+                    desired_time = astropy.time.Time.now(),
                     commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index],
                     measured_position = self.primary_telescope_connection.axis_angles[axis_index],
                     measured_position_time = self.primary_telescope_connection.axis_angles_measurement_time[axis_index],
@@ -195,5 +197,9 @@ class Tracker(object):
 
             return rate
 
+    def get_time(self):
+        if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time is not None:
+            return self.primary_telescope_connection.gps_time + (astropy.time.Time.now() - self.primary_telescope_connection.gps_measurement_time)
+        return astropy.time.Time.now()
 
 

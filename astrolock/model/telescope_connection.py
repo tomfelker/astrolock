@@ -13,6 +13,9 @@ class TelescopeConnection(object):
         self.url_path = url[len(self.__class__.get_url_scheme()):]
         self.axis_angles = np.zeros(2) * u.rad
         self.axis_angles_measurement_time = astropy.time.Time(np.zeros(2), format = 'unix')
+        self.gps_time = None
+        self.gps_location = None
+        self.gps_measurement_time = None
         self.desired_axis_rates = np.zeros(2) * u.rad / u.s
         
         # could be false if you're using a radio telescope,

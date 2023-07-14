@@ -195,6 +195,8 @@ class AlignmentFrame(tk.Frame):
     def update_gui(self):
         self.current_alignment_label.config(text = str(self.tracker.primary_telescope_alignment))
 
+        old_selection = self.alignment_data_treeview.selection()
+
         # it's insane that this is the best way... seems O(n^2)
         self.alignment_data_treeview.delete(*self.alignment_data_treeview.get_children())
 
@@ -216,6 +218,11 @@ class AlignmentFrame(tk.Frame):
                 tags.append('disabled')
 
             item.iid = self.alignment_data_treeview.insert(parent = '', index = 'end', iid = item.iid, values = values, tags=tags)
+
+            try:
+                self.alignment_data_treeview.selection_set(old_selection)
+            except:
+                pass
 
     def get_alignment_data_from_gui(self):
         alignment_data = []
@@ -277,12 +284,12 @@ class AlignmentFrame(tk.Frame):
 
     def load_observations(self):
         filename = tkinter.filedialog.askopenfilename(defaultextension='json', filetypes=[('JSON','*.json')], initialdir=os.path.join('data', 'alignments'))
-        if filename is not '':
+        if filename != '':
             self.load_observations_from_filename(filename)
 
     def save_observations(self):
         filename = tkinter.filedialog.asksaveasfilename(defaultextension='json', filetypes=[('JSON','*.json')], initialdir=os.path.join('data', 'alignments'))
-        if filename is not '':
+        if filename != '':
             self.save_observations_to_filename(filename)
 
     def set_selection_enabled(self, enabled):
