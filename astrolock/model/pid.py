@@ -3,7 +3,7 @@ from astropy.coordinates import Angle
 
 class PIDController:
     def __init__(self):
-        self.proportional_gain = 1.0 / u.s
+        self.proportional_gain = 2.0 / u.s
         pass
 
     def compute_control_rate(

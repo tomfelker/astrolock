@@ -12,6 +12,7 @@ import time
 import numpy as np
 import threading
 import copy
+import math
 
 class TrackerInput(object):
     def __init__(self):
@@ -41,7 +42,11 @@ class Tracker(object):
         self.smooth_input_mag = 0.0
         self.target = None
         self.use_telescope_time = True
+        self.target_offset_using_time = True
+        self.target_offset_max_lead_time = 30.0
         self.user_time_offset = astropy.time.TimeDelta(0 * u.s)
+        self.target_offset_image_space = np.zeros(2)
+        self.target_offset_lead_time = 0.0
 
         self.target_source_map = {
             'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
@@ -143,17 +148,47 @@ class Tracker(object):
 
     def _compute_rates_with_target(self, dt, store):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
+        dir_norm = np.linalg.norm(dir)
+        dir /= dir_norm
+        rates /= dir_norm
 
-        desired_true_axis_positions = np.array(dir, dtype=np.float32)
-        desired_true_axis_rates = np.array(rates, dtype=np.float32)
+        image_left = np.cross(np.array([0.0, 0.0, 1.0]), dir)
+        image_left /= np.linalg.norm(image_left)
+        image_up = np.cross(dir, image_left)
+        image_up /= np.linalg.norm(image_up)
 
-        desired_raw_axis_positions = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_true_axis_positions)
+        # so don't modify self directly, unless store is True
+        # todo: eww
+        target_offset_image_space = self.target_offset_image_space
+        target_offset_lead_time = self.target_offset_lead_time
+
+
+        target_offset_image_space += self.tracker_input.rate * self.tracker_input.rate_scale * dt
+
+        if self.target_offset_using_time:
+            image_space_rates = np.array([np.dot(rates, image_left), np.dot(rates, image_up)])
+            image_space_rates_norm = np.linalg.norm(rates)
+            if image_space_rates_norm > 0.0:
+                desired_delta_lead_time = np.dot(target_offset_image_space, image_space_rates) / image_space_rates_norm
+                old_lead_time = target_offset_lead_time
+                target_offset_lead_time = np.clip(old_lead_time + desired_delta_lead_time, -self.target_offset_max_lead_time, self.target_offset_max_lead_time)
+                delta_lead_time = target_offset_lead_time - old_lead_time
+                target_offset_image_space -= delta_lead_time * image_space_rates
+
+        tweaked_dir = dir + (target_offset_image_space[0] * image_left + target_offset_image_space[1] * image_up) + rates * target_offset_lead_time
+
+        desired_dir = np.array(tweaked_dir, dtype=np.float32)
+        desired_rates = np.array(rates, dtype=np.float32)
+
+        desired_raw_axis_positions = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_dir)
 
         # haha, just inverting was hard enough, let's differentiate numerically...
-        desired_true_axis_positions_after_dt = desired_true_axis_positions + desired_true_axis_rates * dt
-        desired_raw_axis_positions_after_dt = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_true_axis_positions_after_dt)
-        desired_raw_axis_rates = (desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / dt
-        
+        if dt > 0:
+            desired_true_axis_positions_after_dt = desired_dir + desired_rates * dt
+            desired_raw_axis_positions_after_dt = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_true_axis_positions_after_dt)
+            desired_raw_axis_rates = (desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / dt
+        else:
+            desired_raw_axis_rates = np.zeros(2)
 
         rates = np.zeros(2)
         if self.primary_telescope_connection is not None:
@@ -168,6 +203,11 @@ class Tracker(object):
                     store_state = store
                 ).to_value(u.deg / u.s)
                 rates[axis_index] = control_rate
+
+        if store:
+            self.target_offset_image_space = target_offset_image_space
+            self.target_offset_lead_time = target_offset_lead_time
+            self.monotonic_time_ns_of_last_input = time.monotonic_ns()
         return rates
 
     def _compute_rates_momentum(self, dt, store):

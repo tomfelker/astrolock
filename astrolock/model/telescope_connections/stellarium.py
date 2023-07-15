@@ -44,7 +44,7 @@ class StellariumConnection(threaded.ThreadedConnection):
                 # Stellarium seems to have a bug where they missed a format specifier
                 self.last_update_utc_str = status_json['time']['utc'].replace('.%1', '.0')
                 gps_time = astropy.time.Time(self.last_update_utc_str, format='isot', scale='utc')
-                if self.gps_time != gps_time:
+                if self.gps_time is None or np.abs((self.gps_time - gps_time).to_value(u.s)) > 10:
                     self.gps_time = gps_time
                     # a bit of a hack - since they only give second precision for this, only record the measurement time when the second changes,
                     # so that it should be right to within our update loop time.
