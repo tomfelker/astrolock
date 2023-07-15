@@ -20,6 +20,7 @@ class TargetsFrame(tk.Frame):
         self.tracker = tracker
  
         self.target_source = None
+        self.targets_dirty = True
 
         self.selected_target_source_name = tk.StringVar()
         self.selected_target_source_name.trace_add('write', self.selected_target_source_name_changed)
@@ -67,6 +68,7 @@ class TargetsFrame(tk.Frame):
     def targets_updated(self, targets):
         try:
             self.tracker.update_targets(targets)
+            self.targets_dirty = True
             self.tracker.update_gui_callback()
 
         except RuntimeError:
@@ -74,44 +76,51 @@ class TargetsFrame(tk.Frame):
            pass
 
     def update_gui(self):
+        # sigh, eww
+        target_map = None
         if self.target_source is not None:
             target_map = self.target_source.get_target_map()
-        
-            targets = list(target_map.values())
 
-            targets.sort(key = (lambda target : target.score), reverse = True)
+        if self.targets_dirty:
+            self.targets_dirty = False
 
-            #hax:
-            #targets = targets[0:5]
+            if self.target_source is not None:
+                
+                targets = list(target_map.values())
 
-            old_selection = self.targets_treeview.selection()
+                targets.sort(key = (lambda target : target.score), reverse = True)
 
-            # it's insane that this is the best way... seems O(n^2)
-            self.targets_treeview.delete(*self.targets_treeview.get_children())
+                #hax:
+                #targets = targets[0:5]
 
-            ap_now = astropy.time.Time.now()
+                old_selection = self.targets_treeview.selection()
 
-            for target in targets:
-                values = (target.display_name, target.url)
-                self.targets_treeview.insert(parent = '', index = 'end', iid = target.url, values = values)
+                # it's insane that this is the best way... seems O(n^2)
+                self.targets_treeview.delete(*self.targets_treeview.get_children())
 
-                for column in self.targets_treeview['columns']:
-                    if column in target.display_columns:
-                        self.targets_treeview.set(item = target.url, column = column, value = target.display_columns[column])
+                ap_now = astropy.time.Time.now()
 
-                if target.last_known_location_time is not None:
-                    age = ap_now - target.last_known_location_time
-                    self.targets_treeview.set(item = target.url, column = 'age', value = age.to_value(u.s))
+                for target in targets:
+                    values = (target.display_name, target.url)
+                    self.targets_treeview.insert(parent = '', index = 'end', iid = target.url, values = values)
 
-            try:
-                self.targets_treeview.selection_set(old_selection)
-            except:
-                # the old target may have gone away... this is lame, but not worth fixing since eventually we'll have a map and remember targets
-                pass
+                    for column in self.targets_treeview['columns']:
+                        if column in target.display_columns:
+                            self.targets_treeview.set(item = target.url, column = column, value = target.display_columns[column])
 
-            selected_urls = self.targets_treeview.selection()
-            if len(selected_urls) == 1:
-                self.tracker.set_target(target_map[selected_urls[0]])
+                    if target.last_known_location_time is not None:
+                        age = ap_now - target.last_known_location_time
+                        self.targets_treeview.set(item = target.url, column = 'age', value = age.to_value(u.s))
+
+                try:
+                    self.targets_treeview.selection_set(old_selection)
+                except:
+                    # the old target may have gone away... this is lame, but not worth fixing since eventually we'll have a map and remember targets
+                    pass
+
+        selected_urls = self.targets_treeview.selection()
+        if len(selected_urls) == 1:
+            self.tracker.set_target(target_map[selected_urls[0]])
 
 
     def set_text(self, widget, text):

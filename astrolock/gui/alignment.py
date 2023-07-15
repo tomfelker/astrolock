@@ -25,6 +25,7 @@ class AlignmentFrame(tk.Frame):
         # actual data
         self.tracker = tracker
         self.observation_items = []
+        self.observations_dirty = True
 
         # our whole tab should expand with the window (duh)
         self.grid_rowconfigure(0, weight=1)
@@ -128,6 +129,7 @@ class AlignmentFrame(tk.Frame):
         self.observation_items.append(AlignmentDatumTreeviewItem(new_datum))
 
         self.autosave_observations()
+        self.observations_dirty = True
         self.update_gui()
 
     def add_test_observations(self):
@@ -190,39 +192,43 @@ class AlignmentFrame(tk.Frame):
         print(f"Fuzzing offsets by {test_stepper_offsets}")
         for item in self.observation_items:
             item.datum.raw_axis_values += test_stepper_offsets
+        self.observations_dirty = True
         self.update_gui()
 
     def update_gui(self):
         self.current_alignment_label.config(text = str(self.tracker.primary_telescope_alignment))
 
-        old_selection = self.alignment_data_treeview.selection()
+        if self.observations_dirty:
+            self.observations_dirty = False
 
-        # it's insane that this is the best way... seems O(n^2)
-        self.alignment_data_treeview.delete(*self.alignment_data_treeview.get_children())
+            old_selection = self.alignment_data_treeview.selection()
 
-        for item in self.observation_items:
-            alignment_datum = item.datum
+            # it's insane that this is the best way... seems O(n^2)
+            self.alignment_data_treeview.delete(*self.alignment_data_treeview.get_children())
 
-            if alignment_datum.target is not None:
-                target_name = alignment_datum.target.display_name
-                target_url = alignment_datum.target.url
-            else:
-                target_name = '<unknown>'
-                target_url = ''
+            for item in self.observation_items:
+                alignment_datum = item.datum
 
-            #('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
-            values = (target_name, target_url, str(alignment_datum.time), alignment_datum.raw_axis_values[0], alignment_datum.raw_axis_values[1])
+                if alignment_datum.target is not None:
+                    target_name = alignment_datum.target.display_name
+                    target_url = alignment_datum.target.url
+                else:
+                    target_name = '<unknown>'
+                    target_url = ''
 
-            tags = []
-            if not item.enabled:
-                tags.append('disabled')
+                #('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
+                values = (target_name, target_url, str(alignment_datum.time), alignment_datum.raw_axis_values[0], alignment_datum.raw_axis_values[1])
 
-            item.iid = self.alignment_data_treeview.insert(parent = '', index = 'end', iid = item.iid, values = values, tags=tags)
+                tags = []
+                if not item.enabled:
+                    tags.append('disabled')
 
-            try:
-                self.alignment_data_treeview.selection_set(old_selection)
-            except:
-                pass
+                item.iid = self.alignment_data_treeview.insert(parent = '', index = 'end', iid = item.iid, values = values, tags=tags)
+
+                try:
+                    self.alignment_data_treeview.selection_set(old_selection)
+                except:
+                    pass
 
     def get_alignment_data_from_gui(self):
         alignment_data = []
@@ -258,7 +264,7 @@ class AlignmentFrame(tk.Frame):
         alignment = astrolock.model.alignment.align(self.tracker, alignment_data, targets)
 
         self.tracker.primary_telescope_alignment = alignment
-
+        self.observations_dirty = True
         self.update_gui()
 
     
@@ -270,6 +276,7 @@ class AlignmentFrame(tk.Frame):
                 datum = astrolock.model.alignment.AlignmentDatum.from_json(alignment_datum_dict)
                 item = AlignmentDatumTreeviewItem(datum)
                 self.observation_items.append(item)
+        self.observations_dirty = True
         self.update_gui()
 
 
@@ -296,7 +303,8 @@ class AlignmentFrame(tk.Frame):
         for iid in self.alignment_data_treeview.selection():
             for item in self.observation_items:
                 if item.iid == iid:
-                    item.enabled = enabled                    
+                    item.enabled = enabled   
+        self.observations_dirty = True                 
         self.update_gui()
 
 
@@ -311,10 +319,11 @@ class AlignmentFrame(tk.Frame):
     def delete_selected_observations(self):        
         for iid in self.alignment_data_treeview.selection():
             self.observation_items = list(filter(lambda i: i.iid != iid, self.observation_items))
-                    
+        self.observations_dirty = True
         self.update_gui()
 
 
     def delete_all_observations(self):
         self.observation_items.clear()
+        self.observations_dirty = True
         self.update_gui()

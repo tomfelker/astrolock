@@ -36,7 +36,7 @@ class SkyfieldTarget(target.Target):
         
         if tracker.primary_telescope_connection is not None:
             if tracker.primary_telescope_connection.want_atmospheric_refaction:
-                temperature_C = tracker.primary_telescope_connection.temperature_C
+                temperature_C = 20  #tracker.primary_telescope_connection.temperature_C
             else:
                 temperature_C = None
         else:

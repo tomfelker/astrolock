@@ -5,5 +5,5 @@ requests
 pyserial
 skyfield
 torch
-
+pandas
 
