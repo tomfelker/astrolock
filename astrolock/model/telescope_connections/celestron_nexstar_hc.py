@@ -58,7 +58,7 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
       
         self.serial_stream.write(cmd)
         reply = self.serial_stream.read(1)
-        if reply[0] != ord('#'):
+        if len(reply) != 1 or reply[0] != ord('#'):
             raise ConnectionError("read error setting rate")
 
         # the rate we actually set, taking clamping and rounding into account
@@ -83,7 +83,7 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
             ])
         self.serial_stream.write(cmd)
         angle_bytes = self.serial_stream.read(4)
-        if angle_bytes[3] != ord('#'):
+        if len(angle_bytes) != 4 or angle_bytes[3] != ord('#'):
             raise ConnectionError("read error getting axis position")
         angle_int = angle_bytes[0] * 65536 + angle_bytes[1] * 256 + angle_bytes[2]
         angle_radians = angle_int / 16777216 * math.pi * 2
