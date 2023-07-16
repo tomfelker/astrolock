@@ -47,8 +47,8 @@ class StatusFrame(tk.Frame):
         if self.tracker is not None:
             self.label.config(text = self.tracker.get_status())
 
-            self.az_rate_slider.set(self.tracker.tracker_input.rate[0])
-            self.alt_rate_slider.set(self.tracker.tracker_input.rate[1])
+            self.az_rate_slider.set(self.tracker.tracker_input.last_rates[0])
+            self.alt_rate_slider.set(self.tracker.tracker_input.last_rates[1])
             
     def sliders_changed(self, val):
         if False:

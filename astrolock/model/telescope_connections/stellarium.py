@@ -71,7 +71,7 @@ class StellariumConnection(threaded.ThreadedConnection):
                
                 # now we will set our rates, which requires knowing the FOV
 
-                self.desired_axis_rates = self.tracker.get_rates()
+                self.desired_axis_rates = self.tracker.consume_input_and_calculate_raw_axis_rates()
 
                 # this is what controls the move speed, which we are inverting:
                 #

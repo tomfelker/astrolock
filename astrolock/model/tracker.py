@@ -17,17 +17,37 @@ import math
 
 class TrackerInput(object):
     def __init__(self):
-        self.rate_scale = 1
-        self.accel_scale = 1
-        self.rate = np.zeros(2)
-        self.slowdown = 0
-        self.speedup = 0
+        self.last_input_time_ns = time.perf_counter_ns()
+        self.unconsumed_dt = 0.0
+        self.sensitivity = 0
+        self.sensitivity_scale = 1.0
+        self.last_rates = np.zeros(2, dtype=np.float32)
+        self.integrated_rates = np.zeros(2, dtype=np.float32)
+        self.last_braking = 0.0
+        self.integrated_braking = 0.0
+        self.emergency_stop_command = False
+        self.align_command = False
+        self.reset_command = False
 
-class TrackerInputState(object):
-    def __init__(self):
-        self.monotonic_time_ns_of_last_input = None
-        self.momentum = np.zeros(2)
-        self.smooth_input_mag = 0
+    def consume_input_time_rates_and_braking(self):
+        ns = time.perf_counter_ns()
+
+        # integrate up however much time since the last input, since it hasn't been added yet:
+        dt = (ns - self.last_input_time_ns) * 1e-9
+        self.last_input_time_ns = ns
+        self.integrated_rates += self.last_rates * dt
+        self.integrated_braking += self.last_braking * dt
+        self.unconsumed_dt += dt
+
+        # we will return the average rate over all the time since the previous consume call.
+        average_rates = self.integrated_rates / self.unconsumed_dt
+        average_braking = self.integrated_braking / self.unconsumed_dt
+
+        self.integrated_rates *= 0
+        self.integrated_braking *= 0
+        self.unconsumed_dt = 0
+
+        return dt, average_rates, average_braking
 
 class Tracker(object):
     
@@ -46,7 +66,6 @@ class Tracker(object):
         # add yourself here to be notified when any of the above change
         self.settings_observers = []
 
-        self.monotonic_time_ns_of_last_input = None
         self.axis_angles_measurement_time = None
         self.momentum = np.zeros(2)
         self.rates = np.zeros(2)
@@ -112,9 +131,7 @@ class Tracker(object):
     def get_status(self):
         s = ""
         s += "Input:\n"
-        s += "\tRate:  " + str(self.tracker_input.rate) + "\n"
-        s += "\tSlowdown: " + str(self.tracker_input.slowdown) + "\n"
-        s += "\tSpeedup: " + str(self.tracker_input.speedup) + "\n"
+        s += "\tLast rates:  " + str(self.tracker_input.last_rates) + "\n"
         s += "Momentum: " + str(self.momentum) + "\n"
         s += "Target:\n"
         if self.target is not None:
@@ -129,19 +146,6 @@ class Tracker(object):
             s += "Not connected to telescope.\n"
         return s
 
-    def set_input(self, tracker_input):
-        """
-        Called from the pygame thread or the gui thread whenever they have new data.
-        """
-        self.tracker_input = tracker_input
-
-        #if self.primary_telescope_connection is not None:
-        #    rates = self._compute_rates(True)
-        #    self.primary_telescope_connection.set_axis_rate(0, rates[0])
-        #    self.primary_telescope_connection.set_axis_rate(1, rates[1])
-
-        self.notify_status_changed()
-
     def set_target(self, new_target):
         if new_target is None:
             self.target = None
@@ -154,22 +158,19 @@ class Tracker(object):
         if self.target is not None and self.target.url in target_map:
             self.target = self.target.updated_with(target_map[self.target.url])
 
-    def get_rates(self):
-        return self._compute_rates(True) * (u.deg / u.s)
+    def consume_input_and_calculate_raw_axis_rates(self):
+        return u.Quantity(self._compute_rates(True), unit=u.deg / u.s)
 
     def _compute_rates(self, store):
-        monotonic_time_ns = time.monotonic_ns()
-        dt = 1.0
-        if self.monotonic_time_ns_of_last_input is not None:
-            elapsed_since_last_input_ns = monotonic_time_ns - self.monotonic_time_ns_of_last_input
-            dt = elapsed_since_last_input_ns * 1e-9
+
+        # TODO: commands
 
         if self.target is not None:
-            return self._compute_rates_with_target(dt, store)
+            return self._compute_rates_with_target(store)
         else:
-            return self._compute_rates_momentum(dt, store)
+            return self._compute_rates_momentum(store)
 
-    def _compute_rates_with_target(self, dt, store):
+    def _compute_rates_with_target(self, store):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
         dir_norm = np.linalg.norm(dir)
         dir /= dir_norm
@@ -181,12 +182,16 @@ class Tracker(object):
         image_up /= np.linalg.norm(image_up)
 
         # so don't modify self directly, unless store is True
-        # todo: eww
+        # TODO: eww
         target_offset_image_space = self.target_offset_image_space
         target_offset_lead_time = self.target_offset_lead_time
 
+        input_dt, average_rates, average_braking = self.tracker_input.consume_input_time_rates_and_braking()
+        # average_rates are sort of unitless (units of joystick deflection), but let's consider them as degrees per second
+        input_rates_rad_per_s = np.radians(average_rates)
 
-        target_offset_image_space += self.tracker_input.rate * self.tracker_input.rate_scale * dt
+        target_offset_image_space += input_rates_rad_per_s * input_dt
+        # todo: braking, aka recentering - (a bit complex with this time thing...)
 
         if self.target_offset_using_time:
             image_space_rates = np.array([np.dot(rates, image_left), np.dot(rates, image_up)])
@@ -206,10 +211,10 @@ class Tracker(object):
         desired_raw_axis_positions = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_dir)
 
         # haha, just inverting was hard enough, let's differentiate numerically...
-        if dt > 0:
-            desired_true_axis_positions_after_dt = desired_dir + desired_rates * dt
+        if input_dt > 0:
+            desired_true_axis_positions_after_dt = desired_dir + desired_rates * input_dt
             desired_raw_axis_positions_after_dt = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_true_axis_positions_after_dt)
-            desired_raw_axis_rates = wrap_angle_plus_minus_pi_radians(desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / dt
+            desired_raw_axis_rates = wrap_angle_plus_minus_pi_radians(desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / input_dt
         else:
             desired_raw_axis_rates = np.zeros(2)
 
@@ -230,35 +235,25 @@ class Tracker(object):
         if store:
             self.target_offset_image_space = target_offset_image_space
             self.target_offset_lead_time = target_offset_lead_time
-            self.monotonic_time_ns_of_last_input = time.monotonic_ns()
         return rates
 
-    def _compute_rates_momentum(self, dt, store):
+    def _compute_rates_momentum(self, store):
+            input_dt, average_rates, average_braking = self.tracker_input.consume_input_time_rates_and_braking()
 
-            base_rc = 2.0
-            rc = base_rc / (1.0 + self.tracker_input.speedup)
+            rc = 2.0
+            alpha = input_dt / (rc + input_dt)            
 
-            alpha = dt / (rc + dt)
-            
-            # here, we're treating both accel and rate together:
-            input_rate = self.tracker_input.rate * self.tracker_input.rate_scale
             momentum = self.momentum
-            momentum = (momentum + input_rate) * alpha + momentum * (1.0 - alpha)
-            rate = momentum
-
-            # hmm, todo: make this based on magnitude, instead of per-axis
-            max_braking = dt * self.tracker_input.rate_scale * self.tracker_input.slowdown
-            #momentum = np.maximum(np.abs(momentum) - max_braking, 0) * np.sign(momentum)
+            momentum = (momentum + average_rates) * alpha + momentum * (1.0 - alpha)
             momentum_mag = np.sqrt(np.dot(momentum, momentum))
             if momentum_mag > 0:
-                momentum_desired_mag = np.maximum(0, momentum_mag - max_braking)
+                momentum_desired_mag = np.maximum(0, momentum_mag - average_braking)
                 momentum *= momentum_desired_mag / momentum_mag
 
             if store:
                 self.momentum = momentum    
-                self.monotonic_time_ns_of_last_input = time.monotonic_ns()
 
-            return rate
+            return momentum
 
     def get_time(self):
         if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time is not None:
