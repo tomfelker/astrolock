@@ -39,7 +39,7 @@ class StellariumConnection(threaded.ThreadedConnection):
                 self.tracker.notify_idle()
 
                 status = requests.get('http:' + self.url_path + '/api/main/status')
-                measurement_time = astropy.time.Time.now()
+                measurement_time_ns = time.perf_counter_ns()
 
                 status_json = status.json()
                 fov_deg = float(status_json['view']['fov'])
@@ -48,16 +48,26 @@ class StellariumConnection(threaded.ThreadedConnection):
                 self.last_update_utc_str = status_json['time']['utc'].replace('.%1', '.0')
                 gps_time = astropy.time.Time(self.last_update_utc_str, format='isot', scale='utc')
 
-                if self.gps_time is None or np.abs((self.gps_time - gps_time).to_value(u.s)) > 10:
+                # because of that, it jitters, so don't change if it's off by less than a second 
+                should_update_time = False
+                if self.gps_time is None:
+                    should_update_time = True
+                else:
+                    seconds_since_last_measurement = u.Quantity(measurement_time_ns - self.gps_measurement_time_ns, unit=u.ns)
+                    current_extrapolated_gps_time = self.gps_time + seconds_since_last_measurement
+                    time_error = gps_time - current_extrapolated_gps_time
+                    if np.abs(time_error.to_value(u.s)) > 1:
+                        should_update_time = True
+                
+                if should_update_time:
                     self.gps_time = gps_time
-                    # a bit of a hack - since they only give second precision for this, only record the measurement time when the second changes,
-                    # so that it should be right to within our update loop time.
-                    self.gps_measurement_time = measurement_time
+                    self.gps_measurement_time_ns = measurement_time_ns
 
                 view = requests.get('http:' + self.url_path + '/api/main/view?ref=on')
-                measurement_time = astropy.time.Time.now()
-                self.axis_angles_measurement_time[0] = measurement_time
-                self.axis_angles_measurement_time[1] = measurement_time
+                measurement_time_ns = time.perf_counter_ns()
+                
+                self.axis_measurement_times_ns[0] = measurement_time_ns
+                self.axis_measurement_times_ns[1] = measurement_time_ns
 
                 view_json = view.json()
                 terrestrial_dir_str = view_json['altAz']
@@ -67,7 +77,7 @@ class StellariumConnection(threaded.ThreadedConnection):
 
                 terrestrial_dir_vec = np.array(terrestrial_dir_vec, dtype=np.float32) * np.array([-1.0, 1.0, 1.0], dtype=np.float32)
 
-                self.axis_angles = u.Quantity(self.fake_misalignment.raw_axis_values_given_numpy_dir(terrestrial_dir_vec), unit=u.rad)
+                self.axis_angles = self.fake_misalignment.raw_axis_values_given_numpy_dir(terrestrial_dir_vec)
                
                 # now we will set our rates, which requires knowing the FOV
 
@@ -87,8 +97,8 @@ class StellariumConnection(threaded.ThreadedConnection):
                 # hence these hard-coded numbers:
 
                 depl = 0.0004 / 30 * 1000 * fov_deg
-                move_x = self.desired_axis_rates[0].to_value(u.rad / u.s) / depl
-                move_y = self.desired_axis_rates[1].to_value(u.rad / u.s) / depl
+                move_x = self.desired_axis_rates[0] / depl
+                move_y = self.desired_axis_rates[1] / depl
 
                 requests.post('http:' + self.url_path + '/api/main/move', data = {'x': move_x, 'y': move_y}) 
                 
@@ -104,7 +114,7 @@ class StellariumConnection(threaded.ThreadedConnection):
                 # our fault that the loop rate tanks when we start tracking stuff.
 
                 self.record_loop_rate()
-                
+
             except ConnectionError:
                 self.want_to_stop = True
                 pass

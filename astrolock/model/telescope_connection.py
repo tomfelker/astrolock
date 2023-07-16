@@ -1,8 +1,8 @@
-import astropy.units as u
-import astropy.time
 import numpy as np
 import time
 from astrolock.model.util import *
+import astropy
+import astropy.units as u
 
 class TelescopeConnection(object):
     def __init__(self, url, tracker):
@@ -11,12 +11,19 @@ class TelescopeConnection(object):
             raise RuntimeError("This connection type can't handle this URL scheme")
         self.url = url
         self.url_path = url[len(self.__class__.get_url_scheme()):]
-        self.axis_angles = np.zeros(2) * u.rad
-        self.axis_angles_measurement_time = astropy.time.Time(np.zeros(2), format = 'unix')
+
+        # rad
+        self.axis_angles = np.zeros(2)
+        ns = time.perf_counter_ns()
+        self.axis_measurement_times_ns = np.array([ns, ns], dtype=np.int64)
+
+        # astropy.Time
         self.gps_time = None
-        self.gps_location = None
-        self.gps_measurement_time = None
-        self.desired_axis_rates = np.zeros(2) * u.rad / u.s
+        self.gps_location = None        
+        self.gps_measurement_time_ns = None
+
+        # rad/s
+        self.desired_axis_rates = np.zeros(2)
         
         # could be false if you're using a radio telescope,
         # or Stellarium, which can't tell us the current angles _without_ refaction, so we need to turn it off
@@ -69,9 +76,9 @@ class TelescopeConnection(object):
         raise NotImplementedError
     
     def get_status(self):
-        s  = "\tDesired rates: " + str(self.desired_axis_rates.to(u.deg / u.s)) + "\n"
-        s += "\tAngles:        " + str(self.axis_angles.to(u.deg)) + "\n"
-        s += "\tLoop time:     " + str((self.loop_time_smoothed_s * u.s).to(u.ms)) + "\n"
+        s  = "\tDesired rates: " + str(u.Quantity(self.desired_axis_rates, unit=u.rad/u.s).to(u.deg / u.s)) + "\n"
+        s += "\tAngles:        " + str(u.Quantity(self.axis_angles, unit=u.rad).to(u.deg)) + "\n"
+        s += "\tLoop time:     " + str(u.Quantity(self.loop_time_smoothed_s, unit=u.s).to(u.ms)) + "\n"
         return s
 
     def record_loop_rate(self):
@@ -81,16 +88,14 @@ class TelescopeConnection(object):
             self.loop_time_s = loop_time_ns * 1e-9
             self.loop_time_smoothed_s = lerp(self.loop_time_s, self.loop_time_smoothed_s or self.loop_time_s, self.loop_time_smoothing)
             
-        self.last_loop_performance_time_ns = cur_time_ns
-        
-
-    def set_axis_rate(self, axis, angular_rate_deg_per_s):
-        self.desired_axis_rates[axis] = angular_rate_deg_per_s * (u.deg / u.s)
+        self.last_loop_performance_time_ns = cur_time_ns        
         
     def get_estimated_axis_angles_and_time(self):
+        ns = time.perf_counter_ns()
         current_time = astropy.time.Time.now()
-        times_since_measurement = current_time - self.axis_angles_measurement_time
-        estimated_current_axis_angles = self.axis_angles + self.desired_axis_rates * times_since_measurement
+
+        time_s_since_measurement = (ns - self.axis_measurement_times_ns) * 1e-9
+        estimated_current_axis_angles = self.axis_angles + self.desired_axis_rates * time_s_since_measurement
         return estimated_current_axis_angles, current_time
 
 

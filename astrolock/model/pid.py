@@ -11,8 +11,7 @@ class PIDController:
         desired_rate,
         commanded_rate,
         measured_position,
-        measurement_seconds_ago,
-        store_state
+        measurement_seconds_ago
     ):
         # we assume the telescope is moving at the last commanded rate
         predicted_position_at_desired_time = measured_position + commanded_rate * measurement_seconds_ago

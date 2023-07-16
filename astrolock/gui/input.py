@@ -59,7 +59,8 @@ class InputFrame(tk.Frame):
                 else:
                     last_joystick_update_ns = ns
                     #print(f'Skipped {skipped_updates} this {ns_since_update * 1e-6} ms period.')
-                    dt = ns * 1e-9
+                    dt = ns_since_update * 1e-9
+
                     skipped_updates = 0
 
                     left_stick = np.zeros(2)
@@ -100,12 +101,12 @@ class InputFrame(tk.Frame):
                     input.last_input_time_ns = ns
                     input.unconsumed_dt += dt
 
-                    sensitivity_decrease_button = button_r1
+                    sensitivity_decrease_button = button_l1
                     if sensitivity_decrease_button and not input.sensitivity_decrease_button:
                         input.sensitivity -= 1
                     input.sensitivity_decrease_button = sensitivity_decrease_button
 
-                    sensitivity_increase_button = button_l1
+                    sensitivity_increase_button = button_r1
                     if sensitivity_increase_button and not input.sensitivity_increase_button:
                         input.sensitivity += 1
                     input.sensitivity_increase_button = sensitivity_increase_button

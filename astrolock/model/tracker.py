@@ -39,15 +39,15 @@ class TrackerInput(object):
         self.integrated_braking += self.last_braking * dt
         self.unconsumed_dt += dt
 
-        # we will return the average rate over all the time since the previous consume call.
-        average_rates = self.integrated_rates / self.unconsumed_dt
-        average_braking = self.integrated_braking / self.unconsumed_dt
+        # we will return the sum over all the time since the previous consume call.
+        integrated_rates = self.integrated_rates
+        integrated_braking = self.integrated_braking
 
-        self.integrated_rates *= 0
-        self.integrated_braking *= 0
+        self.integrated_rates = np.zeros_like(self.integrated_rates)
+        self.integrated_braking = np.zeros_like(self.integrated_braking)
         self.unconsumed_dt = 0
 
-        return dt, average_rates, average_braking
+        return dt, integrated_rates, integrated_braking
 
 class Tracker(object):
     
@@ -66,7 +66,6 @@ class Tracker(object):
         # add yourself here to be notified when any of the above change
         self.settings_observers = []
 
-        self.axis_angles_measurement_time = None
         self.momentum = np.zeros(2)
         self.rates = np.zeros(2)
         self.tracker_input = TrackerInput()
@@ -120,6 +119,10 @@ class Tracker(object):
         if (self.primary_telescope_connection):
             self.disconnect_from_telescope()
         self.primary_telescope_connection = TelescopeConnection.get_connection(url, self)
+
+        # so we don't immediately process all the stick inputs from before we were connected
+        self.tracker_input = TrackerInput()
+
         if self.primary_telescope_connection:
             self.primary_telescope_connection.start()
 
@@ -159,18 +162,28 @@ class Tracker(object):
             self.target = self.target.updated_with(target_map[self.target.url])
 
     def consume_input_and_calculate_raw_axis_rates(self):
-        return u.Quantity(self._compute_rates(True), unit=u.deg / u.s)
 
-    def _compute_rates(self, store):
+        if self.tracker_input.emergency_stop_command:
+            self.tracker_input.emergency_stop_command = False
 
-        # TODO: commands
+            self.set_target(None)
+            self.momentum *= 0
+            self.target_offset_lead_time = 0
+            self.target_offset_image_space *= 0
+            return np.zeros(2)
+        
+        if self.tracker_input.reset_command:
+            self.tracker_input.reset_command = False
+            self.target_offset_lead_time = 0
+            self.target_offset_image_space *= 0            
+            return np.zeros(2)
 
         if self.target is not None:
-            return self._compute_rates_with_target(store)
+            return self._compute_rates_with_target()
         else:
-            return self._compute_rates_momentum(store)
+            return self._compute_rates_momentum()
 
-    def _compute_rates_with_target(self, store):
+    def _compute_rates_with_target(self):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
         dir_norm = np.linalg.norm(dir)
         dir /= dir_norm
@@ -181,29 +194,25 @@ class Tracker(object):
         image_up = np.cross(dir, image_left)
         image_up /= np.linalg.norm(image_up)
 
-        # so don't modify self directly, unless store is True
-        # TODO: eww
-        target_offset_image_space = self.target_offset_image_space
-        target_offset_lead_time = self.target_offset_lead_time
+        input_dt, integrated_rates, integrated_braking = self.tracker_input.consume_input_time_rates_and_braking()
+        # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
+        # commands an angular velocity, which when integrated, becomes an angle (which we treat as radians)
 
-        input_dt, average_rates, average_braking = self.tracker_input.consume_input_time_rates_and_braking()
-        # average_rates are sort of unitless (units of joystick deflection), but let's consider them as degrees per second
-        input_rates_rad_per_s = np.radians(average_rates)
+        self.target_offset_image_space += integrated_rates
 
-        target_offset_image_space += input_rates_rad_per_s * input_dt
         # todo: braking, aka recentering - (a bit complex with this time thing...)
 
         if self.target_offset_using_time:
             image_space_rates = np.array([np.dot(rates, image_left), np.dot(rates, image_up)])
             image_space_rates_norm = np.linalg.norm(rates)
             if image_space_rates_norm > 0.0:
-                desired_delta_lead_time = np.dot(target_offset_image_space, image_space_rates) / image_space_rates_norm
-                old_lead_time = target_offset_lead_time
-                target_offset_lead_time = np.clip(old_lead_time + desired_delta_lead_time, -self.target_offset_max_lead_time, self.target_offset_max_lead_time)
-                delta_lead_time = target_offset_lead_time - old_lead_time
-                target_offset_image_space -= delta_lead_time * image_space_rates
+                desired_delta_lead_time = np.dot(self.target_offset_image_space, image_space_rates) / image_space_rates_norm
+                old_lead_time = self.target_offset_lead_time
+                self.target_offset_lead_time = np.clip(old_lead_time + desired_delta_lead_time, -self.target_offset_max_lead_time, self.target_offset_max_lead_time)
+                delta_lead_time = self.target_offset_lead_time - old_lead_time
+                self.target_offset_image_space -= delta_lead_time * image_space_rates
 
-        tweaked_dir = dir + (target_offset_image_space[0] * image_left + target_offset_image_space[1] * image_up) + rates * target_offset_lead_time
+        tweaked_dir = dir + (self.target_offset_image_space[0] * image_left + self.target_offset_image_space[1] * image_up) + rates * self.target_offset_lead_time
 
         desired_dir = np.array(tweaked_dir, dtype=np.float32)
         desired_rates = np.array(rates, dtype=np.float32)
@@ -218,46 +227,41 @@ class Tracker(object):
         else:
             desired_raw_axis_rates = np.zeros(2)
 
+        ns = time.perf_counter_ns()
         rates = np.zeros(2)
         if self.primary_telescope_connection is not None:
             for axis_index, pid_controller in enumerate(self.pid_controllers):            
                 control_rate = pid_controller.compute_control_rate(
                     desired_position = desired_raw_axis_positions[axis_index],
                     desired_rate = desired_raw_axis_rates[axis_index],
-                    commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index].to_value(u.rad / u.s),
-                    measured_position = self.primary_telescope_connection.axis_angles[axis_index].to_value(u.rad),
-                    # todo: change this all to perf_counter
-                    measurement_seconds_ago = (astropy.time.Time.now() - self.primary_telescope_connection.axis_angles_measurement_time[axis_index]).to_value(u.s),
-                    store_state = store
-                ) * (u.rad / u.s)
-                rates[axis_index] = control_rate.to_value(u.deg/u.s)
+                    commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index],
+                    measured_position = self.primary_telescope_connection.axis_angles[axis_index],
+                    measurement_seconds_ago = (ns - self.primary_telescope_connection.axis_measurement_times_ns[axis_index]) * 1e-9,
+                )
+                rates[axis_index] = control_rate
 
-        if store:
-            self.target_offset_image_space = target_offset_image_space
-            self.target_offset_lead_time = target_offset_lead_time
         return rates
 
-    def _compute_rates_momentum(self, store):
-            input_dt, average_rates, average_braking = self.tracker_input.consume_input_time_rates_and_braking()
+    def _compute_rates_momentum(self):
+            input_dt, integrated_rates, integrated_braking = self.tracker_input.consume_input_time_rates_and_braking()
+            # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
+            # commands an angular acceleration, which becomes a delta angular velocity when integrated (and we'll think of it in rad/s).
+            if input_dt > 0:
+                rc = 2.0
+                alpha = input_dt / (rc + input_dt)            
 
-            rc = 2.0
-            alpha = input_dt / (rc + input_dt)            
+                self.momentum = (self.momentum + integrated_rates / input_dt) * alpha + self.momentum * (1.0 - alpha)
+                momentum_mag = np.sqrt(np.dot(self.momentum, self.momentum))
+                if momentum_mag > 0:
+                    momentum_desired_mag = np.maximum(0, momentum_mag - integrated_braking / input_dt)
+                    self.momentum *= momentum_desired_mag / momentum_mag
 
-            momentum = self.momentum
-            momentum = (momentum + average_rates) * alpha + momentum * (1.0 - alpha)
-            momentum_mag = np.sqrt(np.dot(momentum, momentum))
-            if momentum_mag > 0:
-                momentum_desired_mag = np.maximum(0, momentum_mag - average_braking)
-                momentum *= momentum_desired_mag / momentum_mag
-
-            if store:
-                self.momentum = momentum    
-
-            return momentum
+            return self.momentum
 
     def get_time(self):
-        if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time is not None:
-            return self.primary_telescope_connection.gps_time + (astropy.time.Time.now() - self.primary_telescope_connection.gps_measurement_time)
+        if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time_ns is not None:
+            time_since_measurement = u.Quantity(time.perf_counter_ns() - self.primary_telescope_connection.gps_measurement_time_ns, unit=u.ns)
+            return self.primary_telescope_connection.gps_time + time_since_measurement
         return astropy.time.Time.now()
 
 

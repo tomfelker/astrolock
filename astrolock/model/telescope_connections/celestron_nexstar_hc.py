@@ -1,7 +1,7 @@
 import serial
 import serial.tools.list_ports
 import astropy.units as u
-import astropy.time
+import time
 import math
 
 import astrolock.model.telescope_connections.com_port
@@ -18,19 +18,20 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
         super().__init__(*args, **kwargs)
 
     def loop(self):
+        rad_to_arcsec = u.Quantity(1.0, unit=u.rad).to_value(u.arcsec)
+
         with self._open_serial_stream():
             while not self.want_to_stop:
                 
                 self.desired_axis_rates = self.tracker.consume_input_and_calculate_raw_axis_rates()
+
                 self.tracker.notify_idle()
-                self._serial_send_axis_rate_cmd(0, self.desired_axis_rates[0].to_value(u.arcsec / u.s))
-                #self.desired_axis_rates = self.tracker.consume_input_and_calculate_raw_axis_rates()
-                self._serial_send_axis_rate_cmd(1, self.desired_axis_rates[1].to_value(u.arcsec / u.s))
-                self.axis_angles[0] = self._serial_read_axis_position_radians(0) * u.rad
-                self.axis_angles_measurement_time[0] = astropy.time.Time.now()
-                #self.tracker.notify_status_changed()
-                self.axis_angles[1] = self._serial_read_axis_position_radians(1) * u.rad
-                self.axis_angles_measurement_time[1] = astropy.time.Time.now()
+                self._serial_send_axis_rate_cmd(0, self.desired_axis_rates[0] * rad_to_arcsec)
+                self._serial_send_axis_rate_cmd(1, self.desired_axis_rates[1] * rad_to_arcsec)
+                self.axis_angles[0] = self._serial_read_axis_position_radians(0)
+                self.axis_measurement_times_ns[0] = time.perf_counter_ns()
+                self.axis_angles[1] = self._serial_read_axis_position_radians(1)
+                self.axis_measurements_time[1] = time.perf_counter_ns()
                 self.tracker.notify_status_changed()
                 self.record_loop_rate()
                 
