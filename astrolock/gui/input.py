@@ -16,14 +16,11 @@ class InputFrame(tk.Frame):
 
         self.pygame_thread = threading.Thread(target = self.pygame_thread_func)
         self.pygame_thread.setDaemon(True)
-        self.pygame_thread.start()
+        # after is needed so the thread doesn't start throwing updates at us before we're in the Tkinter main loop, which would raise exceptions.
+        self.after(0, self.pygame_thread.start)
 
         #todo: cool gui for assigning axes...
         
-
-    def update_gui(self):
-        pass
-
     def pygame_thread_func(self):
         pygame.init()
         pygame.joystick.init()
@@ -57,13 +54,11 @@ class InputFrame(tk.Frame):
                 tracker_input.speedup = right_trigger
 
                 self.tracker.set_input(tracker_input)
-                
-                #self.tracker.update_gui_callback()
 
     def apply_deadzone(self, vec, deadzone = .1, power = 4):
         mag = np.math.sqrt(np.dot(vec, vec))
         if mag < deadzone:
-            return vec * 0
+            return np.zeros_like(vec)
         dir = vec / mag
                 
         mag = (mag - deadzone) * (1 - deadzone)

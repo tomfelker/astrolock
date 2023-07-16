@@ -27,10 +27,10 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
                 self._serial_send_axis_rate_cmd(1, self.desired_axis_rates[1].to_value(u.arcsec / u.s))
                 self.axis_angles[0] = self._serial_read_axis_position_radians(0) * u.rad
                 self.axis_angles_measurement_time[0] = astropy.time.Time.now()
-                self.tracker.update_gui_callback()
+                self.tracker.notify_status_changed()
                 self.axis_angles[1] = self._serial_read_axis_position_radians(1) * u.rad
                 self.axis_angles_measurement_time[1] = astropy.time.Time.now()
-                self.tracker.update_gui_callback()
+                self.tracker.notify_status_changed()
                 self.record_loop_rate()
                 
 

@@ -8,7 +8,8 @@ class StatusFrame(tk.Frame):
         tk.Frame.__init__(self, *args, **kwargs)
 
         self.tracker = tracker
-
+        self.tracker.status_observers.append(self)
+        
         connections = self.tracker.get_recommended_connection_urls()
         if len(connections) == 0:
             connections = ["No connections found"]
@@ -39,7 +40,10 @@ class StatusFrame(tk.Frame):
     def stop(self):
         self.tracker.disconnect_from_telescope()
 
-    def update_gui(self):
+    def on_tracker_status_changed(self):
+        self.after(1, self.update_status_label)
+
+    def update_status_label(self):
         if self.tracker is not None:
             self.label.config(text = self.tracker.get_status())
 

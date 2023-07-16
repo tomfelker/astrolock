@@ -6,6 +6,7 @@ import math
 import astrolock.model.alignment
 import numpy as np
 import torch
+import gc
 
 import astrolock.model.telescope_connections.threaded as threaded
 
@@ -44,6 +45,7 @@ class StellariumConnection(threaded.ThreadedConnection):
                 # Stellarium seems to have a bug where they missed a format specifier
                 self.last_update_utc_str = status_json['time']['utc'].replace('.%1', '.0')
                 gps_time = astropy.time.Time(self.last_update_utc_str, format='isot', scale='utc')
+                                
                 if self.gps_time is None or np.abs((self.gps_time - gps_time).to_value(u.s)) > 10:
                     self.gps_time = gps_time
                     # a bit of a hack - since they only give second precision for this, only record the measurement time when the second changes,
@@ -68,13 +70,15 @@ class StellariumConnection(threaded.ThreadedConnection):
                 #alt_rad = math.asin(terrestrial_dir_vec[2])
                 #az_rad = math.atan2(terrestrial_dir_vec[1], -terrestrial_dir_vec[0])
 
-                self.axis_angles = self.fake_misalignment.raw_axis_values_given_numpy_dir(terrestrial_dir_vec) * u.rad
+                #gc.collect()
+
+                calc_start_time = time.perf_counter_ns()
+
+                self.axis_angles = u.Quantity(self.fake_misalignment.raw_axis_values_given_numpy_dir(terrestrial_dir_vec), unit=u.rad)
                
                 # now we will set our rates, which requires knowing the FOV
 
-                #self.tracker.update_gui_callback()
                 self.desired_axis_rates = self.tracker.get_rates()
-
 
                 # this is what controls the move speed, which we are inverting:
                 # https://fossies.org/linux/stellarium/plugins/RemoteControl/src/MainService.cpp
@@ -89,10 +93,20 @@ class StellariumConnection(threaded.ThreadedConnection):
                 move_x = self.desired_axis_rates[0].to_value(u.rad / u.s) / depl
                 move_y = self.desired_axis_rates[1].to_value(u.rad / u.s) / depl
 
+                calc_time = (time.perf_counter_ns() - calc_start_time) * 1e-9
+                print(f"calc_time {calc_time * 1000} ms")
+
                 requests.post('http:' + self.url_path + '/api/main/move', data = {'x': move_x, 'y': move_y}) 
 
-                #self.tracker.update_gui_callback()
-                time.sleep(.1)
+
+                sleep_start_time = time.perf_counter_ns()
+                sleep_time = .1
+                time.sleep(sleep_time)
+                slept_for = (time.perf_counter_ns() - sleep_start_time) * 1e-9
+                warn_time = .02
+                if slept_for > sleep_time + warn_time:
+                    print(f"Warning!  Tracker thread overslept by {(slept_for - sleep_time) * 1000} ms, somebody's hogging the GIL!")
+
                 self.record_loop_rate()
             except ConnectionError:
                 self.want_to_stop = True

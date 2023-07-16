@@ -6,9 +6,10 @@ class TimeFrame(tk.Frame):
         tk.Frame.__init__(self, *args, **kwargs)
 
         self.tracker = tracker
+        self.tracker.status_observers.append(self)
 
         self.label = tk.Label(self, text="Time")
         self.label.pack()
 
-    def update_gui(self):
+    def on_tracker_status_changed(self):
         self.label.config(text=str(self.tracker.get_time()))

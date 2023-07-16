@@ -21,12 +21,7 @@ class OpenSkyTargetSource(target_source.TargetSource):
         self.want_to_stop = True
         self.query_range = 20 * u.km
         self.api_url = "https://opensky-network.org/api"
-        self.target_map = {}
         self.tracker = tracker
-
-    # maps urls to  targets    
-    def get_target_map(self):
-        return self.target_map
 
     def loop(self):
         while not self.want_to_stop:
@@ -59,8 +54,7 @@ class OpenSkyTargetSource(target_source.TargetSource):
                 })
                 if r.status_code == 200:
                     self.target_map = self.json_to_target_map(r.json())
-                    if self.targets_updated_callback is not None:
-                        self.targets_updated_callback(self.target_map)
+                    self.notify_targets_updated()
                     try:
                         print(f"Opensky credits: {r.headers['X-Rate-Limit-Remaining']}")
                     except:

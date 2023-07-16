@@ -115,7 +115,7 @@ class AlignmentFrame(tk.Frame):
 
         self.alignment_data_treeview.configure(yscrollcommand=self.alignment_data_treeview_scrollbar.set)
 
-        self.update_gui()
+        self.update_observations_treeview()
 
     def add_observation(self):
         if self.tracker.primary_telescope_connection is None:
@@ -129,8 +129,7 @@ class AlignmentFrame(tk.Frame):
         self.observation_items.append(AlignmentDatumTreeviewItem(new_datum))
 
         self.autosave_observations()
-        self.observations_dirty = True
-        self.update_gui()
+        self.update_observations_treeview()
 
     def add_test_observations(self):
         # these were captured while connected to Stellarium, but they differ in time similarly to how
@@ -185,50 +184,46 @@ class AlignmentFrame(tk.Frame):
 
         for alignment_datum in test_alignments:
             self.observation_items.append(AlignmentDatumTreeviewItem(alignment_datum))
-        self.update_gui()        
+        self.update_observations_treeview()        
 
     def add_random_stepper_offsets(self):
         test_stepper_offsets = [random.random() * 2.0 * math.pi, random.random() * 2.0 * math.pi] * u.rad
         print(f"Fuzzing offsets by {test_stepper_offsets}")
         for item in self.observation_items:
             item.datum.raw_axis_values += test_stepper_offsets
-        self.observations_dirty = True
-        self.update_gui()
+        self.update_observations_treeview()
 
-    def update_gui(self):
+    def update_observations_treeview(self):
         self.current_alignment_label.config(text = str(self.tracker.primary_telescope_alignment))
 
-        if self.observations_dirty:
-            self.observations_dirty = False
+        old_selection = self.alignment_data_treeview.selection()
 
-            old_selection = self.alignment_data_treeview.selection()
+        # it's insane that this is the best way... seems O(n^2)
+        self.alignment_data_treeview.delete(*self.alignment_data_treeview.get_children())
 
-            # it's insane that this is the best way... seems O(n^2)
-            self.alignment_data_treeview.delete(*self.alignment_data_treeview.get_children())
+        for item in self.observation_items:
+            alignment_datum = item.datum
 
-            for item in self.observation_items:
-                alignment_datum = item.datum
+            if alignment_datum.target is not None:
+                target_name = alignment_datum.target.display_name
+                target_url = alignment_datum.target.url
+            else:
+                target_name = '<unknown>'
+                target_url = ''
 
-                if alignment_datum.target is not None:
-                    target_name = alignment_datum.target.display_name
-                    target_url = alignment_datum.target.url
-                else:
-                    target_name = '<unknown>'
-                    target_url = ''
+            #('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
+            values = (target_name, target_url, str(alignment_datum.time), alignment_datum.raw_axis_values[0], alignment_datum.raw_axis_values[1])
 
-                #('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
-                values = (target_name, target_url, str(alignment_datum.time), alignment_datum.raw_axis_values[0], alignment_datum.raw_axis_values[1])
+            tags = []
+            if not item.enabled:
+                tags.append('disabled')
 
-                tags = []
-                if not item.enabled:
-                    tags.append('disabled')
+            item.iid = self.alignment_data_treeview.insert(parent = '', index = 'end', iid = item.iid, values = values, tags=tags)
 
-                item.iid = self.alignment_data_treeview.insert(parent = '', index = 'end', iid = item.iid, values = values, tags=tags)
-
-                try:
-                    self.alignment_data_treeview.selection_set(old_selection)
-                except:
-                    pass
+            try:
+                self.alignment_data_treeview.selection_set(old_selection)
+            except:
+                pass
 
     def get_alignment_data_from_gui(self):
         alignment_data = []
@@ -242,8 +237,7 @@ class AlignmentFrame(tk.Frame):
         for target_source in self.tracker.target_source_map.values():
             if target_source.use_for_alignment:
                 target_source.start()
-                target_map = target_source.get_target_map()
-                for target in target_map.values():
+                for target in target_source.target_map.values():
                     targets.append(target)
         
         if len(targets) == 0:
@@ -264,8 +258,7 @@ class AlignmentFrame(tk.Frame):
         alignment = astrolock.model.alignment.align(self.tracker, alignment_data, targets)
 
         self.tracker.primary_telescope_alignment = alignment
-        self.observations_dirty = True
-        self.update_gui()
+        self.update_observations_treeview()
 
     
     def load_observations_from_filename(self, filename):
@@ -276,8 +269,7 @@ class AlignmentFrame(tk.Frame):
                 datum = astrolock.model.alignment.AlignmentDatum.from_json(alignment_datum_dict)
                 item = AlignmentDatumTreeviewItem(datum)
                 self.observation_items.append(item)
-        self.observations_dirty = True
-        self.update_gui()
+        self.update_observations_treeview()
 
 
     def save_observations_to_filename(self, filename):
@@ -304,8 +296,7 @@ class AlignmentFrame(tk.Frame):
             for item in self.observation_items:
                 if item.iid == iid:
                     item.enabled = enabled   
-        self.observations_dirty = True                 
-        self.update_gui()
+        self.update_observations_treeview()
 
 
     def enable_selected_observations(self):
@@ -319,11 +310,9 @@ class AlignmentFrame(tk.Frame):
     def delete_selected_observations(self):        
         for iid in self.alignment_data_treeview.selection():
             self.observation_items = list(filter(lambda i: i.iid != iid, self.observation_items))
-        self.observations_dirty = True
-        self.update_gui()
+        self.update_observations_treeview()
 
 
     def delete_all_observations(self):
         self.observation_items.clear()
-        self.observations_dirty = True
-        self.update_gui()
+        self.update_observations_treeview()

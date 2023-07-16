@@ -74,6 +74,8 @@ class SkyfieldTargetSource(target_source.TargetSource):
         self.load_planets(loader)
         self.load_satellites(loader)
 
+        self.notify_targets_updated()
+
     def load_stars(self, loader, mag_limit = 3.0):
         with loader.open(skyfield.data.hipparcos.URL) as f:
             stars_df = skyfield.data.hipparcos.load_dataframe(f)
@@ -162,8 +164,3 @@ class SkyfieldTargetSource(target_source.TargetSource):
                 new_target.display_name = satellite.name
                 self.target_map[url] = new_target
             
-
-
-    # maps urls to targets    
-    def get_target_map(self):
-        return self.target_map

@@ -31,9 +31,20 @@ class TrackerInputState(object):
 class Tracker(object):
     
     def __init__(self):
-        self.lock = threading.RLock()
+        
         self.primary_telescope_connection = None
         self.primary_telescope_alignment = astrolock.model.alignment.AlignmentModel()
+        # todo: this should come from
+        # the hand controller of the telescope if available, or
+        # from the PC if there were any decent APIs for it, or
+        # the GUI, but for now, hardcode:
+        lat_deg, lon_deg, height_m = 37.51089, -122.2719388888889, 60
+        self.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = lat_deg * u.deg, lon = lon_deg * u.deg, height = height_m * u.m)
+        self.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = lat_deg, longitude_degrees = lon_deg, elevation_m = height_m)
+       
+        # add yourself here to be notified when any of the above change
+        self.settings_observers = []
+
         self.monotonic_time_ns_of_last_input = None
         self.axis_angles_measurement_time = None
         self.momentum = np.zeros(2)
@@ -48,6 +59,8 @@ class Tracker(object):
         self.target_offset_image_space = np.zeros(2)
         self.target_offset_lead_time = 0.0
 
+        self.status_observers = []
+
         self.target_source_map = {
             'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
             'OpenSky': astrolock.model.target_sources.opensky.OpenSkyTargetSource(self),
@@ -58,93 +71,89 @@ class Tracker(object):
         for i in range(2):
             pid_controller = PIDController()
             self.pid_controllers.append(pid_controller)
+    
+    def notify_settings_changed(self):
+        for observer in self.settings_observers:
+            observer.tracker_settings_changed()
 
-        # todo: this should come from
-        # the hand controller of the telescope if available, or
-        # from the PC if there were any decent APIs for it, or
-        # the GUI, but for now, hardcode:
-        lat_deg, lon_deg, height_m = 37.51089, -122.2719388888889, 60
-        self.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = lat_deg * u.deg, lon = lon_deg * u.deg, height = height_m * u.m)
-        self.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = lat_deg, longitude_degrees = lon_deg, elevation_m = height_m)
-       
+    def notify_status_changed(self):
+        for observer in self.status_observers:
+            observer.on_tracker_status_changed()
     
     def get_recommended_connection_urls(self):
-        with self.lock:
-            return TelescopeConnection.get_urls_for_subclasses()
+        return TelescopeConnection.get_urls_for_subclasses()
 
     def connect_to_telescope(self, url):
-        with self.lock:
-            if (self.primary_telescope_connection):
-                self.disconnect_from_telescope()
-            self.primary_telescope_connection = TelescopeConnection.get_connection(url, self)
-            if self.primary_telescope_connection:
-                self.primary_telescope_connection.start()
+        if (self.primary_telescope_connection):
+            self.disconnect_from_telescope()
+        self.primary_telescope_connection = TelescopeConnection.get_connection(url, self)
+        if self.primary_telescope_connection:
+            self.primary_telescope_connection.start()
 
     def disconnect_from_telescope(self):
-        with self.lock:
-            if self.primary_telescope_connection:
-                self.primary_telescope_connection.stop()
-                self.primary_telescope_connection = None
+        if self.primary_telescope_connection:
+            self.primary_telescope_connection.stop()
+            self.primary_telescope_connection = None
 
     def get_status(self):
-        with self.lock:
-            s = ""
-            s += "Input:\n"
-            s += "\tRate:  " + str(self.tracker_input.rate) + "\n"
-            s += "\tSlowdown: " + str(self.tracker_input.slowdown) + "\n"
-            s += "\tSpeedup: " + str(self.tracker_input.speedup) + "\n"
-            s += "Momentum: " + str(self.momentum) + "\n"
-            s += "Target:\n"
-            if self.target is not None:
-                s += self.target.get_status()
-            else:
-                s += "\tNo Target\n"
+        s = ""
+        s += "Input:\n"
+        s += "\tRate:  " + str(self.tracker_input.rate) + "\n"
+        s += "\tSlowdown: " + str(self.tracker_input.slowdown) + "\n"
+        s += "\tSpeedup: " + str(self.tracker_input.speedup) + "\n"
+        s += "Momentum: " + str(self.momentum) + "\n"
+        s += "Target:\n"
+        if self.target is not None:
+            s += self.target.get_status()
+        else:
+            s += "\tNo Target\n"
 
-            if self.primary_telescope_connection:
-                s += "Connected to telescope at " + self.primary_telescope_connection.url + "\n"
-                s += self.primary_telescope_connection.get_status()
-            else:
-                s += "Not connected to telescope.\n"
-            return s
+        if self.primary_telescope_connection:
+            s += "Connected to telescope at " + self.primary_telescope_connection.url + "\n"
+            s += self.primary_telescope_connection.get_status()
+        else:
+            s += "Not connected to telescope.\n"
+        return s
 
     def set_input(self, tracker_input):
-        with self.lock:
-            self.tracker_input = tracker_input            
-            if self.primary_telescope_connection is not None:
-                rates = self._compute_rates(True)
-                self.primary_telescope_connection.set_axis_rate(0, rates[0])
-                self.primary_telescope_connection.set_axis_rate(1, rates[1])
+        """
+        Called from the pygame thread or the gui thread whenever they have new data.
+        """
+        self.tracker_input = tracker_input
+
+        if self.primary_telescope_connection is not None:
+            rates = self._compute_rates(True)
+            self.primary_telescope_connection.set_axis_rate(0, rates[0])
+            self.primary_telescope_connection.set_axis_rate(1, rates[1])
+
+        self.notify_status_changed()
 
     def set_target(self, new_target):
-        with self.lock:
-            if new_target is None:
-                self.target = None
-            elif self.target is not None and self.target.url == new_target.url and self.target != new_target:
-                self.target = self.target.updated_with(new_target)
-            else:
-                self.target = new_target
+        if new_target is None:
+            self.target = None
+        elif self.target is not None and self.target.url == new_target.url and self.target != new_target:
+            self.target = self.target.updated_with(new_target)
+        else:
+            self.target = new_target
 
     def update_targets(self, target_map): 
-        with self.lock:
-            if self.target is not None and self.target.url in target_map:
-                self.target = self.target.updated_with(target_map[self.target.url])
+        if self.target is not None and self.target.url in target_map:
+            self.target = self.target.updated_with(target_map[self.target.url])
 
     def get_rates(self):
-        with self.lock:
-            return self._compute_rates(False) * (u.deg / u.s)
+        return self._compute_rates(False) * (u.deg / u.s)
 
     def _compute_rates(self, store):
-        with self.lock:
-            monotonic_time_ns = time.monotonic_ns()
-            dt = 1.0
-            if self.monotonic_time_ns_of_last_input is not None:
-                elapsed_since_last_input_ns = monotonic_time_ns - self.monotonic_time_ns_of_last_input
-                dt = elapsed_since_last_input_ns * 1e-9
+        monotonic_time_ns = time.monotonic_ns()
+        dt = 1.0
+        if self.monotonic_time_ns_of_last_input is not None:
+            elapsed_since_last_input_ns = monotonic_time_ns - self.monotonic_time_ns_of_last_input
+            dt = elapsed_since_last_input_ns * 1e-9
 
-            if self.target is not None:
-                return self._compute_rates_with_target(dt, store)
-            else:
-                return self._compute_rates_momentum(dt, store)
+        if self.target is not None:
+            return self._compute_rates_with_target(dt, store)
+        else:
+            return self._compute_rates_momentum(dt, store)
 
     def _compute_rates_with_target(self, dt, store):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())

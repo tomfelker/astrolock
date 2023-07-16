@@ -15,7 +15,6 @@ class KmlTargetSource(target_source.TargetSource):
 
     def __init__(self, tracker):
         super().__init__()
-        self.target_map = {}
         self.tracker = tracker
 
         self.use_for_alignment = True
@@ -50,13 +49,3 @@ class KmlTargetSource(target_source.TargetSource):
             
             self.target_map[new_target.url] = new_target
 
-
-
-
-                
-
-
-
-    # maps urls to  targets    
-    def get_target_map(self):
-        return self.target_map

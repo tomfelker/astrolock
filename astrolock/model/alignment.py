@@ -459,8 +459,9 @@ class AlignmentModel(torch.nn.Module):
         d = d.squeeze(-1)
         return d
 
-    def raw_axis_values_given_numpy_dir(self, dir):        
-        return self.raw_axis_values_given_dir(torch.tensor(dir)).detach().numpy()
+    def raw_axis_values_given_numpy_dir(self, dir):
+        with torch.no_grad():        
+            return self.raw_axis_values_given_dir(torch.tensor(dir)).numpy()
 
     def raw_axis_values_given_dir(self, dir):
         """
