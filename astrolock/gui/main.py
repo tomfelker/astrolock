@@ -8,6 +8,7 @@ import astrolock.gui.input
 import astrolock.gui.targets
 import astrolock.model.tracker as tracker
 
+import gc
 
 
 class MainWindow(tk.Tk):
@@ -45,6 +46,9 @@ class MainWindow(tk.Tk):
 
     def _destroy(self, *args, **kwargs):
         self.tracker.disconnect_from_telescope()
+
+def tracker_on_idle(self):
+    self.after(5, gc.collect)
 
 def gui_loop():
     window = MainWindow()

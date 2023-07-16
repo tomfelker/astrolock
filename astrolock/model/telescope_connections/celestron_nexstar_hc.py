@@ -22,6 +22,7 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
             while not self.want_to_stop:
                 
                 self.desired_axis_rates = self.tracker.get_rates()
+                self.tracker.notify_idle()
                 self._serial_send_axis_rate_cmd(0, self.desired_axis_rates[0].to_value(u.arcsec / u.s))
                 #self.desired_axis_rates = self.tracker.get_rates()
                 self._serial_send_axis_rate_cmd(1, self.desired_axis_rates[1].to_value(u.arcsec / u.s))

@@ -21,10 +21,10 @@ class SkyfieldTarget(target.Target):
         observatory_barycentric = observatory.at(time_sf)
 
         if isinstance(self.sf_target, skyfield.api.EarthSatellite):
-            accurate_but_slow = True
+            accurate_but_slow = False
             if accurate_but_slow:
                 # they tell me this way is slower, but - doesn't seem too bad.
-                # TODO: measure
+                # seems to add ~5 ms
                 ssb_satellite = tracker.home_planet_sf + self.sf_target
                 target_apparent = observatory.at(time_sf).observe(ssb_satellite).apparent()
             else:

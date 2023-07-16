@@ -62,6 +62,8 @@ class Tracker(object):
 
         self.status_observers = []
 
+        self.idle_observers = []
+
         self.target_source_map = {
             'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
             'OpenSky': astrolock.model.target_sources.opensky.OpenSkyTargetSource(self),
@@ -80,6 +82,17 @@ class Tracker(object):
     def notify_status_changed(self):
         for observer in self.status_observers:
             observer.on_tracker_status_changed()
+
+    def notify_idle(self):
+        """
+        Telescope connections will call this when they are about to wait for a response for the telescope, which is a good time
+        for us to do GIL-hogging things like GUI updates, garbage collecting, or updating caches.
+        
+        TODO: tracker should have its own thread to service these (rather than, as now, relying on Tkinter to schedule the work)
+        TODO: callers could specify how long they expect to be idle (best case can be calculated from baud rate)
+        """
+        for observer in self.idle_observers:
+            observer.on_tracker_idle()
     
     def get_recommended_connection_urls(self):
         return TelescopeConnection.get_urls_for_subclasses()

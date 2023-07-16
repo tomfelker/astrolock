@@ -7,6 +7,7 @@ import pygame
 import pygame.event
 import pygame.joystick
 import numpy as np
+import time
 
 class InputFrame(tk.Frame):
     def __init__(self, *args, tracker, **kwargs):        
@@ -29,13 +30,22 @@ class InputFrame(tk.Frame):
         for joystick in joysticks:
             joystick.init()
 
+        last_update_time_perf_counter_ns = time.perf_counter_ns()
+
         while True:
             event = pygame.event.wait()
             need_update = False
             if event.type == pygame.JOYAXISMOTION:
                 need_update = True
 
+            seconds_since_update = (time.perf_counter_ns() - last_update_time_perf_counter_ns) * 1e-9
+            if seconds_since_update < .01:
+                # Yikes how fast is this?  PS4 dualshock is melting my CPU just with this.
+                need_update = False
+
+
             if need_update:
+                last_update_time_perf_counter_ns = time.perf_counter_ns()
                 #hmm, threading...
                 #todo: some cool binding thing
                 left_stick = np.zeros(2)
@@ -55,7 +65,7 @@ class InputFrame(tk.Frame):
 
                 self.tracker.set_input(tracker_input)
 
-    def apply_deadzone(self, vec, deadzone = .1, power = 4):
+    def apply_deadzone(self, vec, deadzone = .15, power = 4):
         mag = np.math.sqrt(np.dot(vec, vec))
         if mag < deadzone:
             return np.zeros_like(vec)

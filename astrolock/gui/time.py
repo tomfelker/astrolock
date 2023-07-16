@@ -12,4 +12,7 @@ class TimeFrame(tk.Frame):
         self.label.pack()
 
     def on_tracker_status_changed(self):
+        self.after(0, self.update_label)
+
+    def update_label(self):
         self.label.config(text=str(self.tracker.get_time()))
