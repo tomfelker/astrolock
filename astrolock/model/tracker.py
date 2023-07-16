@@ -4,6 +4,7 @@ import astrolock.model.target_sources.opensky
 import astrolock.model.target_sources.kml
 import astrolock.model.target_sources.skyfield
 import astrolock.model.alignment
+from astrolock.model.util import *
 
 from astropy import units as u
 import astropy.time
@@ -121,10 +122,10 @@ class Tracker(object):
         """
         self.tracker_input = tracker_input
 
-        if self.primary_telescope_connection is not None:
-            rates = self._compute_rates(True)
-            self.primary_telescope_connection.set_axis_rate(0, rates[0])
-            self.primary_telescope_connection.set_axis_rate(1, rates[1])
+        #if self.primary_telescope_connection is not None:
+        #    rates = self._compute_rates(True)
+        #    self.primary_telescope_connection.set_axis_rate(0, rates[0])
+        #    self.primary_telescope_connection.set_axis_rate(1, rates[1])
 
         self.notify_status_changed()
 
@@ -141,7 +142,7 @@ class Tracker(object):
             self.target = self.target.updated_with(target_map[self.target.url])
 
     def get_rates(self):
-        return self._compute_rates(False) * (u.deg / u.s)
+        return self._compute_rates(True) * (u.deg / u.s)
 
     def _compute_rates(self, store):
         monotonic_time_ns = time.monotonic_ns()
@@ -195,7 +196,7 @@ class Tracker(object):
         if dt > 0:
             desired_true_axis_positions_after_dt = desired_dir + desired_rates * dt
             desired_raw_axis_positions_after_dt = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(desired_true_axis_positions_after_dt)
-            desired_raw_axis_rates = (desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / dt
+            desired_raw_axis_rates = wrap_angle_plus_minus_pi_radians(desired_raw_axis_positions_after_dt - desired_raw_axis_positions) / dt
         else:
             desired_raw_axis_rates = np.zeros(2)
 
@@ -203,15 +204,15 @@ class Tracker(object):
         if self.primary_telescope_connection is not None:
             for axis_index, pid_controller in enumerate(self.pid_controllers):            
                 control_rate = pid_controller.compute_control_rate(
-                    desired_position = desired_raw_axis_positions[axis_index] * u.rad,
-                    desired_rate = desired_raw_axis_rates[axis_index] * u.rad / u.s,
-                    desired_time = astropy.time.Time.now(),
-                    commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index],
-                    measured_position = self.primary_telescope_connection.axis_angles[axis_index],
-                    measured_position_time = self.primary_telescope_connection.axis_angles_measurement_time[axis_index],
+                    desired_position = desired_raw_axis_positions[axis_index],
+                    desired_rate = desired_raw_axis_rates[axis_index],
+                    commanded_rate = self.primary_telescope_connection.desired_axis_rates[axis_index].to_value(u.rad / u.s),
+                    measured_position = self.primary_telescope_connection.axis_angles[axis_index].to_value(u.rad),
+                    # todo: change this all to perf_counter
+                    measurement_seconds_ago = (astropy.time.Time.now() - self.primary_telescope_connection.axis_angles_measurement_time[axis_index]).to_value(u.s),
                     store_state = store
-                ).to_value(u.deg / u.s)
-                rates[axis_index] = control_rate
+                ) * (u.rad / u.s)
+                rates[axis_index] = control_rate.to_value(u.deg/u.s)
 
         if store:
             self.target_offset_image_space = target_offset_image_space
