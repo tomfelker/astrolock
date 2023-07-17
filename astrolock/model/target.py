@@ -27,11 +27,17 @@ class Target:
         return ret
 
     def get_status(self):
+        if self.extrapolated_velocity_itrs is not None and self.extrapolated_acceleration_itrs is not None:
+            extrapolation_info = (
+                f'\textrapolated speed: {self.extrapolated_velocity_itrs.norm().to(u.imperial.kt)}\n'
+                f'\textrapolated accel: {self.extrapolated_acceleration_itrs.norm().to(u.m / (u.s * u.s))}\n'
+            )
+        else:
+            extrapolation_info = ''
         return (
             f'\t{self.display_name}\n'
             f'\t{self.url}\n'
-            f'\textrapolated speed: {self.extrapolated_velocity_itrs.norm().to(u.imperial.kt) if self.extrapolated_velocity_itrs is not None else ""}\n'
-            f'\textrapolated accel: {self.extrapolated_acceleration_itrs.norm().to(u.m / (u.s * u.s)) if self.extrapolated_acceleration_itrs is not None else ""}\n'
+            f'{extrapolation_info}'
             f'\t\n'
         )
 

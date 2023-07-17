@@ -24,6 +24,8 @@ class TelescopeConnection(object):
 
         # rad/s
         self.desired_axis_rates = np.zeros(2)
+        # rad/s
+        self.estimated_axis_rates = np.zeros(2)
         
         # could be false if you're using a radio telescope,
         # or Stellarium, which can't tell us the current angles _without_ refaction, so we need to turn it off
@@ -76,10 +78,13 @@ class TelescopeConnection(object):
         raise NotImplementedError
     
     def get_status(self):
-        s  = "\tDesired rates: " + str(u.Quantity(self.desired_axis_rates, unit=u.rad/u.s).to(u.deg / u.s)) + "\n"
-        s += "\tAngles:        " + str(u.Quantity(self.axis_angles, unit=u.rad).to(u.deg)) + "\n"
-        s += "\tLoop time:     " + str(u.Quantity(self.loop_time_smoothed_s, unit=u.s).to(u.ms)) + "\n"
-        return s
+        return (
+            f"\t                     Azimuth   Altitude\n"
+            f"\tLast Angles:      [{math.degrees(self.axis_angles[0]): 9.3f}, {math.degrees(self.axis_angles[1]): 9.3f}] deg\n"
+            f"\tDesired rates:    [{math.degrees(self.desired_axis_rates[0]): 9.3f}, {math.degrees(self.desired_axis_rates[1]): 9.3f}] deg/s\n"
+            f"\tEstimated rates:  [{math.degrees(self.estimated_axis_rates[0]): 9.3f}, {math.degrees(self.estimated_axis_rates[1]): 9.3f}] deg/s\n"
+            f"\tSmooth loop time: {self.loop_time_smoothed_s * 1e3: 6.3f} ms\n"
+        )
 
     def record_loop_rate(self):
         cur_time_ns = time.perf_counter_ns()
@@ -97,6 +102,9 @@ class TelescopeConnection(object):
         time_s_since_measurement = (ns - self.axis_measurement_times_ns) * 1e-9
         estimated_current_axis_angles = self.axis_angles + self.desired_axis_rates * time_s_since_measurement
         return estimated_current_axis_angles, current_time
+    
+    def request_gps(self):
+        pass
 
 
 from astrolock.model.telescope_connections import *

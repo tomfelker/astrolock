@@ -4,6 +4,7 @@ import astropy.units as u
 import astropy.time
 import math
 import astrolock.model.alignment
+from astrolock.model.util import *
 import numpy as np
 import torch
 import gc
@@ -65,7 +66,7 @@ class StellariumConnection(threaded.ThreadedConnection):
 
                 view = requests.get('http:' + self.url_path + '/api/main/view?ref=on')
                 measurement_time_ns = time.perf_counter_ns()
-                
+                axis_dt = (measurement_time_ns - self.axis_measurement_times_ns[0]) * 1e-9
                 self.axis_measurement_times_ns[0] = measurement_time_ns
                 self.axis_measurement_times_ns[1] = measurement_time_ns
 
@@ -77,8 +78,10 @@ class StellariumConnection(threaded.ThreadedConnection):
 
                 terrestrial_dir_vec = np.array(terrestrial_dir_vec, dtype=np.float32) * np.array([-1.0, 1.0, 1.0], dtype=np.float32)
 
+                old_axis_angles = self.axis_angles.copy()
                 self.axis_angles = self.fake_misalignment.raw_axis_values_given_numpy_dir(terrestrial_dir_vec)
-               
+                self.estimated_axis_rates = wrap_angle_plus_minus_pi_radians(self.axis_angles - old_axis_angles) / axis_dt
+
                 # now we will set our rates, which requires knowing the FOV
 
                 self.desired_axis_rates = self.tracker.consume_input_and_calculate_raw_axis_rates()

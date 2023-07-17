@@ -1,6 +1,21 @@
+"""
+This can talk to a Celestron hand controller.
+
+Many thanks for the great docs here:  http://www.paquettefamily.ca/nexstar/NexStar_AUX_Commands_10.pdf
+
+I've tested it mostly with my CPC 1100.  Some notes:
+
+- Max slew rates:
+    - azimuth - just by sound, seems to achieve 4 deg/s
+    - altitude - 
+
+"""
+
+
 import serial
 import serial.tools.list_ports
 import astropy.units as u
+from astrolock.model.util import *
 import time
 import math
 
@@ -26,12 +41,19 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
                 self.desired_axis_rates = self.tracker.consume_input_and_calculate_raw_axis_rates()
 
                 self.tracker.notify_idle()
-                self._serial_send_axis_rate_cmd(0, self.desired_axis_rates[0] * rad_to_arcsec)
-                self._serial_send_axis_rate_cmd(1, self.desired_axis_rates[1] * rad_to_arcsec)
-                self.axis_angles[0] = self._serial_read_axis_position_radians(0)
-                self.axis_measurement_times_ns[0] = time.perf_counter_ns()
-                self.axis_angles[1] = self._serial_read_axis_position_radians(1)
-                self.axis_measurements_time[1] = time.perf_counter_ns()
+                for axis in range(2):
+                    self._serial_send_axis_rate_cmd(axis, self.desired_axis_rates[axis] * rad_to_arcsec)
+    
+                for axis in range(2):
+                    old_axis_angle = self.axis_angles[axis]
+                    old_measurement_time_ns = self.axis_measurement_times_ns[axis]
+
+                    self.axis_angles[axis] = self._serial_read_axis_position_radians(axis) 
+                    self.axis_measurement_times_ns[axis] = time.perf_counter_ns()
+
+                    axis_dt = (self.axis_measurement_times_ns[axis] - old_measurement_time_ns) * 1e-9
+                    self.estimated_axis_rates[axis] = wrap_angle_plus_minus_pi_radians(self.axis_angles[axis] - old_axis_angle) / axis_dt
+
                 self.tracker.notify_status_changed()
                 self.record_loop_rate()
                 

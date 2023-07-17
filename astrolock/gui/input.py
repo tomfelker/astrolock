@@ -23,8 +23,8 @@ class InputFrame(tk.Frame):
         self.min_joystick_update_period_ns = int(1e9 / max_joystick_update_hz)
 
         self.sensitivity_step = 2
-        self.sensitivity_max = 4
-        self.sensitivity_min = -4
+        self.sensitivity_max = 2
+        self.sensitivity_min = -8
         self.fine_adjust_factor = .2
 
         self.pygame_thread = threading.Thread(target = self.pygame_thread_func)

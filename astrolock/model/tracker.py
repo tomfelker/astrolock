@@ -19,7 +19,7 @@ class TrackerInput(object):
     def __init__(self):
         self.last_input_time_ns = time.perf_counter_ns()
         self.unconsumed_dt = 0.0
-        self.sensitivity = 0
+        self.sensitivity = -2
         self.sensitivity_scale = 1.0
         self.last_rates = np.zeros(2, dtype=np.float32)
         self.integrated_rates = np.zeros(2, dtype=np.float32)
@@ -132,22 +132,22 @@ class Tracker(object):
             self.primary_telescope_connection = None
 
     def get_status(self):
-        s = ""
-        s += "Input:\n"
-        s += "\tLast rates:  " + str(self.tracker_input.last_rates) + "\n"
-        s += "Momentum: " + str(self.momentum) + "\n"
-        s += "Target:\n"
-        if self.target is not None:
-            s += self.target.get_status()
-        else:
-            s += "\tNo Target\n"
-
         if self.primary_telescope_connection:
-            s += "Connected to telescope at " + self.primary_telescope_connection.url + "\n"
-            s += self.primary_telescope_connection.get_status()
+            telescope_string = 'Connected to ' + self.primary_telescope_connection.url + '\n' + self.primary_telescope_connection.get_status()
         else:
-            s += "Not connected to telescope.\n"
-        return s
+            telescope_string = 'Not connected'
+        return (
+            f"Target:\n"
+            f"{self.target.get_status() if self.target is not None else 'No target'}\n"
+            f"Input:\n"
+            f"\tSensitivity:    {self.tracker_input.sensitivity}\n"
+            f"\tLast Rates:     [{math.degrees(self.tracker_input.last_rates[0]): 9.3f}, {math.degrees(self.tracker_input.last_rates[1]): 9.3f}] {'deg/s^2' if self.target is None else 'deg/s'}\n"
+            f"\tMomentum:       [{math.degrees(self.momentum[0]): 9.3f}, {math.degrees(self.momentum[1]): 9.3f}] deg/s\n"
+            f"\tSpatial offset: [{math.degrees(self.target_offset_image_space[0]): 9.3f}, {math.degrees(self.target_offset_image_space[1]): 9.3f}] deg\n"
+            f"\tLead time:      {self.target_offset_lead_time: 6.3f} s\n"
+            f"Telescope:\n"
+            f"\t{telescope_string}\n"
+        )
 
     def set_target(self, new_target):
         if new_target is None:
@@ -206,7 +206,7 @@ class Tracker(object):
             image_space_rates = np.array([np.dot(rates, image_left), np.dot(rates, image_up)])
             image_space_rates_norm = np.linalg.norm(rates)
             if image_space_rates_norm > 0.0:
-                desired_delta_lead_time = np.dot(self.target_offset_image_space, image_space_rates) / image_space_rates_norm
+                desired_delta_lead_time = np.dot(self.target_offset_image_space, image_space_rates) / np.square(image_space_rates_norm)
                 old_lead_time = self.target_offset_lead_time
                 self.target_offset_lead_time = np.clip(old_lead_time + desired_delta_lead_time, -self.target_offset_max_lead_time, self.target_offset_max_lead_time)
                 delta_lead_time = self.target_offset_lead_time - old_lead_time
