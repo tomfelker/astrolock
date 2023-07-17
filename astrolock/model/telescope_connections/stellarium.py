@@ -64,6 +64,8 @@ class StellariumConnection(threaded.ThreadedConnection):
                     self.gps_time = gps_time
                     self.gps_measurement_time_ns = measurement_time_ns
 
+                self.gps_location = astropy.coordinates.EarthLocation.from_geodetic(lat = status_json['location']['latitude'] * u.deg, lon = status_json['location']['longitude'] * u.deg, height = status_json['location']['altitude'] * u.m)
+
                 view = requests.get('http:' + self.url_path + '/api/main/view?ref=on')
                 measurement_time_ns = time.perf_counter_ns()
                 axis_dt = (measurement_time_ns - self.axis_measurement_times_ns[0]) * 1e-9

@@ -31,7 +31,7 @@ class StatusFrame(tk.Frame):
         self.az_rate_slider.pack()
 
         #hmm, how to do sizes in cm?
-        self.label = tk.Label(self, text="Status", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 80, height = 25)
+        self.label = tk.Label(self, text="Status", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 25)
         self.label.pack()
 
     def start(self):

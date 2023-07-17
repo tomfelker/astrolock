@@ -78,12 +78,17 @@ class TelescopeConnection(object):
         raise NotImplementedError
     
     def get_status(self):
+
+
+
         return (
             f"\t                     Azimuth   Altitude\n"
             f"\tLast Angles:      [{math.degrees(self.axis_angles[0]): 9.3f}, {math.degrees(self.axis_angles[1]): 9.3f}] deg\n"
             f"\tDesired rates:    [{math.degrees(self.desired_axis_rates[0]): 9.3f}, {math.degrees(self.desired_axis_rates[1]): 9.3f}] deg/s\n"
             f"\tEstimated rates:  [{math.degrees(self.estimated_axis_rates[0]): 9.3f}, {math.degrees(self.estimated_axis_rates[1]): 9.3f}] deg/s\n"
             f"\tSmooth loop time: {self.loop_time_smoothed_s * 1e3: 6.3f} ms\n"
+            f"\tGPS Location:     {location_to_string(self.gps_location)}\n"
+            f"\tGPS Time:         {self.gps_time}\n"
         )
 
     def record_loop_rate(self):
