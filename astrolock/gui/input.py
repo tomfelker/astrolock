@@ -38,20 +38,22 @@ class InputFrame(tk.Frame):
         pygame.init()
         pygame.joystick.init()
 
-        joysticks = [pygame.joystick.Joystick(x) for x in range(pygame.joystick.get_count())]
-        for joystick in joysticks:
-            joystick.init()
+
 
         last_joystick_update_ns = time.perf_counter_ns()
         skipped_updates = 0
 
+        joystick_motion_events = [
+            pygame.JOYAXISMOTION,
+            pygame.JOYBALLMOTION,
+            pygame.JOYBUTTONDOWN,
+            pygame.JOYBUTTONUP,            
+        ]
+
         while True:
             event = pygame.event.wait()
-            need_update = False
-            if event.type == pygame.JOYAXISMOTION:
-                need_update = True
 
-            if need_update:
+            if event.type in joystick_motion_events:                
                 ns = time.perf_counter_ns()
                 ns_since_update = ns - last_joystick_update_ns                
                 if ns_since_update < self.min_joystick_update_period_ns:
@@ -146,6 +148,11 @@ class InputFrame(tk.Frame):
                         input.reset_command = True
 
                     self.tracker.notify_status_changed()
+
+            elif event.type == pygame.JOYDEVICEADDED:
+                joysticks = [pygame.joystick.Joystick(x) for x in range(pygame.joystick.get_count())]
+                for joystick in joysticks:
+                    joystick.init()
 
     def apply_deadzone(self, vec, deadzone = .15, power = 4):
         mag = np.math.sqrt(np.dot(vec, vec))
