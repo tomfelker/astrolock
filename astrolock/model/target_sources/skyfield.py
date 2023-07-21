@@ -9,16 +9,24 @@ import skyfield.data.hipparcos
 
 import astropy.coordinates
 
+import functools
+
+@functools.lru_cache(maxsize=10000)
+def get_observatory_barycentric(tracker_home_planet_sf, tracker_location_sf, time_sf):
+        observatory = tracker_home_planet_sf + tracker_location_sf        
+        observatory_barycentric = observatory.at(time_sf)
+        return observatory_barycentric
+
 
 class SkyfieldTarget(target.Target):
     def __init__(self, sf_target):
         super().__init__()
         self.sf_target = sf_target
 
+
     def altaz_at_time(self, tracker, time):
-        observatory = tracker.home_planet_sf + tracker.location_sf
         time_sf = tracker.ts.from_astropy(time)
-        observatory_barycentric = observatory.at(time_sf)
+        observatory_barycentric = get_observatory_barycentric(tracker.home_planet_sf, tracker.location_sf, time_sf)
 
         if isinstance(self.sf_target, skyfield.api.EarthSatellite):
             accurate_but_slow = False
@@ -26,7 +34,7 @@ class SkyfieldTarget(target.Target):
                 # they tell me this way is slower, but - doesn't seem too bad.
                 # seems to add ~5 ms
                 ssb_satellite = tracker.home_planet_sf + self.sf_target
-                target_apparent = observatory.at(time_sf).observe(ssb_satellite).apparent()
+                target_apparent = observatory_barycentric.observe(ssb_satellite).apparent()
             else:
                 target_apparent = (self.sf_target - tracker.location_sf).at(time_sf)
         else:
@@ -36,7 +44,7 @@ class SkyfieldTarget(target.Target):
         
         if tracker.primary_telescope_connection is not None:
             if tracker.primary_telescope_connection.want_atmospheric_refaction:
-                temperature_C = 20  #tracker.primary_telescope_connection.temperature_C
+                temperature_C = tracker.primary_telescope_connection.current_temperature_C
             else:
                 temperature_C = None
         else:

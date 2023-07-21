@@ -140,12 +140,14 @@ class InputFrame(tk.Frame):
                         input.emergency_stop_command = True
 
                     align_button = button_cross
-                    if align_button:
+                    if align_button and not input.align_button:
                         input.align_command = True
+                    input.align_button = align_button
 
                     reset_offset_button = button_circle
-                    if reset_offset_button:
+                    if reset_offset_button and not input.reset_offset_button:
                         input.reset_command = True
+                    input.reset_offset_button = reset_offset_button
 
                     self.tracker.notify_status_changed()
 

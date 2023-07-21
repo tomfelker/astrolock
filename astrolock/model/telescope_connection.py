@@ -100,13 +100,15 @@ class TelescopeConnection(object):
             
         self.last_loop_performance_time_ns = cur_time_ns        
         
-    def get_estimated_axis_angles_and_time(self):
-        ns = time.perf_counter_ns()
-        current_time = astropy.time.Time.now()
+    def get_estimated_axis_angles_and_time(self, estimate_time_ns):
+        current_ap_time = astropy.time.Time.now()
+        current_time_ns = time.perf_counter_ns()
+        estimate_age = (current_time_ns - estimate_time_ns) * 1e-9 * u.s
+        estimate_time_ap = current_ap_time - estimate_age
 
-        time_s_since_measurement = (ns - self.axis_measurement_times_ns) * 1e-9
+        time_s_since_measurement = (estimate_time_ns - self.axis_measurement_times_ns) * 1e-9
         estimated_current_axis_angles = self.axis_angles + self.desired_axis_rates * time_s_since_measurement
-        return estimated_current_axis_angles, current_time
+        return estimated_current_axis_angles, estimate_time_ap
     
     def request_gps(self):
         pass

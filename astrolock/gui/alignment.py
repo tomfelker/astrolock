@@ -5,6 +5,7 @@ import tkinter.ttk as ttk
 import tkinter.filedialog
 import json
 import os.path
+import time
 
 import astrolock.model.alignment
 from astrolock.model.alignment import AlignmentDatum
@@ -24,6 +25,9 @@ class AlignmentFrame(tk.Frame):
 
         # actual data
         self.tracker = tracker
+
+        self.tracker.add_alignment_observation_callback = self.add_alignment_observation_callback
+
         self.observation_items = []
         self.observations_dirty = True
 
@@ -122,10 +126,10 @@ class AlignmentFrame(tk.Frame):
             print("You need to connect to a telescope so we can tell where it's pointing.")
             return
         
-        estimated_current_axis_angles, current_time = self.tracker.primary_telescope_connection.get_estimated_axis_angles_and_time()
-        new_datum = AlignmentDatum(None, current_time, estimated_current_axis_angles)
-        print(repr(new_datum))
+        self.tracker.add_alignment_observation(time.perf_counter_ns())
 
+    def add_alignment_observation_callback(self, new_datum):
+        print(f'Adding: {new_datum}')
         self.observation_items.append(AlignmentDatumTreeviewItem(new_datum))
 
         self.autosave_observations()

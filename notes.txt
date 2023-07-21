@@ -1,0 +1,50 @@
+
+2023-07-15
+
+First test of it worked decently!
+
+There was an ISS pass around 9pm... Stars only became visible a few minutes before, so it was a rush.
+
+Alignment worked flawlessly.
+
+Tracking was very very bouncy, because:
+    - I had bumped up the proportional gain, shouldn't've done that without testing
+    - the loop rate was horrible, ~500ms
+        - global GUI updates didn't help
+        - joystick updates came way to fast, so CPU busy
+
+Saved the alignment data, "real_5x"
+
+If you solve it without any mount errors, you get:
+
+Step 5000 of 5000, loss 3.3238998753404303e-07, best angle loss was 0.0005980199784971774 with model 0
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: tensor([-97.4908, 323.9644]) deg
+        zenith_roll: -0.3200315535068512 deg
+        zenith_pitch: -0.683101236820221 deg
+        non_perpendicular_axes_error: 0.0 deg
+        collimation_error_in_azimuth: 0.0 deg
+
+
+And with mount errors:
+
+Step 5000 of 5000, loss 1.275354293284181e-07, best angle loss was 0.00043673202162608504 with model 0
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: tensor([-97.2970, 323.9524]) deg
+        zenith_roll: -0.3099735379219055 deg
+        zenith_pitch: -0.7118830680847168 deg
+        non_perpendicular_axes_error: 0.048635825514793396 deg
+        collimation_error_in_azimuth: 0.17704467475414276 deg
+
+When setting up the tripod, using a digital level and a cell phone compass to approximate north, I measured:
+around n:   e:
+.7          .4
+.01          .2 
+
+so we're in the ballpark there
+
+or maybe

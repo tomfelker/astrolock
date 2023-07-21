@@ -28,6 +28,11 @@ class TrackerInput(object):
         self.emergency_stop_command = False
         self.align_command = False
         self.reset_command = False
+        self.sensitivity_decrease_button = False
+        self.sensitivity_increase_button = False
+        self.align_button = False
+        self.reset_offset_button = False
+
 
     def consume_input_time_rates_and_braking(self):
         ns = time.perf_counter_ns()
@@ -81,6 +86,8 @@ class Tracker(object):
         self.status_observers = []
 
         self.idle_observers = []
+
+        self.add_alignment_observation_callback = None
 
         self.target_source_map = {
             'Skyfield': astrolock.model.target_sources.skyfield.SkyfieldTargetSource(self),
@@ -177,12 +184,23 @@ class Tracker(object):
             self.target_offset_lead_time = 0
             self.target_offset_image_space *= 0            
             return np.zeros(2)
+        
+        if self.tracker_input.align_command:
+            self.tracker_input.align_command = False
+            self.add_alignment_observation(self.tracker_input.last_input_time_ns)
 
         if self.target is not None:
             return self._compute_rates_with_target()
         else:
             return self._compute_rates_momentum()
 
+    def add_alignment_observation(self, observation_time_ns):
+        if self.primary_telescope_connection is not None:
+            estimated_current_axis_angles, current_time = self.primary_telescope_connection.get_estimated_axis_angles_and_time(observation_time_ns)
+            new_datum = astrolock.model.alignment.AlignmentDatum(None, current_time, estimated_current_axis_angles)             
+            if self.add_alignment_observation_callback is not None:
+                self.add_alignment_observation_callback(new_datum)
+        
     def _compute_rates_with_target(self):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
         dir_norm = np.linalg.norm(dir)
