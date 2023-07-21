@@ -214,7 +214,7 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
         response = self.serial_stream.read(response_len + 1)
         read_finish_time_ns = time.perf_counter_ns()
         if len(response) != response_len + 1 or response[response_len] != CelestronNexstarResponseCodes.HC_OK:  # '#'
-            raise ConnectionError("Error reading {msg_id.name} from {dest_id.name}.")
+            raise ConnectionError(f"Error reading {msg_id.name} from {dest_id.name}.")
         
         total_time = (read_finish_time_ns - write_start_time_ns) * 1e-9
         write_time = len(cmd) * 8 / self.get_baud_rate()
