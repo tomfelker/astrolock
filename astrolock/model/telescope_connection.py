@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import time
 from astrolock.model.util import *
 import astropy
@@ -112,6 +113,37 @@ class TelescopeConnection(object):
     
     def request_gps(self):
         pass
+
+    def get_time(self):
+        time_since_measurement = u.Quantity(time.perf_counter_ns() - self.gps_measurement_time_ns, unit=u.ns)
+        return self.gps_time + time_since_measurement
+
+    def _set_gps_time_with_inferred_seconds_fraction(self, new_gps_time, new_gps_measurement_time_ns):
+        """
+        The idea here is the telescope gives us a time with only one-second precision, but with higher accuracy.
+        We will guess the fractional part of the seconds, in such a way that the result of get_time() changes as
+        little as possible.  If we read the telescope's time many times, the offset should converge so that we are
+        never surprised by the time we read from the telescope, because our time rolls over to the next second
+        just as its time does.
+        """
+        if self.gps_measurement_time_ns is not None:
+            time_between_measurements = u.Quantity(new_gps_measurement_time_ns - self.gps_measurement_time_ns, unit=u.ns)
+            predicted_time_at_measurement = self.gps_time + time_between_measurements
+            new_to_predicted_s = (predicted_time_at_measurement - new_gps_time).to_value(u.s)
+            if new_to_predicted_s < 0.0:
+                print(f"Telescope clock was faster than expected, adjusting ours by {-new_to_predicted_s} s to match.  Keep syncing till this stops happening.")
+                new_to_predicted_s = 0.0
+            elif new_to_predicted_s > 1.0:
+                print(f"Telescope clock was slower than expected, adjusting ours by {1.0 - new_to_predicted_s} s to match.  Keep syncing till this stops happening.")
+                new_to_predicted_s = 1.0
+
+            new_gps_time = new_gps_time + new_to_predicted_s * u.s
+
+        self.gps_time = new_gps_time
+        self.gps_measurement_time_ns = new_gps_measurement_time_ns
+
+
+
 
 
 from astrolock.model.telescope_connections import *

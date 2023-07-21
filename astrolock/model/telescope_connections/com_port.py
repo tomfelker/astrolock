@@ -15,10 +15,21 @@ class ComPortConnection(threaded.ThreadedConnection):
         url_scheme = cls.get_url_scheme()
         urls = []
         comports = serial.tools.list_ports.comports()
+        filtered_comports = list(filter(cls.filter_comport, comports))
+        if len(comports) > 0 and len(filtered_comports) == 0:
+            print("Found COM ports but none seemed correct, trying anyway.  If this works, please share this log.")
+            for comport in comports:
+                print(f'{comport.device}: {comport.description}, {comport.hwid}, {comport.manufacturer}, {comport.product}')
+            filtered_comports = comports
         for comport in comports:
-            url = url_scheme + comport.device
-            urls.append(url)
+            if cls.filter_comport(comport):
+                url = url_scheme + comport.device
+                urls.append(url)
         return urls
+    
+    @classmethod
+    def filter_comport(self, comport):
+        return True
 
     def __init__(self, *args, **kwargs):
        super().__init__(*args, **kwargs)

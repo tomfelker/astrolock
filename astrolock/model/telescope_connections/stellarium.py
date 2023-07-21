@@ -49,20 +49,10 @@ class StellariumConnection(threaded.ThreadedConnection):
                 self.last_update_utc_str = status_json['time']['utc'].replace('.%1', '.0')
                 gps_time = astropy.time.Time(self.last_update_utc_str, format='isot', scale='utc')
 
-                # because of that, it jitters, so don't change if it's off by less than a second 
-                should_update_time = False
-                if self.gps_time is None:
-                    should_update_time = True
-                else:
-                    seconds_since_last_measurement = u.Quantity(measurement_time_ns - self.gps_measurement_time_ns, unit=u.ns)
-                    current_extrapolated_gps_time = self.gps_time + seconds_since_last_measurement
-                    time_error = gps_time - current_extrapolated_gps_time
-                    if np.abs(time_error.to_value(u.s)) > 1:
-                        should_update_time = True
-                
-                if should_update_time:
-                    self.gps_time = gps_time
-                    self.gps_measurement_time_ns = measurement_time_ns
+                self._set_gps_time_with_inferred_seconds_fraction(
+                    gps_time,
+                    measurement_time_ns
+                )
 
                 self.gps_location = astropy.coordinates.EarthLocation.from_geodetic(lat = status_json['location']['latitude'] * u.deg, lon = status_json['location']['longitude'] * u.deg, height = status_json['location']['altitude'] * u.m)
 
@@ -118,7 +108,8 @@ class StellariumConnection(threaded.ThreadedConnection):
                 # NOTE: Stellarium takes much longer to process each request (~8 ms -> ~40 ms) when moving, so it's not completely
                 # our fault that the loop rate tanks when we start tracking stuff.
 
-                self.record_loop_rate()
+                self.tracker.notify_status_changed()
+                self.record_loop_rate()                
 
             except ConnectionError:
                 self.want_to_stop = True

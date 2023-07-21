@@ -278,8 +278,7 @@ class Tracker(object):
 
     def get_time(self):
         if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time_ns is not None:
-            time_since_measurement = u.Quantity(time.perf_counter_ns() - self.primary_telescope_connection.gps_measurement_time_ns, unit=u.ns)
-            return self.primary_telescope_connection.gps_time + time_since_measurement
+            return self.primary_telescope_connection.get_time()
         return astropy.time.Time.now()
 
 
