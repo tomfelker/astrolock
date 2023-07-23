@@ -53,9 +53,12 @@ class InputFrame(tk.Frame):
         while True:
             event = pygame.event.wait()
 
-            if event.type in joystick_motion_events:                
+            if event.type in joystick_motion_events:
+                input = self.tracker.tracker_input
                 ns = time.perf_counter_ns()
-                ns_since_update = ns - last_joystick_update_ns                
+                # updates can come either from us, or from the tracker when it needs to generate input, in which case it will advance input.last_input_time_ns)
+                last_update_ns = max(last_joystick_update_ns, input.last_input_time_ns)
+                ns_since_update = ns - last_update_ns
                 if ns_since_update < self.min_joystick_update_period_ns:
                     skipped_updates += 1
                 else:
@@ -64,6 +67,9 @@ class InputFrame(tk.Frame):
                     dt = ns_since_update * 1e-9
 
                     skipped_updates = 0
+                    
+                    input.integrate(dt)
+                    input.last_input_time_ns = ns
 
                     left_stick = np.zeros(2)
                     right_stick = np.zeros(2)
@@ -99,10 +105,6 @@ class InputFrame(tk.Frame):
                     # We will integrate various things onto tracker_input, and the telescope
                     # loops will calculate averages when they need it.
 
-                    input = self.tracker.tracker_input
-                    input.last_input_time_ns = ns
-                    input.unconsumed_dt += dt
-
                     sensitivity_decrease_button = button_l1
                     if sensitivity_decrease_button and not input.sensitivity_decrease_button:
                         input.sensitivity -= 1
@@ -130,9 +132,6 @@ class InputFrame(tk.Frame):
                     if ads_button:
                         input.last_rates[0] *= -1
 
-                    input.integrated_rates += input.last_rates * dt
-                    input.integrated_braking += input.last_braking * dt
-
                     emergency_stop_button = button_options
                     if emergency_stop_button:
                         input.last_rates *= 0
@@ -148,6 +147,9 @@ class InputFrame(tk.Frame):
                     if reset_offset_button and not input.reset_offset_button:
                         input.reset_command = True
                     input.reset_offset_button = reset_offset_button
+
+                    input.search_forward_button = button_dpad_r
+                    input.search_backward_button = button_dpad_l
 
                     self.tracker.notify_status_changed()
 

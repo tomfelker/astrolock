@@ -32,7 +32,19 @@ class TrackerInput(object):
         self.sensitivity_increase_button = False
         self.align_button = False
         self.reset_offset_button = False
+        self.search_forward_button = False
+        self.search_backward_button = False
+        self.integrated_search_time = 0.0
 
+
+    def integrate(self, dt):
+        self.unconsumed_dt += dt
+        self.integrated_rates += self.last_rates * dt
+        self.integrated_braking += self.last_braking * dt        
+        if self.search_forward_button:
+            self.integrated_search_time += dt
+        if self.search_backward_button:
+            self.integrated_search_time -= dt
 
     def consume_input_time_rates_and_braking(self):
         ns = time.perf_counter_ns()
@@ -40,19 +52,19 @@ class TrackerInput(object):
         # integrate up however much time since the last input, since it hasn't been added yet:
         dt = (ns - self.last_input_time_ns) * 1e-9
         self.last_input_time_ns = ns
-        self.integrated_rates += self.last_rates * dt
-        self.integrated_braking += self.last_braking * dt
-        self.unconsumed_dt += dt
+        self.integrate(dt)
 
         # we will return the sum over all the time since the previous consume call.
         integrated_rates = self.integrated_rates
         integrated_braking = self.integrated_braking
+        integrated_search_time = self.integrated_search_time
 
         self.integrated_rates = np.zeros_like(self.integrated_rates)
         self.integrated_braking = np.zeros_like(self.integrated_braking)
-        self.unconsumed_dt = 0
+        self.integrated_search_time = 0.0
+        self.unconsumed_dt = 0.0        
 
-        return dt, integrated_rates, integrated_braking
+        return dt, integrated_rates, integrated_braking, integrated_search_time
 
 class Tracker(object):
     
@@ -82,6 +94,10 @@ class Tracker(object):
         self.user_time_offset = astropy.time.TimeDelta(0 * u.s)
         self.target_offset_image_space = np.zeros(2)
         self.target_offset_lead_time = 0.0
+        self.search_time = 0.0
+        # todo: maths
+        self.search_fov_rad = np.deg2rad(0.5)
+        self.search_fovs_per_sec = 2.0
 
         self.status_observers = []
 
@@ -152,6 +168,7 @@ class Tracker(object):
             f"\tMomentum:       [{math.degrees(self.momentum[0]): 9.3f}, {math.degrees(self.momentum[1]): 9.3f}] deg/s\n"
             f"\tSpatial offset: [{math.degrees(self.target_offset_image_space[0]): 9.3f}, {math.degrees(self.target_offset_image_space[1]): 9.3f}] deg\n"
             f"\tLead time:      {self.target_offset_lead_time: 6.3f} s\n"
+            f"\tSearch time:    {self.search_time: 6.3f} s\n"
             f"Telescope:\n"
             f"\t{telescope_string}\n"
         )
@@ -181,12 +198,15 @@ class Tracker(object):
         
         if self.tracker_input.reset_command:
             self.tracker_input.reset_command = False
-            self.target_offset_lead_time = 0
-            self.target_offset_image_space *= 0            
+            self.target_offset_lead_time = 0.0
+            self.target_offset_image_space *= 0
+            self.search_time = 0.0
             return np.zeros(2)
         
         if self.tracker_input.align_command:
             self.tracker_input.align_command = False
+            self.target_offset_image_space += self.compute_image_space_search_offset()
+            self.search_time = 0.0
             self.add_alignment_observation(self.tracker_input.last_input_time_ns)
 
         if self.target is not None:
@@ -200,7 +220,19 @@ class Tracker(object):
             new_datum = astrolock.model.alignment.AlignmentDatum(None, current_time, estimated_current_axis_angles)             
             if self.add_alignment_observation_callback is not None:
                 self.add_alignment_observation_callback(new_datum)
-        
+    
+    def compute_image_space_search_offset(self):
+        arc_length = self.search_fov_rad * self.search_fovs_per_sec * self.search_time
+        # b is how much we move out per radian of rotation        
+        b = self.search_fov_rad / (2.0 * math.pi)
+        theta = math.sqrt(2 * b * arc_length) / b
+        # r is the current radius, given theta
+        r = b * theta
+        return np.array([
+            r * math.cos(theta),
+            r * math.sin(theta)
+        ])
+
     def _compute_rates_with_target(self):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
         dir_norm = np.linalg.norm(dir)
@@ -212,11 +244,12 @@ class Tracker(object):
         image_up = np.cross(dir, image_left)
         image_up /= np.linalg.norm(image_up)
 
-        input_dt, integrated_rates, integrated_braking = self.tracker_input.consume_input_time_rates_and_braking()
+        input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
         # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
         # commands an angular velocity, which when integrated, becomes an angle (which we treat as radians)
 
         self.target_offset_image_space += integrated_rates
+        self.search_time = max(0.0, self.search_time + integrated_search_time)
 
         # todo: braking, aka recentering - (a bit complex with this time thing...)
 
@@ -230,7 +263,10 @@ class Tracker(object):
                 delta_lead_time = self.target_offset_lead_time - old_lead_time
                 self.target_offset_image_space -= delta_lead_time * image_space_rates
 
-        tweaked_dir = dir + (self.target_offset_image_space[0] * image_left + self.target_offset_image_space[1] * image_up) + rates * self.target_offset_lead_time
+        search_offset_image_space = self.compute_image_space_search_offset()
+        offset_image_space = self.target_offset_image_space + search_offset_image_space
+
+        tweaked_dir = dir + (offset_image_space[0] * image_left + offset_image_space[1] * image_up) + rates * self.target_offset_lead_time
 
         desired_dir = np.array(tweaked_dir, dtype=np.float32)
         desired_rates = np.array(rates, dtype=np.float32)
@@ -261,7 +297,7 @@ class Tracker(object):
         return rates
 
     def _compute_rates_momentum(self):
-            input_dt, integrated_rates, integrated_braking = self.tracker_input.consume_input_time_rates_and_braking()
+            input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
             # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
             # commands an angular acceleration, which becomes a delta angular velocity when integrated (and we'll think of it in rad/s).
             if input_dt > 0:
