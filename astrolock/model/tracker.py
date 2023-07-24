@@ -37,7 +37,12 @@ class TrackerInput(object):
         self.integrated_search_time = 0.0
 
 
-    def integrate(self, dt):
+    def integrate_up_to(self, time_ns):
+        if time_ns <= self.last_input_time_ns:
+            return
+        dt = (time_ns - self.last_input_time_ns) * 1e-9
+        self.last_input_time_ns = time_ns
+
         self.unconsumed_dt += dt
         self.integrated_rates += self.last_rates * dt
         self.integrated_braking += self.last_braking * dt        
@@ -46,15 +51,9 @@ class TrackerInput(object):
         if self.search_backward_button:
             self.integrated_search_time -= dt
 
-    def consume_input_time_rates_and_braking(self):
-        ns = time.perf_counter_ns()
-
-        # integrate up however much time since the last input, since it hasn't been added yet:
-        dt = (ns - self.last_input_time_ns) * 1e-9
-        self.last_input_time_ns = ns
-        self.integrate(dt)
-
+    def consume_input_time_rates_and_braking(self):        
         # we will return the sum over all the time since the previous consume call.
+        unconsumed_dt = self.unconsumed_dt
         integrated_rates = self.integrated_rates
         integrated_braking = self.integrated_braking
         integrated_search_time = self.integrated_search_time
@@ -64,7 +63,7 @@ class TrackerInput(object):
         self.integrated_search_time = 0.0
         self.unconsumed_dt = 0.0        
 
-        return dt, integrated_rates, integrated_braking, integrated_search_time
+        return unconsumed_dt, integrated_rates, integrated_braking, integrated_search_time
 
 class Tracker(object):
     
@@ -244,6 +243,8 @@ class Tracker(object):
         image_up = np.cross(dir, image_left)
         image_up /= np.linalg.norm(image_up)
 
+        
+        self.tracker_input.integrate_up_to(time.perf_counter_ns())
         input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
         # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
         # commands an angular velocity, which when integrated, becomes an angle (which we treat as radians)
@@ -296,21 +297,22 @@ class Tracker(object):
 
         return rates
 
-    def _compute_rates_momentum(self):
-            input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
-            # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
-            # commands an angular acceleration, which becomes a delta angular velocity when integrated (and we'll think of it in rad/s).
-            if input_dt > 0:
-                rc = 2.0
-                alpha = input_dt / (rc + input_dt)            
+    def _compute_rates_momentum(self):            
+        self.tracker_input.integrate_up_to(time.perf_counter_ns())
+        input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
+        # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
+        # commands an angular acceleration, which becomes a delta angular velocity when integrated (and we'll think of it in rad/s).
+        if input_dt > 0:
+            rc = 2.0
+            alpha = input_dt / (rc + input_dt)            
 
-                self.momentum = (self.momentum + integrated_rates / input_dt) * alpha + self.momentum * (1.0 - alpha)
-                momentum_mag = np.sqrt(np.dot(self.momentum, self.momentum))
-                if momentum_mag > 0:
-                    momentum_desired_mag = np.maximum(0, momentum_mag - integrated_braking / input_dt)
-                    self.momentum *= momentum_desired_mag / momentum_mag
+            self.momentum = (self.momentum + integrated_rates / input_dt) * alpha + self.momentum * (1.0 - alpha)
+            momentum_mag = np.sqrt(np.dot(self.momentum, self.momentum))
+            if momentum_mag > 0:
+                momentum_desired_mag = np.maximum(0, momentum_mag - integrated_braking / input_dt)
+                self.momentum *= momentum_desired_mag / momentum_mag
 
-            return self.momentum
+        return self.momentum
 
     def get_time(self):
         if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time_ns is not None:
