@@ -3,4 +3,4 @@
 .vs/**
 hip_main.dat
 data/skyfield_cache/**
-celestrack_2023-07-14_visual.txt
+data/alignments/autosave.json
