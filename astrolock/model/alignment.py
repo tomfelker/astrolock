@@ -35,6 +35,11 @@ class AlignmentDatum:
         # axis 1 is altitude, pitch, or declination (which needs no compensation)
         self.raw_axis_values = raw_axis_values
 
+        # these are filled in by the alignment process, for GUI feedback on how close each point was.
+        self.reconstructed_target = None
+        self.angular_error = None
+        self.loss = None        
+
     def __repr__(self):
         return f'astrolock.model.alignment.AlignmentDatum({repr(self.target)}, {repr(self.time)}, {repr(self.raw_axis_values)})'
     
@@ -238,7 +243,6 @@ def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_
     for step in range(num_steps):
         optimizer.zero_grad()
         time_modelbatch_to_observed_dir = model.dir_given_raw_axis_values(time_modelbatch_to_raw_axis_values)
-        time_modelbatch_to_dot = torch.einsum('...d,...d->...', time_modelbatch_to_observed_dir, time_modelbatch_to_predicted_dir)
         
         # dividing by num_observations rather than taking mean so that the learning rate works similarly regardless of batch size       
         loss = torch.sum((time_modelbatch_to_observed_dir - time_modelbatch_to_predicted_dir).square()) / num_observations
@@ -247,13 +251,15 @@ def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_
         optimizer.step()
 
         if step < 10 or step % int(num_steps / 10) == int(num_steps / 10) - 1 or step == num_steps - 1:
-            # Hmm - I'd think this angle based loss would be better, but it gives NaNs on Adam and RMSProp,
-            # and doesn't behave well with SGD.  So just use it for printing...
-            time_modelbatch_to_angle = torch.acos(torch.clamp(time_modelbatch_to_dot, -1.0, 1.0))
-            modelbatch_to_loss_sq = time_modelbatch_to_angle.square().mean(dim=0)
-            min_loss_sq, min_loss_sq_index = modelbatch_to_loss_sq.min(dim=-1)
+            with torch.no_grad():
+                # Hmm - I'd think this angle based loss would be better, but it gives NaNs on Adam and RMSProp,
+                # and doesn't behave well with SGD.  So just use it for printing...
+                time_modelbatch_to_dot = torch.einsum('...d,...d->...', time_modelbatch_to_observed_dir, time_modelbatch_to_predicted_dir)
+                time_modelbatch_to_angle = torch.acos(torch.clamp(time_modelbatch_to_dot, -1.0, 1.0))
+                modelbatch_to_loss_sq = time_modelbatch_to_angle.square().mean(dim=0)
+                min_loss_sq, min_loss_sq_index = modelbatch_to_loss_sq.min(dim=-1)
 
-            print(f'Step {step + 1} of {num_steps}, loss {loss}, best angle loss was {min_loss_sq.sqrt()} with model {min_loss_sq_index}')
+                print(f'Step {step + 1} of {num_steps}, loss {loss}, best angle loss was {min_loss_sq.sqrt()} with model {min_loss_sq_index}')
 
 def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
     num_observations = len(alignment_data)
@@ -303,7 +309,7 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
     for time_index, filtered_target_index in enumerate(time_to_target):
         target = filtered_targets[filtered_target_index]
         print(f"\tObservation {time_index} was {target.display_name}")
-        alignment_data[time_index].target = target
+        alignment_data[time_index].reconstructed_target = target
 
     with torch.no_grad():
         time_to_predicted_dir = target_time_to_predicted_dir[time_to_target, torch.arange(num_observations)]
@@ -317,11 +323,13 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
             target = filtered_targets[filtered_target_index]
             predicted_dir = time_to_predicted_dir[time_index]
             modeled_dir = alignment.dir_given_raw_axis_values(time_to_raw_axis_values[time_index])
+            loss = (predicted_dir - modeled_dir).square().sum().item()
             misalignment_rad = torch.asin(torch.clamp(torch.linalg.norm(torch.linalg.cross(predicted_dir, modeled_dir), dim=-1), -1.0, 1.0))
 
-            alignment_data[time_index].target = target
-            alignment_data[time_index].misalignment = misalignment_rad * u.rad
-            print(f"\tObservation {time_index}, {target.display_name}, was off by {alignment_data[time_index].misalignment.to(u.deg)}")
+            alignment_data[time_index].reconstructed_target = target
+            alignment_data[time_index].angular_error = misalignment_rad * u.rad
+            alignment_data[time_index].loss = loss
+            print(f"\tObservation {time_index}, {target.display_name}, was off by {alignment_data[time_index].angular_error.to(u.deg)}")
 
 
     print(f"Done!\nFinal alignment:\n{alignment}")

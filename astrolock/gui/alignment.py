@@ -105,9 +105,11 @@ class AlignmentFrame(tk.Frame):
         observations_treeview_frame.grid_columnconfigure(0, weight=1)        
 
         self.alignment_data_treeview = ttk.Treeview(observations_treeview_frame, show = 'headings')
-        self.alignment_data_treeview['columns'] = ('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
+        self.alignment_data_treeview['columns'] = ('target_name', 'target_url', 'angular_error', 'loss', 'time', 'raw_axis_0', 'raw_axis_1')
         self.alignment_data_treeview.heading('target_name', text = 'Target')
         self.alignment_data_treeview.heading('target_url', text = 'URL')
+        self.alignment_data_treeview.heading('angular_error', text = 'Error')
+        self.alignment_data_treeview.heading('loss', text = 'Loss')
         self.alignment_data_treeview.heading('time', text = 'Time')
         self.alignment_data_treeview.heading('raw_axis_0', text = 'Raw Az / RA')
         self.alignment_data_treeview.heading('raw_axis_1', text = 'Raw Alt / Dec')
@@ -208,15 +210,23 @@ class AlignmentFrame(tk.Frame):
         for item in self.observation_items:
             alignment_datum = item.datum
 
-            if alignment_datum.target is not None:
-                target_name = alignment_datum.target.display_name
-                target_url = alignment_datum.target.url
+            if alignment_datum.reconstructed_target is not None:
+                target_name = alignment_datum.reconstructed_target.display_name
+                target_url = alignment_datum.reconstructed_target.url
             else:
                 target_name = '<unknown>'
                 target_url = ''
 
-            #('target_name', 'target_url', 'time', 'raw_axis_0', 'raw_axis_1')
-            values = (target_name, target_url, str(alignment_datum.time), alignment_datum.raw_axis_values[0], alignment_datum.raw_axis_values[1])
+            #('target_name', 'target_url', 'angular_error', 'loss', 'time', 'raw_axis_0', 'raw_axis_1')
+            values = (
+                target_name,
+                target_url,
+                str(alignment_datum.angular_error.to(u.deg)) if alignment_datum.angular_error is not None else '',
+                str(alignment_datum.loss),
+                str(alignment_datum.time),
+                alignment_datum.raw_axis_values[0],
+                alignment_datum.raw_axis_values[1]
+            )
 
             tags = []
             if not item.enabled:
