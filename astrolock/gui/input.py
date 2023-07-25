@@ -62,6 +62,7 @@ class InputFrame(tk.Frame):
                     #print(f'Skipped {skipped_updates} this {ns_since_update * 1e-6} ms period.')
                     skipped_updates = 0                    
                     self.update_input_from_joystick(self.tracker.tracker_input, joysticks[0])
+                    self.tracker.tracker_input.integrate_up_to(ns)
                     self.tracker.notify_status_changed()
 
             elif event.type == pygame.JOYDEVICEADDED:
