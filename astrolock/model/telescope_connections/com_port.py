@@ -17,14 +17,13 @@ class ComPortConnection(threaded.ThreadedConnection):
         comports = serial.tools.list_ports.comports()
         filtered_comports = list(filter(cls.filter_comport, comports))
         if len(comports) > 0 and len(filtered_comports) == 0:
-            print("Found COM ports but none seemed correct, trying anyway.  If this works, please share this log.")
+            print("Found COM ports but none matched known devices.  Listing them all anyway.  If you connect and it works, please share this log:")
             for comport in comports:
-                print(f'{comport.device}: {comport.description}, {comport.hwid}, {comport.manufacturer}, {comport.product}')
+                print(f'\t{comport.device}: {comport.description}, {comport.hwid}, {comport.manufacturer}, {comport.product}')
             filtered_comports = comports
-        for comport in comports:
-            if cls.filter_comport(comport):
-                url = url_scheme + comport.device
-                urls.append(url)
+        for comport in filtered_comports:
+            url = url_scheme + comport.device
+            urls.append(url)
         return urls
     
     @classmethod
