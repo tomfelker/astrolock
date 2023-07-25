@@ -34,6 +34,11 @@ class StatusFrame(tk.Frame):
         self.label = tk.Label(self, text="Status", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 25)
         self.label.pack()
 
+        self.bind("<Destroy>", self._destroy)
+
+    def _destroy(self, *args, **kwargs):
+        self.tracker.status_observers.remove(self)
+
     def start(self):
         self.tracker.connect_to_telescope(self.connections_dropdown_choice.get()) 
 

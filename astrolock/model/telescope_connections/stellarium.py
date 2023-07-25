@@ -26,6 +26,11 @@ class StellariumConnection(threaded.ThreadedConnection):
         # and request refraction not be used when giving us coordinates
         self.want_atmospheric_refaction = False
 
+        #self.want_sleep_inhibited = False
+
+        # my telescope can slew nearly 4 deg/s, probably dependent on battery voltage - let's simulate this to see how it acts near the poles
+        self.fake_max_rates = np.deg2rad(np.array([3.5, 3.5]))
+
         self.fake_misalignment = astrolock.model.alignment.AlignmentModel()
         if False:
             self.fake_misalignment.randomize()
@@ -91,9 +96,11 @@ class StellariumConnection(threaded.ThreadedConnection):
                 #
                 # hence these hard-coded numbers:
 
+                limited_desired_axis_rates = np.clip(self.desired_axis_rates, -self.fake_max_rates, self.fake_max_rates)
+
                 depl = 0.0004 / 30 * 1000 * fov_deg
-                move_x = self.desired_axis_rates[0] / depl
-                move_y = self.desired_axis_rates[1] / depl
+                move_x = limited_desired_axis_rates[0] / depl
+                move_y = limited_desired_axis_rates[1] / depl
 
                 requests.post('http:' + self.url_path + '/api/main/move', data = {'x': move_x, 'y': move_y}) 
                 

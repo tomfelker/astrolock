@@ -24,7 +24,7 @@ class InputFrame(tk.Frame):
 
         self.sensitivity_step = 2
         self.sensitivity_max = 2
-        self.sensitivity_min = -8
+        self.sensitivity_min = -10
         self.fine_adjust_factor = .2
 
         self.pygame_thread = threading.Thread(target = self.pygame_thread_func)

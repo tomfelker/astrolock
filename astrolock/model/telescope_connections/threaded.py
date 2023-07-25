@@ -3,6 +3,7 @@ import serial.tools.list_ports
 import threading
 
 import astrolock.model.telescope_connection as telescope_connection
+import astrolock.model.util
 
 class ThreadedConnection(telescope_connection.TelescopeConnection):
 
@@ -14,6 +15,9 @@ class ThreadedConnection(telescope_connection.TelescopeConnection):
        super().__init__(*args, **kwargs)
 
     def start(self):
+        if self.want_sleep_inhibited:
+            astrolock.model.util.sleep_inhibit()
+
         self.want_to_stop = False
         self.loop_thread = threading.Thread(target = self.loop)
         self.loop_thread.start()
@@ -21,4 +25,7 @@ class ThreadedConnection(telescope_connection.TelescopeConnection):
 
 
     def stop(self):
+        if self.want_sleep_inhibited:
+            astrolock.model.util.sleep_uninhibit()
+
         self.want_to_stop = True

@@ -9,7 +9,7 @@ import astrolock.gui.targets
 import astrolock.model.tracker as tracker
 
 import gc
-
+import os
 
 class MainWindow(tk.Tk):
     def __init__(self, *args, **kwargs):        
@@ -53,4 +53,6 @@ def tracker_on_idle(self):
 def gui_loop():
     window = MainWindow()
     window.mainloop()
+    # it'd be nice to let the tracker threads update cleanly, but for some reason that's not always working:
+    os._exit(0)
 

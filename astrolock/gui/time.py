@@ -14,6 +14,11 @@ class TimeFrame(tk.Frame):
         self.label = tk.Label(self, text="Time")
         self.label.pack()
 
+        self.bind("<Destroy>", self._destroy)
+
+    def _destroy(self, *args, **kwargs):
+        self.tracker.status_observers.remove(self)
+
     def on_tracker_status_changed(self):
         self.after(0, self.update_label)
 

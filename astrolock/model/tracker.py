@@ -19,7 +19,7 @@ class TrackerInput(object):
     def __init__(self):
         self.last_input_time_ns = time.perf_counter_ns()
         self.unconsumed_dt = 0.0
-        self.sensitivity = -2
+        self.sensitivity = -3
         self.sensitivity_scale = 1.0
         self.last_rates = np.zeros(2, dtype=np.float32)
         self.integrated_rates = np.zeros(2, dtype=np.float32)
@@ -78,9 +78,6 @@ class Tracker(object):
         lat_deg, lon_deg, height_m = 37.51089, -122.2719388888889, 60
         self.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = lat_deg * u.deg, lon = lon_deg * u.deg, height = height_m * u.m)
         self.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = lat_deg, longitude_degrees = lon_deg, elevation_m = height_m)
-       
-        # add yourself here to be notified when any of the above change
-        self.settings_observers = []
 
         self.momentum = np.zeros(2)
         self.rates = np.zeros(2)
@@ -115,10 +112,6 @@ class Tracker(object):
             pid_controller = PIDController()
             self.pid_controllers.append(pid_controller)
     
-    def notify_settings_changed(self):
-        for observer in self.settings_observers:
-            observer.tracker_settings_changed()
-
     def notify_status_changed(self):
         for observer in self.status_observers:
             observer.on_tracker_status_changed()
@@ -151,7 +144,7 @@ class Tracker(object):
     def disconnect_from_telescope(self):
         if self.primary_telescope_connection:
             self.primary_telescope_connection.stop()
-            self.primary_telescope_connection = None
+            self.primary_telescope_connection = None            
 
     def get_status(self):
         if self.primary_telescope_connection:

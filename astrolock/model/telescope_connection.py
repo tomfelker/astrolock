@@ -34,6 +34,8 @@ class TelescopeConnection(object):
         # it'd be neat if the hand controller could tell us...
         self.current_temperature_C = 10.0
 
+        self.want_sleep_inhibited = True
+
         # state for record_loop_rate()
         self.last_loop_performance_time_ns = None
         self.loop_time_s = 0
