@@ -8,6 +8,10 @@ import skyfield.data
 import skyfield.data.hipparcos
 
 import astropy.coordinates
+import astropy.units as u
+from astropy.units import cds
+from astropy.units import imperial
+import math
 
 import functools
 
@@ -50,7 +54,38 @@ class SkyfieldTarget(target.Target):
         else:
             temperature_C = 'standard'
 
-        alt, az, distance = target_apparent.altaz(temperature_C=temperature_C)
+        pressure_mbar = 'standard'
+
+        if False:
+            # hax
+            #KSQL 220715Z AUTO 00000KT 10SM CLR 16/12 A2990 RMK AO2
+            temperature = 16.0 * u.deg_C
+            pressure = (29.90 * u.cds.mmHg * u.imperial.inch / u.mm)
+        
+            # see https://en.wikipedia.org/wiki/Barometric_formula , only using the first row of the table
+            #P_b = 101325.00 * u.cds.Pa
+            #T_b = 288.15 * u.K
+            P_b = pressure
+            T_b = temperature.to(u.K, equivalencies=u.equivalencies.temperature())
+            L_b = 0.0065 * u.K / u.m
+            h = tracker.location_sf.elevation.m * u.m
+            h_b = 0
+            R_star = 8.3144598 * u.J / (u.mol * u.K)
+            g_0 = 9.80665 * u.m / (u.s * u.s)
+            M = 0.0289644 * u.kg / u.mol
+
+            adjusted_pressure = P_b * math.pow(
+                (T_b - (h - h_b) * L_b) / T_b,
+                g_0 * M / (R_star * L_b)
+            )
+
+            temperature_C = temperature.to_value(u.deg_C, equivalencies=u.equivalencies.temperature())
+            pressure_mbar = adjusted_pressure.to_value(u.mbar)
+
+
+            pressure_mbar *= .1
+
+        alt, az, distance = target_apparent.altaz(temperature_C=temperature_C, pressure_mbar=pressure_mbar)
 
         altaz = astropy.coordinates.AltAz(alt=alt.to(astropy.units.rad), az=az.to(astropy.units.rad), distance=distance.to(astropy.units.au))
         return altaz
