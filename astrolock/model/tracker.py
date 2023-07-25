@@ -197,7 +197,7 @@ class Tracker(object):
         
         if self.tracker_input.align_command:
             self.tracker_input.align_command = False
-            self.target_offset_image_space += self.compute_image_space_search_offset()
+            self.tracker_input.integrated_rates += self.compute_image_space_search_offset()
             self.search_time = 0.0
             self.add_alignment_observation(self.tracker_input.last_input_time_ns)
 
@@ -228,34 +228,57 @@ class Tracker(object):
     def _compute_rates_with_target(self):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
         dir_norm = np.linalg.norm(dir)
-        dir /= dir_norm
-        rates /= dir_norm
+        if dir_norm > 0.0:
+            dir /= dir_norm
+            rates /= dir_norm
 
+        
         image_left = np.cross(np.array([0.0, 0.0, 1.0]), dir)
-        image_left /= np.linalg.norm(image_left)
+        image_left_norm = np.linalg.norm(image_left)
+        if image_left_norm > 0.0:
+            image_left /= image_left_norm
+        else:
+            # if we're looking straight up or down, arbitrary dir
+            image_left = np.array([0.0, -1.0, 0.0])
         image_up = np.cross(dir, image_left)
-        image_up /= np.linalg.norm(image_up)
+        image_up_norm = np.linalg.norm(image_up)
+        if image_up_norm > 0.0:
+            image_up /= image_up_norm
+        else:
+            # if dir was zero, another arbitrary dir
+            image_up = np.array([-1.0, 0.0, 0.0])
 
         
         self.tracker_input.integrate_up_to(time.perf_counter_ns())
-        input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
-        # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
+        input_dt, input_offset, input_braking, input_search_time = self.tracker_input.consume_input_time_rates_and_braking()
+        # input_offset are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
         # commands an angular velocity, which when integrated, becomes an angle (which we treat as radians)
-
-        self.target_offset_image_space += integrated_rates
-        self.search_time = max(0.0, self.search_time + integrated_search_time)
+       
+        self.search_time = max(0.0, self.search_time + input_search_time)
 
         # todo: braking, aka recentering - (a bit complex with this time thing...)
 
         if self.target_offset_using_time:
             image_space_rates = np.array([np.dot(rates, image_left), np.dot(rates, image_up)])
-            image_space_rates_norm = np.linalg.norm(rates)
+            image_space_rates_norm = np.linalg.norm(image_space_rates)
             if image_space_rates_norm > 0.0:
-                desired_delta_lead_time = np.dot(self.target_offset_image_space, image_space_rates) / np.square(image_space_rates_norm)
+                image_space_dir = image_space_rates / image_space_rates_norm
+                desired_delta_lead_time = np.dot(input_offset, image_space_dir) / image_space_rates_norm
                 old_lead_time = self.target_offset_lead_time
                 self.target_offset_lead_time = np.clip(old_lead_time + desired_delta_lead_time, -self.target_offset_max_lead_time, self.target_offset_max_lead_time)
                 delta_lead_time = self.target_offset_lead_time - old_lead_time
-                self.target_offset_image_space -= delta_lead_time * image_space_rates
+                input_offset -= delta_lead_time * image_space_rates
+
+                # rotate this to be always perpendicular to motion
+                old_target_offset_len = np.linalg.norm(self.target_offset_image_space)
+                self.target_offset_image_space -= image_space_dir * np.dot(self.target_offset_image_space, image_space_dir)
+                target_offset_len = np.linalg.norm(self.target_offset_image_space)
+                if target_offset_len > 0.0:
+                    self.target_offset_image_space *= old_target_offset_len / target_offset_len
+        
+        self.target_offset_image_space += input_offset
+
+        
 
         search_offset_image_space = self.compute_image_space_search_offset()
         offset_image_space = self.target_offset_image_space + search_offset_image_space
