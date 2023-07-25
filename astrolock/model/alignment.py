@@ -10,6 +10,7 @@ class AlignmentSettings:
     def __init__(self):
         self.optimize_zenith_errors = True
         self.optimize_mount_errors = True
+        self.optimize_refraction = True
 
         self.min_alt = -20.0 * u.deg
         self.max_alt = 85.0 * u.deg        
@@ -17,7 +18,7 @@ class AlignmentSettings:
         self.refine_during_search_steps = 10
         self.full_random = False
         self.full_random_batch_size=100000
-        self.final_refine_steps = 5000
+        self.final_refine_steps = 10000
         
         # TODO:
         #self.is_equatorial = False
@@ -100,6 +101,7 @@ Here's a dead simple, low memory, embarassingly parallel method:
         but conversely, more targets means we probably need lower acceptable error
 """
 
+
 def xyz_to_azalt(xyz):
     x = xyz[..., 0]
     y = xyz[..., 1]
@@ -108,6 +110,19 @@ def xyz_to_azalt(xyz):
     alt = torch.atan2(z, xy_len)
     az = torch.atan2(y, x)
     return torch.stack([az, alt], dim = -1)
+
+
+def azalt_to_xyz(azalt):
+    az = azalt[..., 0]
+    alt = azalt[..., 1]
+    cos_alt = torch.cos(alt)
+    xyz = torch.stack([
+        torch.cos(az) * cos_alt,
+        torch.sin(az) * cos_alt,
+        torch.sin(alt)
+    ], dim=-1)
+    return xyz
+
 
 def wrap_to_pi(theta):
     ret = torch.atan2(torch.sin(theta), torch.cos(theta))
@@ -236,6 +251,8 @@ def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_
     if settings.optimize_mount_errors and num_observations >= 4:
         params_to_optimize.append(model.collimation_error_in_azimuth)
         params_to_optimize.append(model.non_perpendicular_axes_error)
+    if settings.optimize_refraction and num_observations >= 5:
+        params_to_optimize.append(model.extra_refraction_coefficient)
 
     
     optimizer=torch.optim.Adagrad(params_to_optimize)
@@ -380,14 +397,30 @@ class AlignmentModel(torch.nn.Module):
         # axis 0 is azimuth, yaw, or right ascension (the one which needs acceleration when the other is near 90 degrees)
         # axis 1 is altitude, pitch, or declination (which needs no compensation)
         self.encoder_offsets = torch.nn.Parameter(torch.zeros(batch_shape + (2,)))
+        self.encoder_offsets.units = u.rad
 
         self.zenith_roll = torch.nn.Parameter(torch.zeros(batch_shape))
+        self.zenith_roll.units = u.rad
+        
         self.zenith_pitch = torch.nn.Parameter(torch.zeros(batch_shape))
+        self.zenith_pitch.units = u.rad
+
         # see https://www.wildcard-innovations.com.au/geometric_mount_errors.html
         # for helpful pictures and names.
         self.non_perpendicular_axes_error = torch.nn.Parameter(torch.zeros(batch_shape))
+        self.non_perpendicular_axes_error.units = u.rad
+
         self.collimation_error_in_azimuth = torch.nn.Parameter(torch.zeros(batch_shape))
+        self.collimation_error_in_azimuth.units = u.rad
         
+        # Whoever gave us the targets should already have included atmospheric refraction using some standard params
+        # (TODO: make sure the target sources all match in terms of those params)
+        # but the actual refraction may differ.  The simple model Skyfield uses is written in terms of a value depending
+        # only on the altitude, times a value depending on the temperature and pressure - this parameter adds onto the latter
+        # TODO: when printing, differentiate that this one is not an angle
+        self.extra_refraction_coefficient = torch.nn.Parameter(torch.zeros(batch_shape))
+        self.extra_refraction_coefficient.units = u.dimensionless_unscaled
+
     @classmethod
     def choose_submodel(cls, batched_model, index):
         single_model = cls()
@@ -418,7 +451,11 @@ class AlignmentModel(torch.nn.Module):
     def __repr__(self):
         ret = "AlignmentModel\n"
         for name, param in self.named_parameters():
-            ret += f"\t{name}: {torch.rad2deg(param.data)} deg\n"
+            display_units = param.units
+            if param.units.physical_type == u.get_physical_type("angle"):
+                display_units = u.deg
+
+            ret += f"\t{name}: {u.Quantity(param.data, unit=param.units).to(display_units)}\n"
         return ret
 
     def matrix_given_raw_axis_values(self, raw_axis_values):
@@ -452,6 +489,7 @@ class AlignmentModel(torch.nn.Module):
         F = rotation_matrix_around_z(self.collimation_error_in_azimuth)        
         
         dir = A @ B @ C @ D @ E @ F
+
         dir = dir / torch.linalg.norm(dir, dim=-1, keepdims=True)
         return dir
             
@@ -459,6 +497,7 @@ class AlignmentModel(torch.nn.Module):
         p = torch.tensor([[1.0], [0.0], [0.0]])
         d = self.matrix_given_raw_axis_values(raw_axis_values) @ p
         d = d.squeeze(-1)
+        d = self.refract_apparent_to_true(d)
         return d
 
     def raw_axis_values_given_numpy_dir(self, dir):
@@ -505,6 +544,11 @@ class AlignmentModel(torch.nn.Module):
 
         Then it's a simple matter of inverting some things and subtracting to figure the yaw.
         """
+
+        # todo: support inverting this.  However, this backward pass is only used by random_align, which
+        # does not need to search for this value.  We can optimize it with gradient descent later, during
+        # refine_alignment().
+        assert(self.extra_refraction_coefficient.count_nonzero() == 0)
 
         dir = dir / torch.norm(dir, dim=-1, keepdim=True)
 
@@ -558,6 +602,24 @@ class AlignmentModel(torch.nn.Module):
 
         return raw_axis_values
     
+    def refract_apparent_to_true(self, apparent_dir):
+        apparent_azalt = xyz_to_azalt(apparent_dir)
+        apparent_alt = apparent_azalt[..., 1]
+        apparent_alt_deg = torch.rad2deg(apparent_alt)
+
+        # These fudge factors are from Skyfield, which apparently come from 
+        #   Bennett, G.G. (1982). "The Calculation of Astronomical Refraction in Marine Navigation". Journal of Navigation. 35 (2): 255–259. Bibcode:1982JNav...35..255B. doi:10.1017/S0373463300022037. S2CID 140675736.
+        # plus some overly-rounded arcsecond-to-degree conversion (which should bake itself into extra_refraction_coefficient)
+        r_deg = 0.016667 / torch.tan(torch.deg2rad((apparent_alt_deg + 7.31 / (apparent_alt_deg + 4.4))))
+        d_deg = r_deg * self.extra_refraction_coefficient
+
+        d_deg = torch.where(torch.logical_and(torch.gt(apparent_alt_deg, -1.0), torch.le(apparent_alt_deg, 89.9)), d_deg, 0.0)
+
+        true_alt_deg = apparent_alt_deg - d_deg
+        true_alt = torch.deg2rad(true_alt_deg)
+        true_azalt = torch.stack([apparent_azalt[..., 0], true_alt], dim=-1)
+        true_dir = azalt_to_xyz(true_azalt)
+        return true_dir
     
     def raw_axis_values_given_dir_numeric(self, dir):
         raw_axis_values = torch.zeros(2, requires_grad=True)
