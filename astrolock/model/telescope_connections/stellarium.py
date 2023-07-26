@@ -26,10 +26,10 @@ class StellariumConnection(threaded.ThreadedConnection):
         # and request refraction not be used when giving us coordinates
         self.want_atmospheric_refaction = False
 
-        #self.want_sleep_inhibited = False
+        self.want_sleep_inhibited = False
 
         # my telescope can slew nearly 4 deg/s, probably dependent on battery voltage - let's simulate this to see how it acts near the poles
-        self.fake_max_rates = np.deg2rad(np.array([3.5, 3.5]))
+        self.fake_max_rates = np.deg2rad(np.array([3.0, 3.0]))
 
         self.fake_misalignment = astrolock.model.alignment.AlignmentModel()
         if False:

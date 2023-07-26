@@ -48,4 +48,6 @@ class KmlTargetSource(target_source.TargetSource):
             new_target.url = f'astrolock://kml/{display_name}'
             
             self.target_map[new_target.url] = new_target
+        
+        self.notify_targets_updated()
 
