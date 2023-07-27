@@ -17,6 +17,8 @@ class MainWindow(tk.Tk):
            
         self.tracker = tracker.Tracker()
 
+        self.title('AstroLock')
+
         notebook = ttk.Notebook(self)
 
         self.status_tab = astrolock.gui.status.StatusFrame(notebook, tracker = self.tracker)
@@ -36,7 +38,7 @@ class MainWindow(tk.Tk):
 
         notebook.add(self.status_tab, text = "Status")
         notebook.add(self.input_tab, text = "Input")
-        notebook.add(self.time_tab, text = "Time")
+        notebook.add(self.time_tab, text = "Time and Location")
         notebook.add(self.alignment_tab, text = "Alignment")
         notebook.add(self.targets_tab, text = "Targets")
 

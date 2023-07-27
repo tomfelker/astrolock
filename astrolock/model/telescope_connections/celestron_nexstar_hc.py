@@ -90,9 +90,6 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # request it once on first connect, and then again if we are kicked.
-        self.gps_requested = True
-
         self.last_message_thinking_mid_time_ns = None
         self.last_message_thinking_end_time_ns = None
 
@@ -157,9 +154,6 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
         angle_radians = bytes_to_radians(angle_bytes)
         return angle_radians
     
-    def request_gps(self):
-        self.gps_requested = True
-
     def _read_gps(self):
         self.gps_requested = False
         self.gps_location = None
@@ -193,7 +187,7 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
                 second += .2
                 self.gps_time = astropy.time.Time({'year': year, 'month': month, 'day': day, 'hour': hour, 'minute': minute, 'second': second}, scale='utc')
                 self.gps_measurement_time_ns = self.last_message_thinking_end_time_ns
-            
+            self.tracker.update_location()            
 
 
     def _send_and_receive_via_hc(self, dest_id, msg_id, data = (), response_len = 0, expect_delay = False):

@@ -1,6 +1,6 @@
 # AstroLock
 
-This software will help you aim a telescope, particularly at moving targets like satellites, rockets, or planes, using a gamepad for precise input.  Alignment is computed within Astrolock, so you only need to point at some unidentified objects.  For satellites, Astrolock can download information about their orbits and track them automatically, with you fine-tuning using the joystick.  Or for cases when you can't predict the path in advance, it can track with momentum, so you only need joystick input when the target changes direction.
+This software will help you aim a telescope, particularly at moving targets like satellites, rockets, or planes, using a gamepad for precise input.  Alignment is computed within Astrolock, so you only need to point at some unidentified objects.  For satellites, AstroLock can download information about their orbits and track them automatically, with you fine-tuning using the joystick.  Or for cases when you can't predict the path in advance, it can track with momentum, so you only need joystick input when the target changes direction.
 
 AstroLock is still rough around the edges, and you may need to dive into the Python code to get it working for you.
 
@@ -8,7 +8,7 @@ AstroLock is still rough around the edges, and you may need to dive into the Pyt
 
 All you need is a telescope, a GoTo mount, a computer, and a gamepad.
 
-Astrolock can currently talk to Celestron Nexstar hand controllers that control AltAz mounted telescopes.  (I'm using it with a CPC1100.)  It should be fairly easy to support EQ mounts, or to expand to other mount protocols - all that's needed is the ability to set the rates that each axis should move at, and to read the current position.
+Astrolock can currently talk to Celestron NexStar hand controllers that control AltAz mounted telescopes.  (I'm using it with a CPC1100.)  It should be fairly easy to support EQ mounts, or to expand to other mount protocols - all that's needed is the ability to set the rates that each axis should move at, and to read the current position.
 
 For testing, you can also connect to Stellarium with the Remote Control plugin.
 
@@ -35,9 +35,11 @@ There's no fancy packaging yet, so this is somewhat technical, yet straightforwa
 
 1. Run AstroLock.
 
-1. Under the Status tab, select `celestron_nexstar_hc:COM`n (it should auto-detect) from the dropdown and hit Start.  You should see a bunch of info below, including ideally the GPS info from the telescope.  (If your scope doesn't have GPS, you'll need to edit the default location in tracker.py - did I mention the GUI is incomplete?)
+1. Under the Status tab, select `celestron_nexstar_hc:COM`n (it should auto-detect) from the dropdown and hit Start.  You should see a bunch of info below.
 
-1. Play around with the gamepad - see below for details.  Right trigger or Start will stop any motion.
+1. Play around with using the gamepad to move the telescope - see below for details.  Right trigger or Start will stop any motion.
+
+1. Go to the Time and Location tab, and check that everything looks right.  If your telescope has GPS, it should have grabbed that (or you can kick it to try again), otherwise you can enter your own coordinates or your address.
 
 1. Go to the Alignment tab to start aligning the telescope.  Use your gamepad to point at a target, and once it's centered in your eyepiece or camera, press "Add Current Observation" (or press Cross on the gamepad).  Repeat this three or more times.  Now press "Perform Alignment" - after a few seconds, it should give you a solution, including identifying the targets you used and telling you how level your tripod was.
 
@@ -81,30 +83,30 @@ Everything I know about this protocol I learned in [this PDF](http://www.paquett
 
 #### Stellarium
 
-To connect, all you need to do is run Stellarium and enable the Remote Control plugin, with the default port of 8090 and no authentication.  Then you can select `stellarium:\\localhost:8090` form the Status tab, and hit Start to connect.  (TODO: support choosing other servers to connect to, and support authentication.)
+To connect, all you need to do is run Stellarium and enable the Remote Control plugin, with the default port of 8090 and no authentication.  Then you can select `stellarium:\\localhost:8090` from the Status tab, and hit Start to connect.  (TODO: supporting choosing other servers to connect to, and supporting authentication.)
 
 When connected, we read the time from Stellarium, so you can use its time controls to simulate an upcoming satellite pass you'd like to observe later for real.  We don't currently (TODO) read the location, so you'll need to manually ensure the locations match.
 
 The protocol is really simple, it just sends us JSON data over HTTP.  There are some rough edges:
-* It lets us slew the view at arbitrary rates, although unfortunately these rates are specified realtive to the current FOV - so if you zoom in or out in Stellarium, it will throw off the tracking briefly, until we re-read the FOV.
-* It won't actually tell us the apparent view angle, only the true angle, so there's some complicated problems related to refraction - upshot being, if we aim slightly lower than we ought to, that's why.
-* There's a bug in the GMT time output, so reading Stellarium's time is only accurate to a second.  We do some fancy clamping to hopefully get subsecond accuracy and avoid big time jumps.
+* It lets us slew the view at arbitrary rates, but these rates are specified relative to the current FOV - so if you zoom in or out in Stellarium, it will throw off the tracking briefly.
+* It can't tell us the apparent view angle, only the true angle, so there's some complicated problems related to refraction - upshot being, if we aim slightly lower than we ought to, that's why.
+* There's a bug in the GMT time output, so reading Stellarium's time is only accurate to a second.  We do some fancy clamping to hopefully get sub-second accuracy and avoid big time jumps.
 * Especially when moving, it's fairly slow, so the loop rate ends up being ~200 ms, a bit slower than the actual telescope.  This is a decent test, though.
 
 ### Alignment
 
 The basic idea here is to enter a bunch of "observations", which are basically you saying "at this known time, the motor encoders had these known values, and the telescope was pointed at some unknown target.  AstroLock then has to do a bunch of math to determine a bunch of parameters which will later allow it to point in specified directions.
 
-The motor encoders do not know their absolute position, only their position relative to where they were when the telescope was turned on.  So the most important parameters are the two encoder_offsets, which let us convert between the raw positions that the motor encoders can give, and the actual altitude and azimuth.  In theory, if the tripod were perfectly level and the observations perfectly accurate, those offsets could be determined with just one known star (which we don't implement) or two unknown stars (which we'll try to do, but I've never seen it work).
+The motor encoders do not know their absolute position, only their position relative to where they were when the telescope was turned on.  So the most important parameters are the two encoder_offsets, which let us convert between the raw positions that the motor encoders can give, and the actual altitude and azimuth.  In theory, if the tripod were perfectly level and the observations were perfectly accurate, those offsets could be determined with just one known target (which AstroLock doesn't yet support) or two unknown targets (which AstroLock will happily attempt, but I've never seen it work).
 
-In practice, you should give AstroLock three unknown stars, and it can solve for not only the encoder offsets, but also the tilt of the tripod.  And you can give as many stars as you want, which lets AstroLock compute all of the following with increasing accuracy:
+In practice, you should give AstroLock at least three unknown targets (which can be stars, planets, or satellites), and it can solve for not only the encoder offsets, but also the tilt of the tripod.  And you can give as many targets as you want, which lets AstroLock compute all of the following with increasing accuracy:
 
 * The encoder offsets, necessary for even the roughest alignment
 * The tilt of the tripod (zenith_pitch and zenith_roll).  As long as the tripod is level-ish to within a few degrees, with three or more points, we can recover this accurately.  (If it's not at all level, or the fork mount is on a wedge, see the code for a way to align without assuming anything at all.)
 * Two errors related to mount inaccuracies.  One for if one fork arm is longer than the other, and one for if the telescope is aimed left or right of perpendicular to the altitude axis ("collimation" or "cone" error).
 * A fudge factor for the refraction calculation.
 
-Once you have your alignmnent points, just click "Perform Alignment" and wait a few seconds (perhaps staring at the console output).  It should identify all your observations, and show you the values of all those aprameters.  You can also see, for each observation, how far off it was from where AstroLock thinks it ought to be.  If one was particularly bad, you could disable it and try again.
+Once you have your alignment points, just click "Perform Alignment" and wait a few seconds (perhaps staring at the console output).  It should identify all your observations, and show you the values of all those parameters.  You can also see, for each observation, how far off it was from where AstroLock thinks it ought to be.  If one was particularly bad, you could disable it and try again.
 
 You can also load and save alignments.  If you close AstroLock or lose your connection to the hand controller, you should be able to reconnect and load your alignment (or the autosaved one), "Perform Alignment" again, and be good to go - although if the hand controller lost power, it probably forgets the stepper offsets.  Saved alignments can also be useful for testing, i.e., seeing if adding some new factor to the model helps it achieve lower error.
 
@@ -134,13 +136,13 @@ This lets you use Google Earth (or anything that can output KML) to specify targ
 
 * For easy slewing, it'd be nice to have a non-momentum mode.  Mostly just needs a GUI to support switching modes.
 
-* Once aligned, it'd be nice to have a mode that tracks the sideral rate.  This would help with choosing more alignment targets, or targeting stars you don't know the name of.
+* Once aligned, it'd be nice to have a mode that tracks the sidereal rate.  This would help with choosing more alignment targets, or targeting stars you don't know the name of.
 
 ### GUI
 Obviously the GUI needs a lot of work.  Small improvements:
 * Want a way to show or select tracking modes - important if we add more.
 * Better target selection - showing what stars are up, what satellites will be visible, etc.
-* Needs improvements for connecting to a telscope, including settings for the connection
+* Needs improvements for connecting to a telescope, including settings for the connection
 * Various settings: scope setup, fov, default location, etc.  Ideally with a non-boilerplatey way to add more settings.
 * The Time tab needs love.
 * Dark mode - I did battle with Tkinter for this but did not emerge victorious.  I can't find any reasonable way to learn the names of the myriad theme settings.
@@ -160,3 +162,10 @@ The code is already multithreaded, but Python's GIL being what it is, that doesn
 * Performing an alignment hangs the GUI for a long time - ideally it would either tick the GUI's main loop while running, or run in its own thread - supposedly PyTorch releases the GIL for long-running ops, so that may help.
 * The telescope tracking loop runs in its own thread, but still, slow UI operations can hog the GIL and cause delays in the loop.
 * Some of the target calculations are just very slow, on the order of milliseconds, so it might be useful to perform them on a different thread, somewhat ahead of the current time, and let the tracking loop just interpolate between those points.
+
+## License
+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.

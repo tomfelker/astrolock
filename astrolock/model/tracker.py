@@ -71,13 +71,10 @@ class Tracker(object):
         
         self.primary_telescope_connection = None
         self.primary_telescope_alignment = astrolock.model.alignment.AlignmentModel()
-        # todo: this should come from
-        # the hand controller of the telescope if available, or
-        # from the PC if there were any decent APIs for it, or
-        # the GUI, but for now, hardcode:
-        lat_deg, lon_deg, height_m = 37.51089, -122.2719388888889, 60
-        self.location_ap = astropy.coordinates.EarthLocation.from_geodetic(lat = lat_deg * u.deg, lon = lon_deg * u.deg, height = height_m * u.m)
-        self.location_sf = skyfield.api.wgs84.latlon(latitude_degrees = lat_deg, longitude_degrees = lon_deg, elevation_m = height_m)
+
+        self.use_telescope_location = True
+        # TODO: load and save this from settings - for now, it's hardcoded to my backyard.
+        self.user_location = astropy.coordinates.EarthLocation.from_geodetic(lat=37.51089 * u.deg, lon=-122.2719388888889 * u.deg, height=60 * u.m)
 
         self.momentum = np.zeros(2)
         self.rates = np.zeros(2)
@@ -87,7 +84,7 @@ class Tracker(object):
         self.use_telescope_time = True
         self.target_offset_using_time = True
         self.target_offset_max_lead_time = 30.0
-        self.user_time_offset = astropy.time.TimeDelta(0 * u.s)
+        self.user_time_offset = 0 * u.s
         self.target_offset_image_space = np.zeros(2)
         self.target_offset_lead_time = 0.0
         self.search_time = 0.0
@@ -111,6 +108,8 @@ class Tracker(object):
         for i in range(2):
             pid_controller = PIDController()
             self.pid_controllers.append(pid_controller)
+
+        self.update_location()
     
     def notify_status_changed(self):
         for observer in self.status_observers:
@@ -154,9 +153,9 @@ class Tracker(object):
         return (
             f"Target:\n"
             f"{self.target.get_status() if self.target is not None else 'No target'}\n"
-            f"Input:\n"
+            f"Tracking:\n"
             f"\tSensitivity:    {self.tracker_input.sensitivity}\n"
-            f"\tLast Rates:     [{math.degrees(self.tracker_input.last_rates[0]): 9.3f}, {math.degrees(self.tracker_input.last_rates[1]): 9.3f}] {'deg/s^2' if self.target is None else 'deg/s'}\n"
+            f"\tInput:          [{math.degrees(self.tracker_input.last_rates[0]): 9.3f}, {math.degrees(self.tracker_input.last_rates[1]): 9.3f}] {'deg/s^2' if self.target is None else 'deg/s'}\n"
             f"\tMomentum:       [{math.degrees(self.momentum[0]): 9.3f}, {math.degrees(self.momentum[1]): 9.3f}] deg/s\n"
             f"\tSpatial offset: [{math.degrees(self.target_offset_image_space[0]): 9.3f}, {math.degrees(self.target_offset_image_space[1]): 9.3f}] deg\n"
             f"\tLead time:      {self.target_offset_lead_time: 6.3f} s\n"
@@ -332,7 +331,21 @@ class Tracker(object):
 
     def get_time(self):
         if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time_ns is not None:
-            return self.primary_telescope_connection.get_time()
-        return astropy.time.Time.now()
+            base_time = self.primary_telescope_connection.get_time()
+        else:
+            base_time = astropy.time.Time.now()
+        return base_time + self.user_time_offset
+
+    def update_location(self):
+        if self.use_telescope_location and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_location is not None:
+            self.location_ap = self.primary_telescope_connection.gps_location
+        else:
+            self.location_ap = self.user_location
+
+        # note weird order
+        lon, lat, height = self.location_ap.to_geodetic()
+        self.location_sf = skyfield.api.wgs84.latlon(latitude_degrees=lat.to_value(u.deg), longitude_degrees=lon.to_value(u.deg), elevation_m=height.to_value(u.m))
+
+        self.notify_status_changed()
 
 

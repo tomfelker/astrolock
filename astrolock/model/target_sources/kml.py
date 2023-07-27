@@ -23,7 +23,7 @@ class KmlTargetSource(target_source.TargetSource):
 
     def start(self):
         # todo: maybe follow the file to check for modifications?
-        self.load_targets()
+        self.load_targets() 
 
     def load_targets(self):
         if os.path.splitext(self.filename)[1] == '.kmz':

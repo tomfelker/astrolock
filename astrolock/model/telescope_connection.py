@@ -1,9 +1,12 @@
-import numpy as np
 import math
 import time
-from astrolock.model.util import *
+
 import astropy
 import astropy.units as u
+import numpy as np
+
+from astrolock.model.util import *
+
 
 class TelescopeConnection(object):
     def __init__(self, url, tracker):
@@ -22,6 +25,7 @@ class TelescopeConnection(object):
         self.gps_time = None
         self.gps_location = None        
         self.gps_measurement_time_ns = None
+        self.gps_requested = True
 
         # rad/s
         self.desired_axis_rates = np.zeros(2)
@@ -81,17 +85,12 @@ class TelescopeConnection(object):
         raise NotImplementedError
     
     def get_status(self):
-
-
-
         return (
             f"\t                     Azimuth   Altitude\n"
             f"\tLast Angles:      [{math.degrees(self.axis_angles[0]): 9.3f}, {math.degrees(self.axis_angles[1]): 9.3f}] deg\n"
             f"\tDesired rates:    [{math.degrees(self.desired_axis_rates[0]): 9.3f}, {math.degrees(self.desired_axis_rates[1]): 9.3f}] deg/s\n"
             f"\tEstimated rates:  [{math.degrees(self.estimated_axis_rates[0]): 9.3f}, {math.degrees(self.estimated_axis_rates[1]): 9.3f}] deg/s\n"
             f"\tSmooth loop time: {self.loop_time_smoothed_s * 1e3: 6.3f} ms\n"
-            f"\tGPS Location:     {location_to_string(self.gps_location)}\n"
-            f"\tGPS Time:         {self.gps_time}\n"
         )
 
     def record_loop_rate(self):
@@ -114,7 +113,7 @@ class TelescopeConnection(object):
         return estimated_current_axis_angles, estimate_time_ap
     
     def request_gps(self):
-        pass
+        self.gps_requested = True
 
     def get_time(self):
         time_since_measurement = u.Quantity(time.perf_counter_ns() - self.gps_measurement_time_ns, unit=u.ns)
@@ -132,10 +131,11 @@ class TelescopeConnection(object):
             time_between_measurements = u.Quantity(new_gps_measurement_time_ns - self.gps_measurement_time_ns, unit=u.ns)
             predicted_time_at_measurement = self.gps_time + time_between_measurements
             new_to_predicted_s = (predicted_time_at_measurement - new_gps_time).to_value(u.s)
-            if new_to_predicted_s < 0.0:
+            fudge_time = .1
+            if new_to_predicted_s < -fudge_time:
                 print(f"Telescope clock was faster than expected, adjusting ours by {-new_to_predicted_s} s to match.  Keep syncing till this stops happening.")
                 new_to_predicted_s = 0.0
-            elif new_to_predicted_s > 1.0:
+            elif new_to_predicted_s > 1.0 + fudge_time:
                 print(f"Telescope clock was slower than expected, adjusting ours by {1.0 - new_to_predicted_s} s to match.  Keep syncing till this stops happening.")
                 new_to_predicted_s = 1.0
 

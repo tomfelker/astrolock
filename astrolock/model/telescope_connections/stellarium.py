@@ -59,7 +59,10 @@ class StellariumConnection(threaded.ThreadedConnection):
                     measurement_time_ns
                 )
 
-                self.gps_location = astropy.coordinates.EarthLocation.from_geodetic(lat = status_json['location']['latitude'] * u.deg, lon = status_json['location']['longitude'] * u.deg, height = status_json['location']['altitude'] * u.m)
+                if self.gps_requested:
+                    self.gps_requested = False
+                    self.gps_location = astropy.coordinates.EarthLocation.from_geodetic(lat = status_json['location']['latitude'] * u.deg, lon = status_json['location']['longitude'] * u.deg, height = status_json['location']['altitude'] * u.m)
+                    self.tracker.update_location()
 
                 view = requests.get('http:' + self.url_path + '/api/main/view?ref=on')
                 measurement_time_ns = time.perf_counter_ns()
