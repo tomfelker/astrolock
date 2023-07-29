@@ -1,16 +1,28 @@
 {
     "cSpell.words": [
+        "afov",
+        "altaz",
+        "arctan",
         "AstroLock",
+        "astropy",
+        "azalt",
+        "azalts",
         "Celestrak",
         "Celestron",
         "ephemerides",
         "gamepad",
         "gamepads",
+        "lerp",
         "nexstar",
+        "Omni",
+        "pygame",
+        "radec",
         "Skyfield",
+        "starlib",
         "Stellarium",
         "telrad",
         "Tkinter",
-        "toolkits"
+        "toolkits",
+        "uninhibit"
     ]
 }

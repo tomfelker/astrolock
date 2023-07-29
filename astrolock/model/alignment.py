@@ -18,7 +18,7 @@ class AlignmentSettings:
         self.refine_during_search_steps = 10
         self.full_random = False
         self.full_random_batch_size=100000
-        self.final_refine_steps = 10000
+        self.final_refine_steps = 5000
         
         # TODO:
         #self.is_equatorial = False
@@ -348,6 +348,7 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
             alignment_data[time_index].loss = loss
             print(f"\tObservation {time_index}, {target.display_name}, was off by {alignment_data[time_index].angular_error.to(u.deg)}")
 
+    alignment.valid = True
 
     print(f"Done!\nFinal alignment:\n{alignment}")
 
@@ -387,6 +388,9 @@ def rotation_matrix_around_z(theta):
 class AlignmentModel(torch.nn.Module):
     def __init__(self, batch_shape = ()):
         super().__init__()
+
+        # True if we think we've actually aligned something, in which case different tracking modes become possible.
+        self.valid = False
 
         self.batch_shape = batch_shape
 
@@ -492,7 +496,12 @@ class AlignmentModel(torch.nn.Module):
 
         dir = dir / torch.linalg.norm(dir, dim=-1, keepdims=True)
         return dir
-            
+
+    def dir_given_numpy_raw_axis_values(self, raw_axis_values):
+        with torch.no_grad():
+            return self.dir_given_raw_axis_values(torch.tensor(raw_axis_values)).numpy()
+        return 
+
     def dir_given_raw_axis_values(self, raw_axis_values):
         p = torch.tensor([[1.0], [0.0], [0.0]])
         d = self.matrix_given_raw_axis_values(raw_axis_values) @ p

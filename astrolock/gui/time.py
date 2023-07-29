@@ -18,7 +18,9 @@ def location_string(location):
     if location is None:
         return 'None'
     lon, lat, height = location.to_geodetic()
-    return f'lat: {lat.to_value(u.deg): 3.8f} deg, lon: {lon.to_value(u.deg): 3.8f} deg, h: {height.to_value(u.m): 3.3f} m'
+    return (
+        f'{lat.to_value(u.deg): 13.8f} {lon.to_value(u.deg): 13.8f} {height.to_value(u.m): 9.3f}'
+    )
 
 def parse_angle(angle_str):
     # astropy seems pretty nice here
@@ -53,29 +55,32 @@ class TimeFrame(tk.Frame):
         self.offset_frame.grid(sticky='w')
         self.offset_frame.columnconfigure(9, weight=1)
 
-        tk.Label(self.offset_frame, text='Offset by:').grid(row=0, column=0)
+        self.offset_enabled_var = tk.BooleanVar()
+        self.offset_enabled_var.trace_add('write', self.time_offset_changed)
+        self.offset_enabled_checkbutton = tk.Checkbutton(self.offset_frame, text="Offset by:", variable=self.offset_enabled_var)
+        self.offset_enabled_checkbutton.grid(row=0, column=0)
 
         self.offset_d_var = tk.IntVar()
-        self.offset_d = tk.Spinbox(self.offset_frame, from_=-3650, to=3650, textvariable=self.offset_d_var, width=5, command=self.time_offset_changed)
+        self.offset_d = tk.Spinbox(self.offset_frame, from_=-3650, to=3650, textvariable=self.offset_d_var, width=5, command=self.time_offset_changed, state = 'disabled')
         self.offset_d.grid(row=0, column=1)
         tk.Label(self.offset_frame, text='days').grid(row=0, column=2)
 
         self.offset_h_var = tk.IntVar()
-        self.offset_h = tk.Spinbox(self.offset_frame, from_=-24, to=24, textvariable=self.offset_h_var, width=5, command=self.time_offset_changed)
+        self.offset_h = tk.Spinbox(self.offset_frame, from_=-24, to=24, textvariable=self.offset_h_var, width=5, command=self.time_offset_changed, state = 'disabled')
         self.offset_h.grid(row=0, column=3)
         tk.Label(self.offset_frame, text='hours').grid(row=0, column=4)
 
         self.offset_m_var = tk.IntVar()
-        self.offset_m = tk.Spinbox(self.offset_frame, from_=-60, to=60, textvariable=self.offset_m_var, width=5, command=self.time_offset_changed)
+        self.offset_m = tk.Spinbox(self.offset_frame, from_=-60, to=60, textvariable=self.offset_m_var, width=5, command=self.time_offset_changed, state = 'disabled')
         self.offset_m.grid(row=0, column=5)
         tk.Label(self.offset_frame, text='minutes').grid(row=0, column=6)
 
         self.offset_s_var = tk.IntVar()
-        self.offset_s = tk.Spinbox(self.offset_frame, from_=-60, to=60, textvariable=self.offset_s_var, width=5, command=self.time_offset_changed)
+        self.offset_s = tk.Spinbox(self.offset_frame, from_=-60, to=60, textvariable=self.offset_s_var, width=5, command=self.time_offset_changed, state = 'disabled')
         self.offset_s.grid(row=0, column=7)
         tk.Label(self.offset_frame, text='seconds').grid(row=0, column=8)
 
-        self.current_time_label = tk.Label(time_frame, text="<current time>", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 5)
+        self.current_time_label = tk.Label(time_frame, text="<current time>", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 6)
         self.current_time_label.grid()
 
         location_frame = ttk.LabelFrame(self, text="Location")
@@ -111,7 +116,7 @@ class TimeFrame(tk.Frame):
         self.user_address_button = tk.Button(address_entry_frame, text='Lookup and Save to User Location', command=self.on_user_address_button_click)
         self.user_address_button.grid(row=0, column=2)
 
-        self.current_location_label = tk.Label(location_frame, text="<current location>", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 5)
+        self.current_location_label = tk.Label(location_frame, text="<current location>", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 7)
         self.current_location_label.grid()
 
         self.bind("<Destroy>", self._destroy)
@@ -127,12 +132,26 @@ class TimeFrame(tk.Frame):
         self.tracker.update_location()
 
     def time_offset_changed(self, *args, **kwarg):
-        offset_s = (
-            self.offset_d_var.get() * 24 * 60 * 60 +
-            self.offset_h_var.get() * 60 * 60 +
-            self.offset_m_var.get() * 60 +
-            self.offset_s_var.get()
-        )
+        if self.offset_enabled_var.get():
+            self.offset_d.config(state='normal')
+            self.offset_h.config(state='normal')
+            self.offset_m.config(state='normal')
+            self.offset_s.config(state='normal')
+
+            offset_s = (
+                self.offset_d_var.get() * 24 * 60 * 60 +
+                self.offset_h_var.get() * 60 * 60 +
+                self.offset_m_var.get() * 60 +
+                self.offset_s_var.get()
+            )
+        else:
+            self.offset_d.config(state='disabled')
+            self.offset_h.config(state='disabled')
+            self.offset_m.config(state='disabled')
+            self.offset_s.config(state='disabled')
+
+            offset_s = 0.0
+
         self.tracker.user_time_offset = offset_s * u.s
 
     def on_user_location_button_click(self, *args, **kwargs):
@@ -195,6 +214,7 @@ class TimeFrame(tk.Frame):
 
         text = (
             '\n'
+            f'                     lat (deg)     lon (deg)        h (m)\n'
             f'  Current location: {location_string(self.tracker.location_ap)}\n'
             '\n'
             f'     User location: {location_string(self.tracker.user_location)}\n'

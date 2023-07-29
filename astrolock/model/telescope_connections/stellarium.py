@@ -31,10 +31,15 @@ class StellariumConnection(threaded.ThreadedConnection):
         # my telescope can slew nearly 4 deg/s, probably dependent on battery voltage - let's simulate this to see how it acts near the poles
         self.fake_max_rates = np.deg2rad(np.array([3.0, 3.0]))
 
+        
+
         self.fake_misalignment = astrolock.model.alignment.AlignmentModel()
-        if False:
+        do_fake_misalignment = False
+        if do_fake_misalignment:
             self.fake_misalignment.randomize()
             print(f"Stellarium connection using random fake misalignment: {self.fake_misalignment}")
+        else:
+            self.tracker.primary_telescope_alignment.valid = True
 
 
     def loop(self):

@@ -9,29 +9,39 @@ class StatusFrame(tk.Frame):
 
         self.tracker = tracker
         self.tracker.status_observers.append(self)
-        
+
+        connection_frame = tk.LabelFrame(self, text="Connection")
+        connection_frame.grid(row=0, column=0, sticky='nsew')
+        self.columnconfigure(0, weight=1, uniform='fred') # you've gotta be kidding me
+        self.columnconfigure(1, weight=1, uniform='fred')
+
         connections = self.tracker.get_recommended_connection_urls()
         if len(connections) == 0:
             connections = ["No connections found"]
         print('\n'.join(connections))
         self.connections_dropdown_choice = tk.StringVar(self, connections[0])
-        self.connections_dropdown = tk.OptionMenu(self, self.connections_dropdown_choice, *connections)
+        self.connections_dropdown = tk.OptionMenu(connection_frame, self.connections_dropdown_choice, *connections)
         #ttk.OptionMenu(self, self.connections_dropdown_choice, *connections)
-        self.connections_dropdown.pack()
+        self.connections_dropdown.grid()
 
-        start_button = tk.Button(self, text = "Start!", command = self.start)
-        start_button.pack()
+        start_button = tk.Button(connection_frame, text = "Start!", command = self.start)
+        start_button.grid()
         
-        stop_button = tk.Button(self, text = "Stop!", command = self.stop)
-        stop_button.pack()
+        stop_button = tk.Button(connection_frame, text = "Stop!", command = self.stop)
+        stop_button.grid()
 
-        self.alt_rate_slider = tk.Scale(self, from_ = 5, to = -5, resolution = .1, length = 130, sliderlength = 30, orient = tk.VERTICAL, command = self.sliders_changed)    
-        self.alt_rate_slider.pack() 
-        self.az_rate_slider = tk.Scale(self, from_ = -5, to = 5, resolution = .1, length = 130, sliderlength = 30, orient = tk.HORIZONTAL, command = self.sliders_changed)
-        self.az_rate_slider.pack()
+        mode_frame = tk.LabelFrame(self, text="Mode")
+        mode_frame.grid(row=0, column=1, sticky='nsew')
+
+        self.mode_var = tk.StringVar(self)
+        self.mode_dropdown = tk.OptionMenu(mode_frame, self.mode_var, *self.tracker.modes, command=self.on_mode_selected)
+        self.mode_dropdown.grid()
+
+        status_frame = tk.LabelFrame(self, text="Status")
+        status_frame.grid(row=1, columnspan=2, sticky='wse')
 
         #hmm, how to do sizes in cm?
-        self.label = tk.Label(self, text="Status", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 25)
+        self.label = tk.Label(status_frame, text="Status", font=("TkFixedFont"), anchor = 'nw', justify = 'left', width = 120, height = 25)
         self.label.pack()
 
         self.bind("<Destroy>", self._destroy)
@@ -45,20 +55,13 @@ class StatusFrame(tk.Frame):
     def stop(self):
         self.tracker.disconnect_from_telescope()
 
+    def on_mode_selected(self, *args, **kwargs):
+        self.tracker.current_mode = self.mode_var.get()
+
     def on_tracker_status_changed(self):
         self.after(1, self.update_status_label)
 
     def update_status_label(self):
         if self.tracker is not None:
             self.label.config(text = self.tracker.get_status())
-
-            self.az_rate_slider.set(self.tracker.tracker_input.last_rates[0])
-            self.alt_rate_slider.set(self.tracker.tracker_input.last_rates[1])
-            
-    def sliders_changed(self, val):
-        if False:
-            tracker_input = tracker.TrackerInput()
-            tracker_input.rate[0] = self.az_rate_slider.get()
-            tracker_input.rate[1] = self.alt_rate_slider.get()
-            self.tracker.set_input(tracker_input)
-    
+            self.mode_var.set(self.tracker.current_mode)

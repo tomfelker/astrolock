@@ -11,15 +11,14 @@ import astropy.time
 import skyfield
 import time
 import numpy as np
-import threading
-import copy
 import math
+import datetime
 
 class TrackerInput(object):
     def __init__(self):
         self.last_input_time_ns = time.perf_counter_ns()
         self.unconsumed_dt = 0.0
-        self.sensitivity = -3
+        self.sensitivity = -5
         self.sensitivity_scale = 1.0
         self.last_rates = np.zeros(2, dtype=np.float32)
         self.integrated_rates = np.zeros(2, dtype=np.float32)
@@ -65,6 +64,35 @@ class TrackerInput(object):
 
         return unconsumed_dt, integrated_rates, integrated_braking, integrated_search_time
 
+class TelescopeInfo:
+    def __init__(self):
+        self.native_focal_length = 2800 * u.mm
+        self.aperture_diameter = 279.4 * u.mm
+        self.barlow_zoom = 1.0
+
+        # Celestron 93325 40mm Omni
+        self.eyepiece_focal_length = 40.0 * u.mm
+        self.eyepiece_afov = 43.0 * u.deg
+
+        # ASI678MC
+        self.sensor_size = np.array([7.7, 4.3]) * u.mm
+        self.sensor_pixel_size = 2 * u.um
+
+        self.update_derived()
+        
+    def update_derived(self):
+        self.focal_length = self.native_focal_length * self.barlow_zoom
+        self.f_number = self.focal_length / self.aperture_diameter
+        self.eyepiece_zoom = self.focal_length / self.eyepiece_focal_length
+        self.eyepiece_fov = np.arctan(np.tan(self.eyepiece_afov / 2.0) / self.eyepiece_zoom) * 2.0
+        self.camera_fov = np.arctan(self.sensor_size / (2.0 * self.focal_length)) * 2.0
+        # Note: this doesn't match Stellarium because they make this small angle approximation:
+        #self.eyepiece_fov = ((self.eyepiece_afov / 2.0) / self.eyepiece_zoom) * 2.0
+        #self.camera_fov = (self.sensor_size / (2.0 * self.focal_length)) * 2.0 * u.rad
+        
+
+
+
 class Tracker(object):
     
     def __init__(self):
@@ -76,21 +104,46 @@ class Tracker(object):
         # TODO: load and save this from settings - for now, it's hardcoded to my backyard.
         self.user_location = astropy.coordinates.EarthLocation.from_geodetic(lat=37.51089 * u.deg, lon=-122.2719388888889 * u.deg, height=60 * u.m)
 
-        self.momentum = np.zeros(2)
-        self.rates = np.zeros(2)
+        self.telescope_info = TelescopeInfo()
+
+        
         self.tracker_input = TrackerInput()
         self.smooth_input_mag = 0.0
         self.target = None
         self.use_telescope_time = True
-        self.target_offset_using_time = True
-        self.target_offset_max_lead_time = 30.0
+        self.target_offset_max_lead_time = 300.0
         self.user_time_offset = 0 * u.s
+
+
+        self.modes =  [
+            # these ones require a target
+            'target_with_time_offset',
+            'target_with_spatial_offset',
+
+            # these ones require alignment
+            'sidereal',
+            # TODO: 'angular_momentum'
+
+            # these ones work at any time:
+            'axis_momentum',
+            'slew'
+        ]
+
+
+        # tracking state
+        # TODO: these should perhaps be separate classes
+        self.default_mode = 'axis_momentum'
+        self.current_mode = self.default_mode
+        self.momentum = np.zeros(2)
         self.target_offset_image_space = np.zeros(2)
         self.target_offset_lead_time = 0.0
         self.search_time = 0.0
+
+
         # todo: maths
-        self.search_fov_rad = np.deg2rad(0.5)
-        self.search_fovs_per_sec = 2.0
+        self.search_overlap_factor = 1.5
+        self.search_fov_rad = self.telescope_info.camera_fov.to_value(u.rad) / self.search_overlap_factor
+        self.search_fovs_per_sec = 1.0
 
         self.status_observers = []
 
@@ -164,6 +217,16 @@ class Tracker(object):
             f"\t{telescope_string}\n"
         )
 
+
+    def is_mode_allowed(self, mode):
+        if mode == 'target_with_time_offset' or mode == 'target_with_spatial_offset':
+            return self.target is not None and self.primary_telescope_alignment.valid
+        if mode == 'sidereal' or mode == 'angular_momentum':
+            return self.primary_telescope_alignment.valid
+        if mode == 'axis_momentum' or mode == 'slew':
+            return True
+        return False
+
     def set_target(self, new_target):
         if new_target is None:
             self.target = None
@@ -171,6 +234,8 @@ class Tracker(object):
             self.target = self.target.updated_with(new_target)
         else:
             self.target = new_target
+            self.current_mode = 'target_with_time_offset'
+
 
     def update_targets(self, target_map): 
         if self.target is not None and self.target.url in target_map:
@@ -200,10 +265,19 @@ class Tracker(object):
             self.search_time = 0.0
             self.add_alignment_observation(self.tracker_input.last_input_time_ns)
 
-        if self.target is not None:
+        if not self.is_mode_allowed(self.current_mode):
+            self.current_mode = self.default_mode
+            assert(self.is_mode_allowed(self.current_mode))
+
+        if self.current_mode == 'target_with_time_offset' or self.current_mode == 'target_with_spatial_offset':
             return self._compute_rates_with_target()
-        else:
-            return self._compute_rates_momentum()
+        elif self.current_mode == 'sidereal':
+            return self._compute_rates_sidereal()
+        elif self.current_mode == 'axis_momentum':
+            return self._compute_rates_axis_momentum()
+        elif self.current_mode == 'slew':
+            return self._compute_rates_slew()
+            
 
     def add_alignment_observation(self, observation_time_ns):
         if self.primary_telescope_connection is not None:
@@ -213,16 +287,16 @@ class Tracker(object):
                 self.add_alignment_observation_callback(new_datum)
     
     def compute_image_space_search_offset(self):
-        arc_length = self.search_fov_rad * self.search_fovs_per_sec * self.search_time
+        arc_length = self.search_fovs_per_sec * self.search_time
         # b is how much we move out per radian of rotation        
-        b = self.search_fov_rad / (2.0 * math.pi)
+        b = 1.0 / (2.0 * math.pi)
         theta = math.sqrt(2 * b * arc_length) / b
         # r is the current radius, given theta
         r = b * theta
         return np.array([
             r * math.cos(theta),
             r * math.sin(theta)
-        ])
+        ]) * self.search_fov_rad
 
     def _compute_rates_with_target(self):
         dir, rates = self.target.dir_and_rates_at_time(tracker = self, time = self.get_time())
@@ -232,21 +306,7 @@ class Tracker(object):
             rates /= dir_norm
 
         
-        image_left = np.cross(np.array([0.0, 0.0, 1.0]), dir)
-        image_left_norm = np.linalg.norm(image_left)
-        if image_left_norm > 0.0:
-            image_left /= image_left_norm
-        else:
-            # if we're looking straight up or down, arbitrary dir
-            image_left = np.array([0.0, -1.0, 0.0])
-        image_up = np.cross(dir, image_left)
-        image_up_norm = np.linalg.norm(image_up)
-        if image_up_norm > 0.0:
-            image_up /= image_up_norm
-        else:
-            # if dir was zero, another arbitrary dir
-            image_up = np.array([-1.0, 0.0, 0.0])
-
+        image_left, image_up = dir_to_image_left_and_up(dir)
         
         self.tracker_input.integrate_up_to(time.perf_counter_ns())
         input_dt, input_offset, input_braking, input_search_time = self.tracker_input.consume_input_time_rates_and_braking()
@@ -257,7 +317,7 @@ class Tracker(object):
 
         # todo: braking, aka recentering - (a bit complex with this time thing...)
 
-        if self.target_offset_using_time:
+        if self.current_mode == 'target_with_time_offset':
             image_space_rates = np.array([np.dot(rates, image_left), np.dot(rates, image_up)])
             image_space_rates_norm = np.linalg.norm(image_space_rates)
             if image_space_rates_norm > 0.0:
@@ -312,7 +372,51 @@ class Tracker(object):
 
         return rates
 
-    def _compute_rates_momentum(self):            
+    def _compute_rates_sidereal(self):
+        dir = self.primary_telescope_alignment.dir_given_numpy_raw_axis_values(self.primary_telescope_connection.axis_angles)
+
+        azalt = np_xyz_to_azalt(dir)       
+        alt_deg = np.rad2deg(azalt[1])
+        az_deg = np.rad2deg(azalt[0])
+
+        dt_s = 1.0
+        time_sf = self.ts.from_astropy(self.get_time())
+        time_plus_dt_sf = time_sf + datetime.timedelta(seconds=dt_s)
+
+        apparent = self.location_sf.at(time_sf).from_altaz(alt_degrees=alt_deg, az_degrees=az_deg)
+        radec = apparent.radec() # hmm, of time?
+        star = skyfield.starlib.Star(ra = radec[0], dec=radec[1])
+
+        observatory_barycentric = self.home_planet_sf + self.location_sf        
+        altaz0 = observatory_barycentric.at(time_sf).observe(star).apparent().altaz()
+        altaz1 = observatory_barycentric.at(time_plus_dt_sf).observe(star).apparent().altaz()
+
+        azalts = np.array([
+            [altaz0[1].radians, altaz0[0].radians],
+            [altaz1[1].radians, altaz1[0].radians]
+        ], dtype=np.float32)
+
+        dirs = np_azalt_to_xyz(azalts)
+        image_left, image_up = dir_to_image_left_and_up(dirs[0])
+
+        self.tracker_input.integrate_up_to(time.perf_counter_ns())
+        input_dt, input_offset, input_braking, input_search_time = self.tracker_input.consume_input_time_rates_and_braking()
+
+        # TODO: integrate spiral search in somehow... a bit strange since really we're just commanding rates, not positions
+        # also we need to do that in dir-space, not azalt space
+        #self.search_time = max(0.0, self.search_time + input_search_time)
+        #search_offset_image_space = self.compute_image_space_search_offset()
+
+        dirs[1] += (input_offset[0] * image_left + input_offset[1] * image_up) * dt_s
+
+        raws = self.primary_telescope_alignment.raw_axis_values_given_numpy_dir(dirs)
+        rates = wrap_angle_plus_minus_pi_radians(raws[1] - raws[0]) / dt_s
+       
+        rates += input_offset
+
+        return rates
+
+    def _compute_rates_axis_momentum(self):            
         self.tracker_input.integrate_up_to(time.perf_counter_ns())
         input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
         # Integrated_rates are units of joystick deflection * time.  Here we're thinking that your instantaneous deflection
@@ -328,6 +432,11 @@ class Tracker(object):
                 self.momentum *= momentum_desired_mag / momentum_mag
 
         return self.momentum
+    
+    def _compute_rates_slew(self):
+        self.tracker_input.integrate_up_to(time.perf_counter_ns())
+        input_dt, integrated_rates, integrated_braking, integrated_search_time = self.tracker_input.consume_input_time_rates_and_braking()
+        return integrated_rates
 
     def get_time(self):
         if self.use_telescope_time and self.primary_telescope_connection is not None and self.primary_telescope_connection.gps_time is not None and self.primary_telescope_connection.gps_measurement_time_ns is not None:
