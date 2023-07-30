@@ -103,7 +103,7 @@ class TelescopeConnection(object):
         self.last_loop_performance_time_ns = cur_time_ns        
         
     def get_estimated_axis_angles_and_time(self, estimate_time_ns):
-        current_ap_time = astropy.time.Time.now()
+        current_ap_time = self.tracker.get_time()
         current_time_ns = time.perf_counter_ns()
         estimate_age = (current_time_ns - estimate_time_ns) * 1e-9 * u.s
         estimate_time_ap = current_ap_time - estimate_age
