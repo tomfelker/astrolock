@@ -51,21 +51,33 @@ The left joystick is for coarse adjustment, and right joystick is for fine adjus
 
 The axes are mapped similar to non-inverted video game controls, so that if you have a telrad sight or a camera, the crosshair will move in the direction that you push the stick.  When you pull the left trigger (L2), it will switch to what you would see if looking through an SCT with a diagonal.  (Someday there will be a GUI for configuring this to match other setups.)
 
+Although we can only command the telescope at ~7 fps, the gamepad is polled and averaged continuously, so quick flicks of the joystick should work as expected.  Still, that atrocious baud rate means things are a bit laggy, so be careful and keep your sensitivity as low as possible (press L1 a lot).
+
 What actually happens with this input depends on the mode:
 
-### Momentum Mode
+### Target modes
 
-In this mode, your stick inputs accelerate the motors - so if you leave the sticks alone, the motors will continue at their present speed.  This mode works fine even if the telescope hasn't been aligned.  I've used it to track ISS and a Falcon 9 launch with some success, though it's a bit fidgety - one drawback is that when the target gets higher, you'll need to manually accelerate the azimuth.
+When you've selected a target, you're in these modes.  The telescope will automatically try to follow the target, and your stick inputs are just controlling an offset - so, if you leave the sticks alone, the target should stay still in your view.
 
-### Target mode
+In `target_with_time_offset` mode, the offset includes a "lead time" - so for example, suppose the target is moving slowly near the horizon, and due to some problem with your clock, it's three seconds ahead of where AstroLock thought it would be.  All you need to do is use the sticks to center the target, and the offset in the direction that it's moving will be converted to a lead time and stored.  Now, if that was the only error and you do nothing more with the sticks, it should track the target accurately even when it's nearly overhead and the three-second error translates to a much larger angular error.  This works very well with satellites (where a time offset is usually the largest error), but can be strange with stars, particularly ones like Polaris that don't move much.
 
-When you've selected a target, you're in this mode.  The telescope will automatically try to follow the target, and your stick inputs are just controlling an offset - so, if you leave the sticks alone, the target should stay still in your view.
-
-The offset includes a "lead time" - so for example, suppose the target is moving slowly near the horizon, and due to some problem with your clock, it's three seconds ahead of where AstroLock thought it would be.  All you need to do is use the sticks to center the target, and the offset in the direction that it's moving will be converted to a lead time and stored.  Now, if that was the only error and you do nothing more with the sticks, it should track the target accurately even when it's nearly overhead and the three-second error translates to a much larger angular error.
+There's also `target_with_spatial_offset` mode, which is the same except the offset is only in image space, not computed in terms of time.
 
 #### Spiral Search
 
 What if you have the target centered as well as you can with your sights, but you can't see it in the eyepiece or camera?  Press and hold DPad-Right, and the telescope will move in a spiral pattern designed to cover all the nearby sky.  (Currently you need to edit the source code so it knows your field of view - GUI TODO.)  If you caught a glimpse of the target but you lost it, you can reverse the sweep with DPad-Left.  You can then fine-tune with the joysticks as usual.  Once you are centered, press Cross to reset the spiral, so that subsequent spirals will be centered on your current aim point.
+
+### Sideral mode
+
+In this mode, the scope just moves with the "fixed stars" no matter where you point it.  This is great for aiming at something you see but don't know the name of, or for adding new alignment points.  However, it's only possible to use this mode when you've already aligned the scope, as otherwise AstroLock wouldn't know how fast to rotate.
+
+### Axis Momentum
+
+In this mode, you accelerate the scope with your joystick inputs, but when you let go, the scope keeps moving.  (Be careful!  No warranty express or implied!  You can stop it by pressing the right trigger or the Start button.)  Since we're just directly controling the motor speeds, you don't need to be aligned, but if you're tracking an object near gimbal lock, you will need to fight with it a bit to speed up and slow down the azimuth rates.  This mode is good for tracking moving targets.
+
+### Slew
+
+In this mode, your joystick deflection directly controls the speed of the motors.  This is the mode you'll be in when you start, and you can use it to point to your alignment stars.
 
 ## Details
 
@@ -120,7 +132,7 @@ This uses the Skyfield library, JPL ephemerides, and NORAD / Celestrak TLE data 
 
 This uses the OpenSky API to grab ADS-B data and provide targets representing aircraft.
 
-Note that the without an API key, the data is at least 10 seconds old (and there's a limit on how many queries you can do), so although we extrapolate it, it won't work well for planes that are manouvering.  It'd be cool to use an SDR to grab the ADS-B data ourselves with much less latency.
+Note that the without an API key, the data is at least 10 seconds old (and there's a limit on how many queries you can do), so although we extrapolate it, it won't work well for planes that are manouvering.  Also, the time resolution is 1 second at best, which is problematic.  This is mostly a proof of concept.  It'd be cool to use an SDR to grab the ADS-B data ourselves with much less latency.
 
 #### KML
 
@@ -134,17 +146,12 @@ This lets you use Google Earth (or anything that can output KML) to specify targ
 
 * We could also have momentum modes making other assumptions about the target's motion, fitting the recent history to those assumptions, and thus extrapolating.  For example, if we know the target is in a circular orbit at a given height, we could learn the other orbital parameters.  Or for a rocket launch, if we know the launch point and direction, we can guess the acceleration.
 
-* For easy slewing, it'd be nice to have a non-momentum mode.  Mostly just needs a GUI to support switching modes.
-
-* Once aligned, it'd be nice to have a mode that tracks the sidereal rate.  This would help with choosing more alignment targets, or targeting stars you don't know the name of.
-
 ### GUI
 Obviously the GUI needs a lot of work.  Small improvements:
-* Want a way to show or select tracking modes - important if we add more.
 * Better target selection - showing what stars are up, what satellites will be visible, etc.
 * Needs improvements for connecting to a telescope, including settings for the connection
 * Various settings: scope setup, fov, default location, etc.  Ideally with a non-boilerplatey way to add more settings.
-* The Time tab needs love.
+* The Input tab needs love.
 * Dark mode - I did battle with Tkinter for this but did not emerge victorious.  I can't find any reasonable way to learn the names of the myriad theme settings.
 
 Or potentially large improvements, including switching to other toolkits (thinking PySide or DearPyGUI).
@@ -163,7 +170,11 @@ The code is already multithreaded, but Python's GIL being what it is, that doesn
 * The telescope tracking loop runs in its own thread, but still, slow UI operations can hog the GIL and cause delays in the loop.
 * Some of the target calculations are just very slow, on the order of milliseconds, so it might be useful to perform them on a different thread, somewhat ahead of the current time, and let the tracking loop just interpolate between those points.
 
-## License
+### Capture and Closed Loop
+
+There's a nice Python library for Zwo cameras (and likely others...), PyTorch for processing frames, and Tensorez has some code for .SER files.  So it'd be cool to make a GUI for doing the focusing and video capture also.  Quickly detecting the center of mass of the image could give a steering signal.  Also it'd be cool to have auditory feedback - it should sound like a Sidewinder when it locks on.  This would likely have to be a different program for threading reasons, but tightly integrated.
+
+# License
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
