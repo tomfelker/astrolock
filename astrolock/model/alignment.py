@@ -10,7 +10,7 @@ class AlignmentSettings:
     def __init__(self):
         self.optimize_zenith_errors = True
         self.optimize_mount_errors = True
-        self.optimize_refraction = True
+        self.optimize_refraction = False
 
         self.min_alt = -20.0 * u.deg
         self.max_alt = 85.0 * u.deg        
@@ -499,7 +499,7 @@ class AlignmentModel(torch.nn.Module):
 
     def dir_given_numpy_raw_axis_values(self, raw_axis_values):
         with torch.no_grad():
-            return self.dir_given_raw_axis_values(torch.tensor(raw_axis_values)).numpy()
+            return self.dir_given_raw_axis_values(torch.tensor(raw_axis_values, dtype=torch.float32)).numpy()
         return 
 
     def dir_given_raw_axis_values(self, raw_axis_values):
@@ -511,7 +511,7 @@ class AlignmentModel(torch.nn.Module):
 
     def raw_axis_values_given_numpy_dir(self, dir):
         with torch.no_grad():        
-            return self.raw_axis_values_given_dir(torch.tensor(dir)).numpy()
+            return self.raw_axis_values_given_dir(torch.tensor(dir, dtype=torch.float32)).numpy()
 
     def raw_axis_values_given_dir(self, dir):
         """
