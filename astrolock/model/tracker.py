@@ -132,7 +132,7 @@ class Tracker(object):
 
         # tracking state
         # TODO: these should perhaps be separate classes
-        self.default_mode = 'axis_momentum'
+        self.default_mode = 'slew'
         self.current_mode = self.default_mode
         self.momentum = np.zeros(2)
         self.target_offset_image_space = np.zeros(2)

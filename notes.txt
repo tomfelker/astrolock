@@ -48,3 +48,22 @@ around n:   e:
 so we're in the ballpark there
 
 or maybe
+
+2023-07-29, tracked ISS!
+        worked very well, but I got on target late due to focusing
+        video settings were:
+                Exposure = 2ms
+                Gain = 93
+        and I would say it was underexposed by about half, and coulda been sharper image-wise
+        ASI 'gain' values are centibel (1/10 decibel), something about voltage, something about 60 gain units to double...
+        also I want to hit 183 so the vtech kicks in
+
+        so: gain to 150, still 2 ms = plenty bright
+        gain to 210, 1 ms = plenty bright (too bright?
+        how about: gain 190, 1 ms
+
+plan tonight:
+        gain 190
+        1 ms
+        if too dim, bump gain
+        if too bright, nerf exposure

@@ -10,6 +10,7 @@ class AlignmentSettings:
     def __init__(self):
         self.optimize_zenith_errors = True
         self.optimize_mount_errors = True
+        # TODO: don't think this is correct until we can invert it also...
         self.optimize_refraction = False
 
         self.min_alt = -20.0 * u.deg
