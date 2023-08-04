@@ -1,11 +1,17 @@
 {
     "configurations": [
-        
         {
-            "name": "Python: Module",
+            "name": "AstroLock",
             "type": "python",
             "request": "launch",
             "module": "astrolock",
+            "justMyCode": true
+        },
+        {
+            "name": "Focus",
+            "type": "python",
+            "request": "launch",
+            "program": "focus.py",
             "justMyCode": true
         }
     ]
