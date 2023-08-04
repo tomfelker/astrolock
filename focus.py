@@ -161,10 +161,9 @@ def process_frame(raw_frame_hw, state, debayer = True):
     # TODO: This is so dumb... torch can't support uint16 for whatever dumb reason... so need to profile to determine
     # which of the two dumb options is better: doing the conversion to float on the CPU in numpy, or doubling the memory
     # use on the CPU in numpy and then doing the divide in torch possibly on GPU if that's a thing.
-    raw_frame_hw = np.array(raw_frame_hw, dtype=np.int32)
+    raw_frame_hw = np.array(raw_frame_hw, dtype=np.float32)
 
-    frame = torch.tensor(raw_frame_hw, dtype = torch.float32)
-    frame = frame.to(dev)
+    frame = torch.tensor(raw_frame_hw, dtype = torch.float32, device=dev)
     frame /= (1 << 16) - 1
        
     # frame is now shape bhwc, 0 to 1
