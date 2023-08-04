@@ -306,9 +306,12 @@ while running:
         print('timeout')
         continue
     
+    process_start_ns = time.perf_counter_ns()
     luckiness, pygame_frame_whc, audio, state = process_frame(frame, state)
-
+    process_time_ns = time.perf_counter_ns() - process_start_ns
+    
     print(luckiness)
+    print(f'Took {process_time_ns * 1e-6:.1f} ms')
 
     # tried crossfading, but SDL_mixer doesn't change volume smoothly, so it still has pops :-(
     new_sound = pygame.mixer.Sound(audio.cpu().numpy())
