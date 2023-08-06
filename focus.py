@@ -136,9 +136,11 @@ def compute_focus(frame, state):
     star_crop_com = center_of_mass_offset(star_crop)
     star_crop_ema_com = center_of_mass_offset(new_star_crop_ema)
 
+    inset_size = star_crop_size * expand_factor
+    inset_center = inset_size // 2
     
-    star_crop_com_int = torch.tensor(torch.round(star_crop_com * expand_factor * com_display_scale), dtype=torch.int32)
-    star_crop_ema_com_int = torch.tensor(torch.round(star_crop_ema_com * expand_factor * com_display_scale), dtype=torch.int32)
+    star_crop_com_int = torch.clamp(torch.tensor(torch.round(star_crop_com * expand_factor * com_display_scale), dtype=torch.int32) + inset_center, 0, inset_size - 1)
+    star_crop_ema_com_int = torch.clamp(torch.tensor(torch.round(star_crop_ema_com * expand_factor * com_display_scale), dtype=torch.int32) + inset_center, 0, inset_size - 1)
 
     star_crop_expanded = expand_image(star_crop, expand_factor)
     ema_expanded = expand_image(new_star_crop_ema, expand_factor)
@@ -156,20 +158,18 @@ def compute_focus(frame, state):
     combined[:, star_mins[0]:star_maxs[0], star_mins[1], 0] = 1
     combined[:, star_mins[0]:star_maxs[0], star_maxs[1], 0] = 1
     
-    # blit the processed stuff into the corner
-    inset_size = star_crop_size * expand_factor
+    # blit the processed stuff into the corner    
     combined[:, 0:inset_size, 0:inset_size, :] = star_crop_expanded
     combined[:, inset_size:2 * inset_size, 0:inset_size, :] = ema_expanded
 
     # off on the other side, representations of the coms (different from the coms of maxs) (for collimation)
-    # TODO: should probably have bounds checks, but, it seems to survive, at least on GPU...
-    combined[:, inset_size // 2, -inset_size-1:-1, 0] = .1
-    combined[:, 0:inset_size, -inset_size-1 + inset_size // 2, 0] = .1
-    combined[:, inset_size // 2 + star_crop_com_int[0, 0, 0], -inset_size + inset_size // 2 + star_crop_com_int[0, 1, 0], :] = 1
+    combined[:, inset_center, -inset_size-1:-1, 0] = .1
+    combined[:, 0:inset_size, -inset_size-1 + inset_center, 0] = .1
+    combined[:, star_crop_com_int[0, 0, 0], -inset_size + star_crop_com_int[0, 1, 0], :] = 1
 
-    combined[:, inset_size + inset_size // 2, -inset_size-1:-1, 0] = .1
-    combined[:, inset_size: 2 * inset_size, -inset_size-1 + inset_size // 2, 0] = .1
-    combined[:, inset_size + inset_size // 2 + star_crop_ema_com_int[0, 0, 0], -inset_size + inset_size // 2 + star_crop_ema_com_int[0, 1, 0], :] = 1
+    combined[:, inset_size + inset_center, -inset_size-1:-1, 0] = .1
+    combined[:, inset_size: 2 * inset_size, -inset_size-1 + inset_center, 0] = .1
+    combined[:, inset_size + star_crop_ema_com_int[0, 0, 0], -inset_size + star_crop_ema_com_int[0, 1, 0], :] = 1
 
 
     new_state = FocusState(new_star_crop_ema, new_focus_mean, new_focus_variance)
