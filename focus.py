@@ -14,7 +14,8 @@ ema_alpha = .02
 
 star_crop_size = 64
 expand_factor = 8
-    
+com_display_scale = 30
+
 
 if torch.cuda.is_available():  
     dev = "cuda:0" 
@@ -132,6 +133,13 @@ def compute_focus(frame, state):
     new_focus_mean = lerp(state.focus_mean, focus, ema_alpha)
     new_focus_variance = lerp(state.focus_variance, (focus - state.focus_mean) * (focus - new_focus_mean), ema_alpha)
 
+    star_crop_com = center_of_mass_offset(star_crop)
+    star_crop_ema_com = center_of_mass_offset(new_star_crop_ema)
+
+    
+    star_crop_com_int = torch.tensor(torch.round(star_crop_com * expand_factor * com_display_scale), dtype=torch.int32)
+    star_crop_ema_com_int = torch.tensor(torch.round(star_crop_ema_com * expand_factor * com_display_scale), dtype=torch.int32)
+
     star_crop_expanded = expand_image(star_crop, expand_factor)
     ema_expanded = expand_image(new_star_crop_ema, expand_factor)
 
@@ -152,6 +160,17 @@ def compute_focus(frame, state):
     inset_size = star_crop_size * expand_factor
     combined[:, 0:inset_size, 0:inset_size, :] = star_crop_expanded
     combined[:, inset_size:2 * inset_size, 0:inset_size, :] = ema_expanded
+
+    # off on the other side, representations of the coms (different from the coms of maxs) (for collimation)
+    # TODO: should probably have bounds checks, but, it seems to survive, at least on GPU...
+    combined[:, inset_size // 2, -inset_size-1:-1, 0] = .1
+    combined[:, 0:inset_size, -inset_size-1 + inset_size // 2, 0] = .1
+    combined[:, inset_size // 2 + star_crop_com_int[0, 0, 0], -inset_size + inset_size // 2 + star_crop_com_int[0, 1, 0], :] = 1
+
+    combined[:, inset_size + inset_size // 2, -inset_size-1:-1, 0] = .1
+    combined[:, inset_size: 2 * inset_size, -inset_size-1 + inset_size // 2, 0] = .1
+    combined[:, inset_size + inset_size // 2 + star_crop_ema_com_int[0, 0, 0], -inset_size + inset_size // 2 + star_crop_ema_com_int[0, 1, 0], :] = 1
+
 
     new_state = FocusState(new_star_crop_ema, new_focus_mean, new_focus_variance)
     return new_focus_mean, combined, new_state
@@ -292,12 +311,6 @@ sound = None
 state = FocusState(None, 0.0, 0.0)
 last_perf_time_ns = time.perf_counter_ns()
 while running:
-    
-    perf_time_ns = time.perf_counter_ns()
-    loop_time_ns = perf_time_ns - last_perf_time_ns
-    last_perf_time_ns = perf_time_ns
-
-    print(f"Loop time: {loop_time_ns * 1e-6:.1f} ms ({1 / (loop_time_ns * 1e-9):.1f} Hz)")
 
     try:
         frame = camera.capture_video_frame()
@@ -309,9 +322,13 @@ while running:
     process_start_ns = time.perf_counter_ns()
     luckiness, pygame_frame_whc, audio, state = process_frame(frame, state)
     process_time_ns = time.perf_counter_ns() - process_start_ns
-    
-    print(luckiness)
-    print(f'Took {process_time_ns * 1e-6:.1f} ms')
+
+
+    perf_time_ns = time.perf_counter_ns()
+    loop_time_ns = perf_time_ns - last_perf_time_ns
+    last_perf_time_ns = perf_time_ns
+
+    print(f"EMA peak: {luckiness.item():.4f}, Process time: {process_time_ns * 1e-6:.1f} ms, Loop time: {loop_time_ns * 1e-6:.1f} ms, {1 / (loop_time_ns * 1e-9):.1f} Hz")
 
     # tried crossfading, but SDL_mixer doesn't change volume smoothly, so it still has pops :-(
     new_sound = pygame.mixer.Sound(audio.cpu().numpy())
