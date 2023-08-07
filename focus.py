@@ -8,8 +8,8 @@ import time
 from collections import namedtuple
 
 # Tunables!  (TODO: GUI)
-exposure_usec = 5000
-gain_centibels = 182
+exposure_usec = 100
+gain_centibels = 0
 ema_alpha = .02
 
 star_crop_size = 64
@@ -110,18 +110,19 @@ def compute_focus(frame, state):
     #com_offset = torch.tensor([[[0], [0]]])
 
     image_size = torch.tensor(star_mask.shape[-3:-1], dtype=torch.int32)
-    image_center = torch.tensor(image_size, dtype=torch.float32) / 2
-    image_center_int = torch.tensor(image_center, dtype=torch.int32)
+    image_center = image_size.type(dtype=torch.float32) / 2
+    image_center_int = image_center.type(dtype=torch.int32)
     # TODO: this is not respecting the batch dim, which is fine for now, but lame.
     star_center = image_center + com_offset[0, :, 0]
-    star_center_int = torch.tensor(torch.trunc(star_center), dtype=torch.int32)
 
-    star_mins = star_center_int - torch.tensor([star_crop_size // 2, star_crop_size // 2], dtype=torch.int32)
+    star_crop_half_size = torch.tensor([star_crop_size // 2, star_crop_size // 2], dtype=torch.int32)
+    star_center = torch.clamp(star_center, star_crop_half_size, image_size - star_crop_half_size - 1)
+
+    star_center_int = torch.trunc(star_center).type(dtype=torch.int32)
+
+    star_mins = star_center_int - star_crop_half_size
     star_maxs = star_mins + torch.tensor([star_crop_size, star_crop_size], dtype=torch.int32)
     
-    if (star_mins < 0).any() or (star_maxs >= image_size).any():
-        return state.focus_mean, frame, state
-        
     star_crop = frame[:, star_mins[0]:star_maxs[0], star_mins[1]:star_maxs[1], :]
 
     if state.star_crop_ema is None:
@@ -152,16 +153,16 @@ def compute_focus(frame, state):
     combined[:, image_center_int[0], :, 0] = .2
     combined[:, :, image_center_int[1], 0] = .2
 
+    # blit the processed stuff into the corner    
+    combined[:, 0:inset_size, 0:inset_size, :] = star_crop_expanded
+    combined[:, inset_size:2 * inset_size, 0:inset_size, :] = ema_expanded
+
     # box around the star
     combined[:, star_mins[0], star_mins[1]:star_maxs[1], 0] = 1
     combined[:, star_maxs[0], star_mins[1]:star_maxs[1], 0] = 1
     combined[:, star_mins[0]:star_maxs[0], star_mins[1], 0] = 1
     combined[:, star_mins[0]:star_maxs[0], star_maxs[1], 0] = 1
     
-    # blit the processed stuff into the corner    
-    combined[:, 0:inset_size, 0:inset_size, :] = star_crop_expanded
-    combined[:, inset_size:2 * inset_size, 0:inset_size, :] = ema_expanded
-
     # off on the other side, representations of the coms (different from the coms of maxs) (for collimation)
     combined[:, inset_center, -inset_size-1:-1, 0] = .1
     combined[:, 0:inset_size, -inset_size-1 + inset_center, 0] = .1
@@ -198,7 +199,7 @@ def process_frame(raw_frame_hw, state, debayer = True):
     
     pygame_frame_whc = convert_linear_to_srgb(frame)
     pygame_frame_whc *= 255.0
-    pygame_frame_whc = torch.tensor(pygame_frame_whc, dtype=torch.uint8)
+    pygame_frame_whc = pygame_frame_whc.type(dtype=torch.uint8)
     pygame_frame_whc = torch.squeeze(pygame_frame_whc, axis = 0)
     pygame_frame_whc = torch.permute(pygame_frame_whc, dims=(1, 0, 2))
 
@@ -252,7 +253,7 @@ def generate_audio(luckiness):
     tile_fade_s = torch.abs(torch.linspace(-1.0, 1.0, audio_samples, device=dev))
     audio_s = audio_s * (1.0 - tile_fade_s) + torch.roll(audio_s, shifts=audio_samples // 2, dims=0) * tile_fade_s
 
-    audio_int16_s = torch.tensor(audio_s * 32767.0, dtype = torch.int16)
+    audio_int16_s = (audio_s * 32767.0).type(dtype = torch.int16)
     # it seems sdlmixer can't broadcast, need to stack for stereo
     #audio_int16_sc = tf.expand_dims(audio_int16_s, axis = 1)
     audio_int16_sc = torch.stack([audio_int16_s, audio_int16_s], axis = 1)
@@ -308,7 +309,7 @@ luckiness_cache = None
 surface = None
 running = True
 sound = None
-state = FocusState(None, 0.0, 0.0)
+state = FocusState(None, torch.tensor(0.0), torch.tensor(0.0))
 last_perf_time_ns = time.perf_counter_ns()
 while running:
 
