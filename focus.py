@@ -8,8 +8,8 @@ import time
 from collections import namedtuple
 
 # Tunables!  (TODO: GUI)
-exposure_usec = 100
-gain_centibels = 0
+exposure_usec = 1000
+gain_centibels = 182
 ema_alpha = .02
 
 star_crop_size = 64
