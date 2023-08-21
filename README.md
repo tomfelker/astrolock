@@ -2,6 +2,8 @@
 
 This software will help you aim a telescope, particularly at moving targets like satellites, rockets, or planes, using a gamepad for precise input.  Alignment is computed within Astrolock, so you only need to point at some unidentified objects.  For satellites, AstroLock can download information about their orbits and track them automatically, with you fine-tuning using the joystick.  Or for cases when you can't predict the path in advance, it can track with momentum, so you only need joystick input when the target changes direction.
 
+There's also a utility to help with collimating and focusing, focus.py.
+
 AstroLock is still rough around the edges, and you may need to dive into the Python code to get it working for you.
 
 ## Hardware
@@ -23,7 +25,7 @@ There's no fancy packaging yet, so this is somewhat technical, yet straightforwa
 
 1. clone this repository
 
-1. install the requirements, which includes PyTorch (but no need for GPU support, the CPU is plenty fast)
+1. install the requirements, which includes PyTorch (but no need for GPU support, except perhaps for focus.py)
     * `python -m pip install -r requirements.txt`
 
 1. From the root of the cloned repository, run `python -m astrolock` 
@@ -137,6 +139,10 @@ Note that the without an API key, the data is at least 10 seconds old (and there
 #### KML
 
 This lets you use Google Earth (or anything that can output KML) to specify targets that are fixed to the Earth's surface.  If there are distant objects you can see at daytime and get accurate coordintes for, this would let you align your telescope during the day.
+
+## Focus
+
+The focus.py tool uses a camera to help focus or collimate the telescope.  (It's a little like MetaGuide with fewer features and no UI...)  Just run it and it should connect to an ASI camera (you'll need to install the library) and show a live view.  (To adjust exposure and gain, you'll need to edit the python file... TODO autoexposure.)  It will select the brightest star, compute an exponential moving average of it, show how they are centered relative to their peaks, and tell you which screw to turn.
 
 ## Future Directions
 

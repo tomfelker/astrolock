@@ -67,3 +67,88 @@ plan tonight:
         1 ms
         if too dim, bump gain
         if too bright, nerf exposure
+
+
+2023-08-07
+        Tried to track Tiangong.
+                set the tripod intentionally unlevel by ~5 degrees - first time, this worked fine
+                used focus.py to collimate, this worked awesome!
+                realized Tiangong's path was such that I should rotate the tripod - so, rotated it and tried to realign
+                this time it couldn't align... ran out of time before the pass
+                tracked in momentum mode... I'm not good at this, only got a few frames
+                also turns out I must've bumped the focus while moving the tripod - image was sort of strangely doubled
+
+So, why didn't the alignment work?
+        after many bugfixes, and switching to more consistent losses, a mystery remains:
+
+        with limiting mag of 3, it always aligns to:
+
+                Refining alignment: step 5000 of 5000: avg loss 5.609e-07, best loss 5.609e-07 with model 0
+                Accuracy:
+                        Observation 0, Sargas (HIP 86228), was off by 0.020519529112944693 deg
+                        Observation 1, Almach (HIP 9640), was off by 0.055450347163059695 deg
+                        Observation 2, Dubhe (HIP 54061), was off by 0.04504491748335559 deg
+                Done!
+                Final alignment:
+                AlignmentModel
+                        encoder_offsets: [119.591385  42.178425] deg
+                        zenith_roll: 0.9328662763449895 deg
+                        zenith_pitch: 10.943368361782158 deg
+                        non_perpendicular_axes_error: 0.0 deg
+                        collimation_error_in_azimuth: 0.0 deg
+                        extra_refraction_coefficient: 0.0
+
+        but with limiting mag of 2, it finds the right solution:
+
+                Refining alignment: step 5000 of 5000: avg loss 1.195e-07, best loss 1.195e-07 with model 0
+                Accuracy:
+                        Observation 0, Arcturus (HIP 69673), was off by 0.009646177280478495 deg
+                        Observation 1, Altair (HIP 97649), was off by 0.022387329051838645 deg
+                        Observation 2, Vega (HIP 91262), was off by 0.024139679450450206 deg
+                Done!
+                Final alignment:
+                AlignmentModel
+                        encoder_offsets: [33.601837    0.18461345] deg
+                        zenith_roll: -3.696126133501135 deg
+                        zenith_pitch: -4.162482058519497 deg
+                        non_perpendicular_axes_error: 0.0 deg
+                        collimation_error_in_azimuth: 0.0 deg
+                        extra_refraction_coefficient: 0.0
+
+        the latter is clearly better (and I believe is correct...)
+
+        so why isn't it found?
+
+
+        also sometimes
+                Refining alignment: step 5000 of 5000: avg loss 5.900e-07, best loss 5.900e-07 with model 0
+                Accuracy:
+                        Observation 0, MOON, was off by 0.056788013698590906 deg
+                        Observation 1, MARS BARYCENTER, was off by 0.047697708929124984 deg
+                        Observation 2, Fang (HIP 78265), was off by 0.017656877770389337 deg
+                Done!
+                Final alignment:
+                AlignmentModel
+                        encoder_offsets: [238.53256  58.26868] deg
+                        zenith_roll: -2.6574699385878744 deg
+                        zenith_pitch: -1.1510108857692667 deg
+                        non_perpendicular_axes_error: 0.0 deg
+                        collimation_error_in_azimuth: 0.0 deg
+                        extra_refraction_coefficient: 0.0
+
+        This persists even when:
+                - setting stdev_zenith et al to 0
+                - disabling below/above horizon filtering
+
+        so, should be: [50, 104, 97]
+
+        I guess the theory is, our algorithm (in unrolled form) is:
+                - for each observation
+                        - for each target
+                                assume we were looking at that target during that observation
+                                compute encoder offsets from there
+                                based on that, find the stars we were looking at at the other times
+                                optimize
+
+        So the problem is, with more stars, we can make wrong assumptions about the other stars, unless we were
+        very nearly correct about our zenith or other errors...

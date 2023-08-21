@@ -10,11 +10,17 @@ from collections import namedtuple
 # Tunables!  (TODO: GUI)
 exposure_usec = 1000
 gain_centibels = 182
-ema_alpha = .02
+ema_alpha = .03
 
-star_crop_size = 64
+star_crop_size = 63
 expand_factor = 8
 com_display_scale = 30
+
+debayer = True
+
+# since we have to center the peak in the crop, and then take the COM of the crop, we
+# need the crop to be of odd size so nonzero background or lazy math won't throw off the COM
+assert(star_crop_size % 2 == 1)
 
 
 if torch.cuda.is_available():  
@@ -98,37 +104,52 @@ def expand_image(image, expand_factor):
 
 FocusState = namedtuple('FocusState', ['star_crop_ema', 'focus_mean', 'focus_variance'])
 
-def compute_focus(frame, state):
-    # nerf  
+def indices_of_global_max(x):
+    index_flat = torch.argmax(x)
+    indices = torch.tensor(np.unravel_index(index_flat.cpu().item(), x.shape))
+    return indices
+
+def crop_image(image_bhwc, center, crop_sizes):
+    image_size = torch.tensor(image_bhwc.shape[-3:-1], dtype=torch.int32)
+    crop_half_sizes = torch.tensor(crop_sizes // 2, dtype=torch.int32)
+
+    center = torch.trunc(center).type(dtype=torch.int32)
+    center = torch.clamp(center, crop_half_sizes, image_size - crop_half_sizes - 1)
+
+    mins = center - crop_half_sizes
+    maxs = mins + crop_sizes
     
-    frame_max = torch.max(frame)
-    star_mask = frame == frame_max
+    crop = image_bhwc[:, mins[..., 0]:maxs[..., 0], mins[..., 1]:maxs[..., 1], :]
+    return crop, mins, maxs
 
-    frame_max = frame_max.cpu()
-
-    com_offset = center_of_mass_offset(star_mask).cpu()
-    #com_offset = torch.tensor([[[0], [0]]])
-
-    image_size = torch.tensor(star_mask.shape[-3:-1], dtype=torch.int32)
+def compute_focus(frame, state):
+    image_size = torch.tensor(frame.shape[-3:-1], dtype=torch.int32)
     image_center = image_size.type(dtype=torch.float32) / 2
     image_center_int = image_center.type(dtype=torch.int32)
-    # TODO: this is not respecting the batch dim, which is fine for now, but lame.
-    star_center = image_center + com_offset[0, :, 0]
 
-    star_crop_half_size = torch.tensor([star_crop_size // 2, star_crop_size // 2], dtype=torch.int32)
-    star_center = torch.clamp(star_center, star_crop_half_size, image_size - star_crop_half_size - 1)
+    # TODO: if we're doing debayer, and the star is either colored, or staying still to within a subpixel,
+    # then aliasing effects could shift our center a bit.  We could compensate by, instead of collapsing
+    # channels when computing the CoM, computing the CoM for each channel separately, then shifting that by
+    # the channel's subpixels' position in the bayer pattern.  In practice, my guiding, and certainly the
+    # seeing, is not that good, and the dither should average it out (as confirmed by test mode).
 
-    star_center_int = torch.trunc(star_center).type(dtype=torch.int32)
+    # TODO: could implement lock on by using last frame's center, or click location, for this
+    init_center_indices = indices_of_global_max(frame)
+    init_center = init_center_indices[-3:-1]
+    frame_max = frame[tuple(init_center_indices)]
+    init_star_crop, _, _ = crop_image(frame, init_center, star_crop_size)
+    init_star_crop_star_mask = (init_star_crop == frame_max)
+    init_star_crop_star_mask_com = center_of_mass_offset(init_star_crop_star_mask)
+    star_center = init_center + init_star_crop_star_mask_com.cpu()[0, :, 0]
 
-    star_mins = star_center_int - star_crop_half_size
-    star_maxs = star_mins + torch.tensor([star_crop_size, star_crop_size], dtype=torch.int32)
-    
-    star_crop = frame[:, star_mins[0]:star_maxs[0], star_mins[1]:star_maxs[1], :]
+    star_crop, star_mins, star_maxs = crop_image(frame, star_center, star_crop_size)
 
     if state.star_crop_ema is None:
-        new_star_crop_ema = star_crop.clone()
+        new_star_crop_ema = torch.zeros_like(star_crop)
     else:
-        new_star_crop_ema = lerp(state.star_crop_ema, star_crop, ema_alpha)
+        new_star_crop_ema = state.star_crop_ema
+
+    new_star_crop_ema = lerp(new_star_crop_ema, star_crop, ema_alpha)
     
     focus = frame_max
     new_focus_mean = lerp(state.focus_mean, focus, ema_alpha)
@@ -172,9 +193,40 @@ def compute_focus(frame, state):
     combined[:, inset_size: 2 * inset_size, -inset_size-1 + inset_center, 0] = .1
     combined[:, inset_size + star_crop_ema_com_int[0, 0, 0], -inset_size + star_crop_ema_com_int[0, 1, 0], :] = 1
 
+    debug_text = collimation_instructions(star_crop_ema_com.cpu())
 
     new_state = FocusState(new_star_crop_ema, new_focus_mean, new_focus_variance)
-    return new_focus_mean, combined, new_state
+    return new_focus_mean.cpu(), combined, new_state, debug_text
+
+def collimation_instructions(com):
+    screw_angles = {
+        "bottom": -90,
+        "upper left": 150,
+        "upper right": 30
+    }
+
+    best_to_tighten = ""
+    best_to_tighten_dot = 0
+    best_to_loosen = ""
+    best_to_loosen_dot = 0
+
+    for screw_name, screw_angle in screw_angles.items():
+        screw_angle_rad = np.deg2rad(screw_angle)
+        screw_dir = np.array([np.cos(screw_angle_rad), np.sin(screw_angle_rad)])
+
+        # todo: determine sign experimentally
+        tighten_dot = np.dot(screw_dir, com).item()
+        loosen_dot = -tighten_dot
+
+        if tighten_dot > best_to_loosen_dot:
+            best_to_tighten_dot = tighten_dot
+            best_to_tighten = screw_name
+
+        if loosen_dot > best_to_loosen_dot:
+            best_to_loosen_dot = loosen_dot
+            best_to_loosen = screw_name
+
+    return f'Tighten {best_to_tighten} screw by {best_to_tighten_dot: 4.1f} or loosen {best_to_loosen} screw by {best_to_loosen_dot: 4.1f}'
 
 @torch.no_grad()
 def process_frame(raw_frame_hw, state, debayer = True):
@@ -193,7 +245,7 @@ def process_frame(raw_frame_hw, state, debayer = True):
     # make batch dim
     frame = torch.unsqueeze(frame, dim=0)
     
-    luckiness, frame, state = compute_focus(frame, state)
+    luckiness, frame, state, debug_text = compute_focus(frame, state)
 
     frame = bayer_planes_to_subsampled_rgb(frame, debayer=debayer)
     
@@ -205,7 +257,7 @@ def process_frame(raw_frame_hw, state, debayer = True):
 
     audio = generate_audio(luckiness)
 
-    return luckiness, pygame_frame_whc, audio, state
+    return luckiness, pygame_frame_whc, audio, state, debug_text
 
 @torch.no_grad()
 def generate_audio(luckiness):
@@ -272,22 +324,23 @@ cameras = zwoasi.list_cameras()
 
 if len(cameras) == 0:
     print('No cameras found')
-    exit()
+    camera = None
+else:
+    camera = zwoasi.Camera(0)
 
-camera = zwoasi.Camera(0)
+if camera:
+    camera_info = camera.get_camera_property()
 
-camera_info = camera.get_camera_property()
+    print(camera_info)
 
-print(camera_info)
+    camera.set_roi(image_type = zwoasi.ASI_IMG_RAW16)
 
-camera.set_roi(image_type = zwoasi.ASI_IMG_RAW16)
+    camera.start_video_capture()
 
-camera.start_video_capture()
-
-# seems to be usec
-camera.set_control_value(zwoasi.ASI_EXPOSURE, exposure_usec)
-# units are supposedly centibels of voltage gain, so add ~60 to double intensity.  (Experimentally, seems to need more like 80)
-camera.set_control_value(zwoasi.ASI_GAIN, gain_centibels)
+    # seems to be usec
+    camera.set_control_value(zwoasi.ASI_EXPOSURE, exposure_usec)
+    # units are supposedly centibels of voltage gain, so add ~60 to double intensity.  (Experimentally, seems to need more like 80)
+    camera.set_control_value(zwoasi.ASI_GAIN, gain_centibels)
 
 pygame.init()
 display = pygame.display.set_mode(size = (1024, 768), depth = 32, flags = pygame.RESIZABLE)
@@ -302,7 +355,6 @@ except AttributeError:
 
 pygame.mixer.init(frequency = 48000, size = -16, channels = 2)
 
-bit_depth = camera_info['BitDepth']
 
 luckiness_cache = None
 
@@ -311,17 +363,35 @@ running = True
 sound = None
 state = FocusState(None, torch.tensor(0.0), torch.tensor(0.0))
 last_perf_time_ns = time.perf_counter_ns()
+frame_count = 0
 while running:
+    frame_count = frame_count + 1
+    if camera:
+        try:        
+            frame = camera.capture_video_frame()        
+        except zwoasi.ZWO_IOError:
+            print('timeout')
+            continue
+    else:
+        # testing
+        frame=np.zeros((2160, 3840), dtype=np.uint16)
+        center_x = (1000 + 200 * np.sin(frame_count / 23)).astype(np.int32)
+        center_y = (2000 + 200 * np.sin(frame_count / 31)).astype(np.int32)
+        
+        frame[center_x+1, center_y+1] = 20000
+        frame[center_x+1, center_y] = 30000
+        frame[center_x+1, center_y-1] = 20000
+        frame[center_x, center_y+1] = 30000
+        frame[center_x, center_y] = 40000
+        frame[center_x, center_y-1] = 30000
+        frame[center_x-1, center_y+1] = 20000
+        frame[center_x-1, center_y] = 30000
+        frame[center_x-1, center_y-1] = 20000
 
-    try:
-        frame = camera.capture_video_frame()
-        #frame=torch.zeros((2160, 3840), dtype=torch.int16)
-    except zwoasi.ZWO_IOError:
-        print('timeout')
-        continue
+        #frame[center_x+3, center_y+4] = 10000
     
     process_start_ns = time.perf_counter_ns()
-    luckiness, pygame_frame_whc, audio, state = process_frame(frame, state)
+    luckiness, pygame_frame_whc, audio, state, debug_text = process_frame(frame, state, debayer=debayer)
     process_time_ns = time.perf_counter_ns() - process_start_ns
 
 
@@ -329,7 +399,7 @@ while running:
     loop_time_ns = perf_time_ns - last_perf_time_ns
     last_perf_time_ns = perf_time_ns
 
-    print(f"EMA peak: {luckiness.item():.4f}, Process time: {process_time_ns * 1e-6:.1f} ms, Loop time: {loop_time_ns * 1e-6:.1f} ms, {1 / (loop_time_ns * 1e-9):.1f} Hz")
+    print(f"EMA peak: {luckiness.item():.4f}, {debug_text}, Process time: {process_time_ns * 1e-6:.1f} ms, Loop time: {loop_time_ns * 1e-6:.1f} ms, {1 / (loop_time_ns * 1e-9):.1f} Hz")
 
     # tried crossfading, but SDL_mixer doesn't change volume smoothly, so it still has pops :-(
     new_sound = pygame.mixer.Sound(audio.cpu().numpy())
@@ -348,4 +418,5 @@ while running:
             running = False
     
 pygame.quit()
-camera.close()
+if camera:
+    camera.close()
