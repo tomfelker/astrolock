@@ -46,6 +46,7 @@ class KmlTargetSource(target_source.TargetSource):
             new_target = target.Target.from_gps(lat_deg=lat_deg, lon_deg=lon_deg, alt_m=alt_m)
             new_target.display_name = display_name
             new_target.url = f'astrolock://kml/{display_name}'
+            new_target.use_for_alignment = True
             
             self.target_map[new_target.url] = new_target
         

@@ -252,7 +252,8 @@ class AlignmentFrame(tk.Frame):
             if target_source.use_for_alignment:
                 target_source.start()
                 for target in target_source.target_map.values():
-                    targets.append(target)
+                    if target.use_for_alignment:
+                        targets.append(target)
         
         if len(targets) == 0:
             print("Couldn't find any targets to align to.")

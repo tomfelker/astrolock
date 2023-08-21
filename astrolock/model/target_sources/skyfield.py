@@ -119,11 +119,16 @@ class SkyfieldTargetSource(target_source.TargetSource):
 
         self.notify_targets_updated()
 
-    def load_stars(self, loader, mag_limit = 3.0):
+    def load_stars(self, loader, mag_limit = 2.0):
         with loader.open(skyfield.data.hipparcos.URL) as f:
             stars_df = skyfield.data.hipparcos.load_dataframe(f)
 
         stars_df = stars_df[stars_df['magnitude'] <= mag_limit]
+
+        stars_df = stars_df[stars_df['ra_degrees'].notnull()]
+        stars_df = stars_df[stars_df['dec_degrees'].notnull()]
+
+
 
         star_names_url = 'https://www.pas.rochester.edu/~emamajek/WGSN/IAU-CSN.txt'
         hip_to_name = {}
@@ -149,11 +154,15 @@ class SkyfieldTargetSource(target_source.TargetSource):
 
             new_target = SkyfieldTarget(star)
             new_target.url = url
+            new_target.use_for_alignment = True
 
             new_target.display_name = f"HIP {star_index}"
             if star_index in hip_to_name:
                 new_target.display_name = f'{hip_to_name[star_index]} ({new_target.display_name})'
 
+            #if 'Tarazed' in new_target.display_name:
+            #    print("hax")
+            #    continue
 
             self.target_map[url] = new_target
         
@@ -176,6 +185,7 @@ class SkyfieldTargetSource(target_source.TargetSource):
             new_target = SkyfieldTarget(self.planets[planet_name])
             new_target.url = url
             new_target.display_name = planet_displayname
+            new_target.use_for_alignment = True
 
             self.target_map[url] = new_target
 
@@ -205,5 +215,7 @@ class SkyfieldTargetSource(target_source.TargetSource):
                 new_target = SkyfieldTarget(satellite)
                 new_target.url = url
                 new_target.display_name = satellite.name
+                new_target.use_for_alignment = False  # I mean, you _could_, but probably aren't...
+
                 self.target_map[url] = new_target
             

@@ -14,16 +14,19 @@ class AlignmentSettings:
         self.optimize_refraction = False
 
         self.min_alt = -20.0 * u.deg
-        self.max_alt = 85.0 * u.deg        
-        self.num_batches = 5
-        self.refine_during_search_steps = 10
+        self.max_alt = 89.0 * u.deg        
+        self.num_batches = 1
+        self.refine_during_search_steps = 100
         self.full_random = False
-        self.full_random_batch_size=100000
-        self.final_refine_steps = 5000
+        self.full_random_batch_size=5000
+        self.final_refine_steps = 1000
+
+        self.zenith_error_stdev_degrees = 0.0
+        self.mount_errors_stdev_degrees = 0.0
         
         # TODO:
         #self.is_equatorial = False
-        #self.lattitude_rad = (45 * u.deg).to_value(u.rad)
+        #self.latitude_rad = (45 * u.deg).to_value(u.rad)
 
 class AlignmentDatum:
     """
@@ -47,7 +50,7 @@ class AlignmentDatum:
     
     def to_json(self):
         return {
-            "time": str(self.time),
+            "time": str(self.time.to_value('isot', 'date_hms')),
             "raw_axis_values": self.raw_axis_values.tolist()
         }
 
@@ -129,17 +132,35 @@ def wrap_to_pi(theta):
     ret = torch.atan2(torch.sin(theta), torch.cos(theta))
     return ret
 
-def compute_best_dot_and_target(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir):
+def compute_dir_losses(predicted_dirs, observed_dirs):
+
+    losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False)    
+    #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).sqrt()    
+    return losses
+
+def compute_model_losses(dir_losses, time_dim):
+    model_losses = dir_losses.mean(dim=time_dim)
+    #model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
+
+    return model_losses
+
+def compute_best_loss_and_target(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir):
     # At each time, for each model, figure out where it thinks it was pointing (time_batch_to_observed_dir).
     time_batch_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(1)
     time_batch_to_observed_dir = batch_to_model.dir_given_raw_axis_values(time_batch_to_raw_axis_values)
 
-    # For each model each target, compute the dot of the angle between where we think we were pointed at each time, and where the target was at each time.
-    batch_target_time_to_dot = torch.einsum('tod,obd->bto', target_time_to_predicted_dir, time_batch_to_observed_dir)
+    # todo swizzle better?    
+    target_time_batch_to_predicted_dir = target_time_to_predicted_dir.unsqueeze(2)
+    target_time_batch_to_observed_dir = time_batch_to_observed_dir.unsqueeze(0)
+
+    target_time_batch_to_loss = compute_dir_losses(target_time_batch_to_predicted_dir, target_time_batch_to_observed_dir)
+
+    target_batch_time_to_loss = target_time_batch_to_loss.permute((0, 2, 1))
 
     # For each model at each time, find the dot of the angle to, and the index of, the target we think we were closest to.
-    (batch_time_to_best_dot, batch_time_to_best_target) = torch.max(batch_target_time_to_dot, dim=-2)
-    return (batch_time_to_best_dot, batch_time_to_best_target)
+    (batch_time_to_best_loss, batch_time_to_best_target) = torch.min(target_batch_time_to_loss, dim=0)
+
+    return (batch_time_to_best_loss, batch_time_to_best_target)
 
 
 def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings):
@@ -177,16 +198,16 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings
         
 
     for batch in range(0, num_batches):
-        print(f"Evaluating {batch_size} models, batch {batch} of {num_batches}...", end='')
+        batch_string = f'Evaluating {batch_size} models, batch {batch+1} of {num_batches}, '
 
         # First, we create a bunch of models, with parameters that are random (except possibly ensuring we are pointing directly at one single observation).
 
         batch_to_model = AlignmentModel((batch_size,))
 
         if optimize_zenith_errors:
-            batch_to_model.randomize_zenith_error()
+            batch_to_model.randomize_zenith_error(np.deg2rad(settings.zenith_error_stdev_degrees))
         if optimize_mount_errors:
-            batch_to_model.randomize_mount_errors()
+            batch_to_model.randomize_mount_errors(np.deg2rad(settings.mount_errors_stdev_degrees))
 
         if settings.full_random:
             batch_to_model.randomize_encoder_offsets()
@@ -203,7 +224,7 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings
                 batch_to_model.encoder_offsets[:] = batch_to_raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
 
         # Okay, now our models are fully initialized.  Now figure out what stars each is closest to pointing to, and how close.
-        (batch_time_to_best_dot, batch_time_to_best_target) = compute_best_dot_and_target(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir)
+        (batch_time_to_best_loss, batch_time_to_best_target) = compute_best_loss_and_target(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir)
 
         if settings.refine_during_search_steps > 0:
             print('')
@@ -211,37 +232,36 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings
             batch_time_to_predicted_dir = target_time_to_predicted_dir[batch_time_to_best_target, torch.arange(num_observations)]
             time_modelbatch_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(1)
             time_modelbatch_to_predicted_dir = batch_time_to_predicted_dir.swapaxes(0, 1)
-            refine_alignment(batch_to_model, time_modelbatch_to_raw_axis_values, time_modelbatch_to_predicted_dir, num_steps=settings.refine_during_search_steps, settings=settings)
+            refine_alignment(batch_to_model, time_modelbatch_to_raw_axis_values, time_modelbatch_to_predicted_dir, num_steps=settings.refine_during_search_steps, settings=settings, debug_string_prefix=batch_string)
 
             # Since we changed the models, the angles to their closest stars have changed (hopefully, improved),
             # so we must redo this:
-            (batch_time_to_best_dot, batch_time_to_best_target) = compute_best_dot_and_target(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir)
+            (batch_time_to_best_loss, batch_time_to_best_target) = compute_best_loss_and_target(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir)
 
-            print('After refining,', end='')
+            print('After refining, ', end='')
+        else:
+            print(batch_string, end='')
 
-
-        # Compute the loss for each model, which is the RMS of the angles between each observation and the nearest target
-        batch_time_to_lowest_angle = torch.acos(torch.clamp(batch_time_to_best_dot, -1.0, 1.0))
-        batch_to_loss = batch_time_to_lowest_angle.square().mean(dim=-1).sqrt()
+        batch_to_loss = compute_model_losses(batch_time_to_best_loss, time_dim=-1)
 
         # Get the loss of, and index of, the best model.
         (best_loss_in_batch, best_batch_index) = torch.min(batch_to_loss, dim=-1)
 
         # Extract that model from the batch and save it off if it's the best so far.
         if best_loss_in_batch < best_loss:
-            print(" new best", end='')
+            print("new best", end='')
             best_loss = best_loss_in_batch
             best_time_to_target = batch_time_to_best_target[best_batch_index, :]
             best_model = AlignmentModel.choose_submodel(batch_to_model, best_batch_index)
         else:
-            print(" kept old", end='')
+            print("kept old", end='')
 
-        print(f" loss {best_loss} with assignments {best_time_to_target} with model {best_batch_index}")
+        print(f" loss {best_loss} with assignments {best_time_to_target}")
 
     return best_model, best_time_to_target
 
 
-def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_to_predicted_dir, num_steps, settings):
+def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_to_predicted_dir, num_steps, settings, debug_string_prefix = ''):
     num_observations = time_modelbatch_to_raw_axis_values.shape[0]
 
     params_to_optimize = [model.encoder_offsets]
@@ -262,22 +282,17 @@ def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_
         optimizer.zero_grad()
         time_modelbatch_to_observed_dir = model.dir_given_raw_axis_values(time_modelbatch_to_raw_axis_values)
         
-        # dividing by num_observations rather than taking mean so that the learning rate works similarly regardless of batch size       
-        loss = torch.sum((time_modelbatch_to_observed_dir - time_modelbatch_to_predicted_dir).square()) / num_observations
+        time_modelbatch_to_loss = compute_dir_losses(time_modelbatch_to_observed_dir, time_modelbatch_to_predicted_dir)
+        modelbatch_to_loss = compute_model_losses(time_modelbatch_to_loss, time_dim=0)
+        loss = torch.mean(modelbatch_to_loss)
         
         loss.backward()
         optimizer.step()
 
         if step < 10 or step % int(num_steps / 10) == int(num_steps / 10) - 1 or step == num_steps - 1:
             with torch.no_grad():
-                # Hmm - I'd think this angle based loss would be better, but it gives NaNs on Adam and RMSProp,
-                # and doesn't behave well with SGD.  So just use it for printing...
-                time_modelbatch_to_dot = torch.einsum('...d,...d->...', time_modelbatch_to_observed_dir, time_modelbatch_to_predicted_dir)
-                time_modelbatch_to_angle = torch.acos(torch.clamp(time_modelbatch_to_dot, -1.0, 1.0))
-                modelbatch_to_loss_sq = time_modelbatch_to_angle.square().mean(dim=0)
-                min_loss_sq, min_loss_sq_index = modelbatch_to_loss_sq.min(dim=-1)
-
-                print(f'Step {step + 1} of {num_steps}, loss {loss}, best angle loss was {min_loss_sq.sqrt()} with model {min_loss_sq_index}')
+                min_loss, min_loss_index = modelbatch_to_loss.min(dim=-1)
+                print(f'{debug_string_prefix}step {step + 1} of {num_steps}: avg loss {loss:.3e}, best loss {min_loss:.3e} with model {min_loss_index}')
 
 def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
     num_observations = len(alignment_data)
@@ -309,16 +324,17 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
                 dir = dir / torch.linalg.norm(dir, dim=-1, keepdims=True)
                 time_to_predicted_dir.append(dir)
             time_to_predicted_dir = torch.stack(time_to_predicted_dir)
-            too_low = torch.max(time_to_predicted_dir[:, 2]) < min_z
-            too_high = torch.min(time_to_predicted_dir[:, 2]) > max_z
-            if not too_high and not too_low:
+            all_too_low = torch.max(time_to_predicted_dir[:, 2]) < min_z
+            all_too_high = torch.min(time_to_predicted_dir[:, 2]) > max_z
+            if not all_too_high and not all_too_low:
                 target_time_to_predicted_dir.append(time_to_predicted_dir)
                 filtered_targets.append(target)
-            else:
-                pass
         target_time_to_predicted_dir = torch.stack(target_time_to_predicted_dir)
 
     print(f"Filtered down to {len(filtered_targets)} targets.");
+
+    for index, target in enumerate(filtered_targets):
+        print(f'targets[{index}] = {target.display_name}')
 
     print("Running random alignment...")
     alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings=settings)
@@ -326,14 +342,13 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
     print("Identification:")
     for time_index, filtered_target_index in enumerate(time_to_target):
         target = filtered_targets[filtered_target_index]
-        print(f"\tObservation {time_index} was {target.display_name}")
+        print(f"\tObservation {time_index+1} was {target.display_name}")
         alignment_data[time_index].reconstructed_target = target
 
     with torch.no_grad():
         time_to_predicted_dir = target_time_to_predicted_dir[time_to_target, torch.arange(num_observations)]
 
-    print("Refining alignment...")
-    refine_alignment(alignment, time_to_raw_axis_values, time_to_predicted_dir, num_steps=settings.final_refine_steps, settings=settings)
+    refine_alignment(alignment, time_to_raw_axis_values, time_to_predicted_dir, num_steps=settings.final_refine_steps, settings=settings, debug_string_prefix="Refining alignment: ")
 
     print("Accuracy:")
     with torch.no_grad():
@@ -341,7 +356,8 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
             target = filtered_targets[filtered_target_index]
             predicted_dir = time_to_predicted_dir[time_index]
             modeled_dir = alignment.dir_given_raw_axis_values(time_to_raw_axis_values[time_index])
-            loss = (predicted_dir - modeled_dir).square().sum().item()
+            losses = compute_dir_losses(predicted_dir, modeled_dir)
+            loss = losses.sum().item()
             misalignment_rad = torch.asin(torch.clamp(torch.linalg.norm(torch.linalg.cross(predicted_dir, modeled_dir), dim=-1), -1.0, 1.0))
 
             alignment_data[time_index].reconstructed_target = target
@@ -443,7 +459,7 @@ class AlignmentModel(torch.nn.Module):
         with torch.no_grad():
             self.encoder_offsets[:] = torch.rand(self.batch_shape + (2,)) * 2 * math.pi
 
-    def randomize_zenith_error(self, stdev_radians = math.radians(1.0)):
+    def randomize_zenith_error(self, stdev_radians = math.radians(3.0)):
         with torch.no_grad():
             self.zenith_pitch[...] = torch.randn(self.batch_shape) * stdev_radians
             self.zenith_roll[...] = torch.rand(self.batch_shape) * stdev_radians

@@ -17,6 +17,7 @@ class Target:
         self.prev_target = None
         self.score = -float('inf')
         self.display_columns = {}
+        self.use_for_alignment = False
 
     @classmethod
     def from_gps(cls, lat_deg, lon_deg, alt_m = 0):
