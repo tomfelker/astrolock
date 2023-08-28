@@ -152,3 +152,10 @@ So, why didn't the alignment work?
 
         So the problem is, with more stars, we can make wrong assumptions about the other stars, unless we were
         very nearly correct about our zenith or other errors...
+
+        Looking at where it fails exactly, when the magnitude limit is raised to 2.72, we include:
+                Kaus Media (HIP 89931) 
+                Tarazed (HIP 97278)
+        and Tarazed is quite close to Altair, which is the correct one.  But Tarazed is not part of any of the bad solutions.
+        So why does including it somehow disable the real solution?
+        What's weird is - even in "full random" mode, this seems to occur...
