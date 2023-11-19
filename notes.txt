@@ -159,3 +159,14 @@ So, why didn't the alignment work?
         and Tarazed is quite close to Altair, which is the correct one.  But Tarazed is not part of any of the bad solutions.
         So why does including it somehow disable the real solution?
         What's weird is - even in "full random" mode, this seems to occur...
+
+        So, implemented brute_align, which does a brute force search over all combinations of stars... this is of course infeasible,
+        so it actually has a bracket of the best ones found so far.  The algorithm is basically:
+
+        for each new observation:
+                in batches, combine each target with the previous bracket
+                refine that a bit
+                take the top k of those for the new bracket
+
+        So then the question becomes, how big should the bracket be?  In my experiments, where I believe the correct assignment above
+        is the lowest loss globally (haven't verified this)

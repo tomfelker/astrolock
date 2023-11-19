@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn
 import itertools
+from astrolock.model.util import *
 
 class AlignmentSettings:
     def __init__(self):
@@ -16,8 +17,7 @@ class AlignmentSettings:
 
         self.min_alt = -20.0 * u.deg
         self.max_alt = 89.0 * u.deg        
-        self.num_batches = 50
-        self.num_closest = 3
+        self.num_batches = 100
         self.refine_during_search_steps = 1000
         self.full_random = True
         self.full_random_batch_size=5000
@@ -33,12 +33,22 @@ class AlignmentSettings:
 class BruteAlignmentSettings:
     def __init__(self):
         self.max_batch_size = 10000
-        self.bracket_size = 10
-        self.refine_steps = 1000
+        #self.bracket_size = 500  # our favorite answer went away with 5 - todo, debug where it is
+        self.refine_steps = 100 # our favorite model doesn't win 'till 700 or so
+
+
+        self.bracket_quantile = .02
 
         self.optimize_zenith_errors = True
-        self.optimize_mount_errors = True
+        self.optimize_mount_errors = False
         self.optimize_refraction = False
+
+        self.debug_time_to_target = None
+        # Arcturus, Altair, Vega
+        # at limiting mag 2:
+        #self.debug_time_to_target = [12, 21, 20]
+        # at limiting mag 3:
+        #self.debug_time_to_target = [50, 104, 97]
 
 class AlignmentDatum:
     """
@@ -152,9 +162,11 @@ def compute_dir_losses(predicted_dirs, observed_dirs):
     return losses
 
 def compute_model_losses(dir_losses, time_dim):
+    model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
+
     #model_losses = dir_losses.mean(dim=time_dim)
     #model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
-    model_losses = dir_losses.square().mean(dim=time_dim).square()
+    #model_losses = dir_losses.square().mean(dim=time_dim).square()
 
     return model_losses
 
@@ -288,78 +300,110 @@ def brute_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings 
     num_targets, num_times, num_spatial_dimensions = target_time_to_predicted_dir.shape
 
     # this is our "bracket" holding the target assignments that are currently best.
-    # although in the first iteration, it's size is num_targets rather than settings.bracket_size
-    bracket_time_to_target = torch.arange(num_targets, dtype=torch.int64).unsqueeze(1)
-    bracket_to_loss = torch.full(size=(num_targets,), fill_value=float('inf'))
-    bracket_to_model = AlignmentModel((num_targets,))
-
-    # init the models, assuming we were pointing at the first target
-
-    first_raw_axis_values = time_to_raw_axis_values[0].unsqueeze(0)
-    bracket_to_first_predicted_dir = target_time_to_predicted_dir[:, 0, :]
-    with torch.no_grad():
-        bracket_to_model.encoder_offsets[:] = first_raw_axis_values - bracket_to_model.raw_axis_values_given_dir(bracket_to_first_predicted_dir)
+    # although in the first iteration, it's size is num_targets rather than the bracket size
+    prev_bracket_time_to_target = torch.arange(num_targets, dtype=torch.int64).unsqueeze(1)
+    prev_bracket_to_model = None
 
     # adding each successive observation
-    for new_time in range(1, num_times):        
+    for current_step_num_times in range(2, num_times + 1):
+        
+        debug_partial_time_to_target = None
+        if settings.debug_time_to_target is not None:
+            debug_partial_time_to_target = torch.tensor(settings.debug_time_to_target[0:current_step_num_times], dtype=torch.int64)
 
-        print(f'Calculating observation {new_time+1} of {num_times}')
+        # Figure out how big the current bracket should be, so it includes the best settings.bracket_quantile of the assignments.
+        prev_bracket_size = prev_bracket_time_to_target.shape[0]
+        total_combinations = prev_bracket_size * num_targets
+        bracket_size = int(math.ceil(total_combinations * settings.bracket_quantile))
+        bracket_time_to_target = None
 
-        assignment_pairs = itertools.product(bracket_time_to_target.unbind(0), torch.arange(num_targets))
+        print(f'Considering first {current_step_num_times} of {num_times} observations with a bracket size of {bracket_size}')
+
+        assignment_pairs = itertools.product(range(prev_bracket_time_to_target.shape[0]), range(num_targets))
         for assignment_pairs_in_batch in batched(assignment_pairs, settings.max_batch_size):
             batch_size = len(assignment_pairs_in_batch)
-            batch_time_to_target = torch.zeros(size=(batch_size, new_time + 1), dtype=torch.int64)
+            batch_time_to_target = torch.zeros(size=(batch_size, current_step_num_times), dtype=torch.int64)
             batch_to_model = AlignmentModel((batch_size,))
 
-            print('starting a batch')
-            for batch_index, assignment_pair in enumerate(assignment_pairs_in_batch):
-                (old_assignment, new_assignment) = assignment_pair
-                batch_time_to_target[batch_index, 0 : new_time] = old_assignment
-                batch_time_to_target[batch_index, new_time] = new_assignment
-                #print(f'adding {old_assignment} and {new_assignment}')
+            print(f'Starting a batch of size {batch_size}')
 
-            #print(f'Computing losses for {batch_time_to_target} ')
+            debug_batch_index = None
+            for batch_index, (old_bracket_index, new_assignment) in enumerate(assignment_pairs_in_batch):
+                old_assignments = prev_bracket_time_to_target[old_bracket_index]
+                batch_time_to_target[batch_index, :current_step_num_times - 1] = old_assignments
+                batch_time_to_target[batch_index, -1] = new_assignment
+                if prev_bracket_to_model is not None:
+                    # this means:
+                    #batch_to_model[batch_index] = bracket_to_model[old_bracket_index]
+                    batch_to_model.assign_submodel(batch_index, prev_bracket_to_model, old_bracket_index)
+                #print(f'{batch_index}: {batch_time_to_target[batch_index]}')
+                if debug_partial_time_to_target is not None and (batch_time_to_target[batch_index] == debug_partial_time_to_target).all():
+                    debug_batch_index = batch_index
+                    print(f'\tIncluding debug assignments {batch_time_to_target[batch_index]} at index {batch_index}')
         
             indices=batch_time_to_target.unsqueeze(-1).expand((-1, -1, num_spatial_dimensions))
             batch_time_to_predicted_dir = torch.gather(input=target_time_to_predicted_dir, dim=0, index=indices)
 
-
+            if prev_bracket_to_model is None:
+                # Init our batch models with the average of the encoder offsets they'd need to point at the already
+                # assigned targets.  We could instead initialize with the model from the previous step, but that seems
+                # a bit less symmetrical, and more complex to implement.
+                with torch.no_grad():
+                    for init_time in range(0, current_step_num_times):
+                        raw_axis_values = time_to_raw_axis_values[init_time].unsqueeze(0)
+                        batch_to_predicted_dir = batch_time_to_predicted_dir[:, init_time, :]
+                        with torch.no_grad():
+                            batch_to_model.encoder_offsets[:] += raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
+                    batch_to_model.encoder_offsets[:] /= current_step_num_times
             
 
-
+            # swizzle things a bit for refine_alignment()
             time_batch_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(1)            
-            time_batch_to_observed_dir = batch_to_model.dir_given_raw_axis_values(time_batch_to_raw_axis_values)
-            batch_time_to_observed_dir = time_batch_to_observed_dir.permute((1, 0, 2))
             time_batch_to_predicted_dir = batch_time_to_predicted_dir.permute((1, 0, 2))
+            refine_alignment(batch_to_model, time_batch_to_raw_axis_values[0:current_step_num_times, :, :], time_batch_to_predicted_dir, num_steps=settings.refine_steps, settings=settings)
 
-            refine_alignment(batch_to_model, time_batch_to_raw_axis_values[0:new_time+1, :, :], time_batch_to_predicted_dir, num_steps=settings.refine_steps, settings=settings)
-
-            # after refining, must recompute
-            # todo: deuglify
+            # after refining, compute the losses
             time_batch_to_observed_dir = batch_to_model.dir_given_raw_axis_values(time_batch_to_raw_axis_values)
             batch_time_to_observed_dir = time_batch_to_observed_dir.permute((1, 0, 2))
-
-            batch_time_to_loss = compute_dir_losses(batch_time_to_predicted_dir, batch_time_to_observed_dir[:, 0:new_time+1, :])
-
+            batch_time_to_loss = compute_dir_losses(batch_time_to_predicted_dir, batch_time_to_observed_dir[:, 0:current_step_num_times, :])
             batch_to_loss = compute_model_losses(batch_time_to_loss, time_dim=1)
-            #batch_to_loss = batch_time_to_loss.mean(dim=1, keepdim=False)
 
-            # now merge with the bracket
-            if bracket_time_to_target.shape[1] == batch_time_to_target.shape[1]:
-                merged_time_to_target = torch.cat((bracket_time_to_target, batch_time_to_target), dim=0)
-                merged_to_loss = torch.cat((bracket_to_loss, batch_to_loss), dim=0)
-                merged_to_model = AlignmentModel.concatenate_batches(bracket_to_model, batch_to_model)
+            if debug_batch_index is not None:
+                print(f'After refinement, debug assignment loss was {batch_to_loss[debug_batch_index]}, ({batch_time_to_loss[debug_batch_index]}), model: {AlignmentModel.choose_submodel(batch_to_model, debug_batch_index)}')
+                debug_best_loss, debug_best_loss_index = torch.min(batch_to_loss, dim=0)
+                print(f'vs best loss was model {debug_best_loss_index}, loss {batch_to_loss[debug_best_loss_index]}, ({batch_time_to_loss[debug_best_loss_index]}), model: {AlignmentModel.choose_submodel(batch_to_model, debug_best_loss_index)}')
+
+            # Now merge this batch with the bracket
+            if bracket_time_to_target is not None:
+                merged_time_to_target = torch.cat((batch_time_to_target, bracket_time_to_target), dim=0)
+                merged_to_loss = torch.cat((batch_to_loss, bracket_to_loss), dim=0)
+                merged_to_model = AlignmentModel.concatenate_batches(batch_to_model, bracket_to_model)
             else:
+                # for the first batch in each step, the bracket is empty
                 merged_time_to_target = batch_time_to_target
                 merged_to_loss = batch_to_loss
                 merged_to_model = batch_to_model
-            
-            best_losses, best_indices = merged_to_loss.topk(k=min(settings.bracket_size, merged_to_loss.shape[0]), dim=0, largest=False)
 
+            # pare the bracket back down to its proper size            
+            best_losses, best_indices = merged_to_loss.topk(k=min(bracket_size, merged_to_loss.shape[0]), dim=0, largest=False)
             bracket_to_loss = best_losses
             bracket_time_to_target = merged_time_to_target[best_indices]
             bracket_to_model = AlignmentModel.choose_submodels(merged_to_model, best_indices)
-    
+
+            if debug_batch_index is not None:
+                best_indices_equal_debug_batch_index = (best_indices == debug_batch_index)
+                if best_indices_equal_debug_batch_index.any():
+                    place = best_indices_equal_debug_batch_index.nonzero()[0].item() + 1
+                    print(f'Debug assignment made the cut, {ordinal(place)} place out of {bracket_size}, in the top {place / total_combinations} fraction of all considered on this step')
+                else:
+                    print("Debug assignment didn't make the cut")
+
+        prev_bracket_time_to_target = bracket_time_to_target
+        prev_bracket_to_model = bracket_to_model
+
+
+    # todo: maybe refine the final bracket further
+
     # now we're done, extract the one we like
     best_loss_in_bracket, best_bracket_index = torch.min(bracket_to_loss, dim=0)
     best_time_to_target = bracket_time_to_target[best_bracket_index]
@@ -375,13 +419,13 @@ def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_
 
     params_to_optimize = [model.encoder_offsets]
 
-    if settings.optimize_zenith_errors and num_observations >= 3:
+    if settings.optimize_zenith_errors and num_observations >= 2:
         params_to_optimize.append(model.zenith_pitch)
         params_to_optimize.append(model.zenith_roll)
-    if settings.optimize_mount_errors and num_observations >= 4:
+    if settings.optimize_mount_errors and num_observations >= 3:
         params_to_optimize.append(model.collimation_error_in_azimuth)
         params_to_optimize.append(model.non_perpendicular_axes_error)
-    if settings.optimize_refraction and num_observations >= 5:
+    if settings.optimize_refraction and num_observations >= 4:
         params_to_optimize.append(model.extra_refraction_coefficient)
 
     
@@ -568,9 +612,13 @@ class AlignmentModel(torch.nn.Module):
         submodels = cls(batch_shape=indices.shape)
         for name, param in submodels.named_parameters():
             with torch.no_grad():
-                attr = getattr(batched_model, name)
-                param[...] = attr[indices, ...]
+                param[...] = getattr(batched_model, name)[indices, ...]
         return submodels
+    
+    def assign_submodel(self, self_index, other, other_index):
+        for name, param in self.named_parameters():
+            with torch.no_grad():
+                param[self_index, ...] = getattr(other, name)[other_index, ...]
 
     @classmethod
     def concatenate_batches(cls, first_model, second_model):

@@ -67,3 +67,10 @@ def sleep_inhibit():
 def sleep_uninhibit():
     if os.name == 'nt':
         ctypes.windll.kernel32.SetThreadExecutionState(ExecutionState.ES_CONTINUOUS)
+
+def ordinal(n: int):
+    if 11 <= (n % 100) <= 13:
+        suffix = 'th'
+    else:
+        suffix = ['th', 'st', 'nd', 'rd', 'th'][min(n % 10, 4)]
+    return str(n) + suffix
