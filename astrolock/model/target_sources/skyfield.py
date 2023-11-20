@@ -119,7 +119,7 @@ class SkyfieldTargetSource(target_source.TargetSource):
 
         self.notify_targets_updated()
 
-    def load_stars(self, loader, mag_limit = 2):
+    def load_stars(self, loader, mag_limit = 3):
         with loader.open(skyfield.data.hipparcos.URL) as f:
             stars_df = skyfield.data.hipparcos.load_dataframe(f)
 

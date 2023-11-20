@@ -16,14 +16,14 @@ class AlignmentSettings:
         self.optimize_refraction = False
 
         self.min_alt = -20.0 * u.deg
-        self.max_alt = 89.0 * u.deg        
-        self.num_batches = 100
-        self.refine_during_search_steps = 1000
-        self.full_random = True
+        self.max_alt = 89.0 * u.deg
+        self.num_batches = 10
+        self.refine_during_search_steps = 100
+        self.full_random = False
         self.full_random_batch_size=5000
-        self.final_refine_steps = 1000
+        self.final_refine_steps = 5000
 
-        self.zenith_error_stdev_degrees = 6.0
+        self.zenith_error_stdev_degrees = 3.0
         self.mount_errors_stdev_degrees = 0.1
         
         # TODO:
@@ -33,11 +33,11 @@ class AlignmentSettings:
 class BruteAlignmentSettings:
     def __init__(self):
         self.max_batch_size = 10000
-        #self.bracket_size = 500  # our favorite answer went away with 5 - todo, debug where it is
-        self.refine_steps = 100 # our favorite model doesn't win 'till 700 or so
+        self.bracket_size = 50  # our favorite answer went away with 5 - todo, debug where it is
+        self.refine_steps = 1000 # our favorite model doesn't win 'till 700 or so
 
 
-        self.bracket_quantile = .02
+        #self.bracket_quantile = .02
 
         self.optimize_zenith_errors = True
         self.optimize_mount_errors = False
@@ -155,17 +155,28 @@ def wrap_to_pi(theta):
     return ret
 
 def compute_dir_losses(predicted_dirs, observed_dirs):
+    # this one seems to work
+    #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False)
 
-    #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False)    
+    # works okay but unmotivated
     #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).square()
-    losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).sqrt()    
+
+    # This is the one I'd choose, should be proportional to small angles - but
+    # this one gives nans a lot?  no idea why - the expression itself can never nan
+    # seems to be something to do with the gradient of sqrt(0) being infinite - so NaNs may come from
+    # when we actually succeed exactly.
+    #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).sqrt()
+    # but, meh, epsilon does the trick...
+    losses = (torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False) + 1.175494e-38).sqrt()
+    
+    # this one works (and was the original one), but seems like it wouldn't be as numerically stable
+    #losses = 1 - torch.einsum('...d,...d->...', predicted_dirs, observed_dirs)
+
     return losses
 
 def compute_model_losses(dir_losses, time_dim):
-    model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
-
     #model_losses = dir_losses.mean(dim=time_dim)
-    #model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
+    model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
     #model_losses = dir_losses.square().mean(dim=time_dim).square()
 
     return model_losses
@@ -314,7 +325,10 @@ def brute_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings 
         # Figure out how big the current bracket should be, so it includes the best settings.bracket_quantile of the assignments.
         prev_bracket_size = prev_bracket_time_to_target.shape[0]
         total_combinations = prev_bracket_size * num_targets
-        bracket_size = int(math.ceil(total_combinations * settings.bracket_quantile))
+        #if settings.bracket_quantile is not None:
+        #    bracket_size = int(math.ceil(total_combinations * settings.bracket_quantile))
+        if settings.bracket_size is not None:
+            bracket_size = settings.bracket_size
         bracket_time_to_target = None
 
         print(f'Considering first {current_step_num_times} of {num_times} observations with a bracket size of {bracket_size}')
@@ -489,7 +503,7 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
     for index, target in enumerate(filtered_targets):
         print(f'targets[{index}] = {target.display_name}')
 
-    if True:
+    if False:
         print("Running brute alignment...")
         alignment, time_to_target = brute_align(target_time_to_predicted_dir, time_to_raw_axis_values)
     else:
