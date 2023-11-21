@@ -17,14 +17,16 @@ class AlignmentSettings:
 
         self.min_alt = -20.0 * u.deg
         self.max_alt = 89.0 * u.deg
-        self.num_batches = 10
-        self.refine_during_search_steps = 100
+        self.num_batches = 50
+        self.refine_during_search_steps = 0
+
         self.full_random = False
         self.full_random_batch_size=5000
-        self.final_refine_steps = 5000
+        self.final_refine_steps = 1000
 
-        self.zenith_error_stdev_degrees = 3.0
+        self.zenith_error_stdev_degrees = 6.0
         self.mount_errors_stdev_degrees = 0.1
+        self.encoder_fuzz_stdev_degrees = 0.1
         
         # TODO:
         #self.is_equatorial = False
@@ -156,7 +158,7 @@ def wrap_to_pi(theta):
 
 def compute_dir_losses(predicted_dirs, observed_dirs):
     # this one seems to work
-    #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False)
+    losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False)
 
     # works okay but unmotivated
     #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).square()
@@ -167,7 +169,8 @@ def compute_dir_losses(predicted_dirs, observed_dirs):
     # when we actually succeed exactly.
     #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).sqrt()
     # but, meh, epsilon does the trick...
-    losses = (torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False) + 1.175494e-38).sqrt()
+    #losses = (torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False) + 1.175494e-38).sqrt()
+    #losses = (torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False) + 1e-10).sqrt()
     
     # this one works (and was the original one), but seems like it wouldn't be as numerically stable
     #losses = 1 - torch.einsum('...d,...d->...', predicted_dirs, observed_dirs)
@@ -175,8 +178,9 @@ def compute_dir_losses(predicted_dirs, observed_dirs):
     return losses
 
 def compute_model_losses(dir_losses, time_dim):
-    #model_losses = dir_losses.mean(dim=time_dim)
-    model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
+    model_losses = dir_losses.mean(dim=time_dim)
+    #model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
+    #model_losses = dir_losses.square().mean(dim=time_dim)
     #model_losses = dir_losses.square().mean(dim=time_dim).square()
 
     return model_losses
@@ -227,7 +231,7 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings
     else:
         # Make a batch of models, one for each guess of the form "we were looking directly at this target index at this time index"
         batch_size = num_targets * num_observations
-        if optimize_zenith_errors or optimize_mount_errors or settings.full_random:
+        if optimize_zenith_errors or optimize_mount_errors or settings.full_random or settings.encoder_fuzz_stdev_degrees != 0:
             num_batches = settings.num_batches
         else:
             # if we're only checking our stepper offsets, then all the batches would be initialized the same anyway.
@@ -260,8 +264,14 @@ def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings
             with torch.no_grad():
                 batch_to_model.encoder_offsets[:] = batch_to_raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
 
+                if settings.encoder_fuzz_stdev_degrees != 0:
+                    batch_to_model.encoder_offsets[:] += torch.normal(mean=0, std=np.deg2rad(settings.encoder_fuzz_stdev_degrees), size=batch_to_raw_axis_values.size())
+
         # Okay, now our models are fully initialized.  Now figure out what stars each is closest to pointing to, and how close.
         (batch_time_to_best_loss, batch_time_to_best_target) = compute_best_loss_and_target(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir)
+
+        # hmm, todo, refine encoder offsets based on these assignments?
+        # be careful with averaging, modular arithmetic necessary
 
         if settings.refine_during_search_steps > 0:
             print('')
