@@ -170,3 +170,28 @@ So, why didn't the alignment work?
 
         So then the question becomes, how big should the bracket be?  In my experiments, where I believe the correct assignment above
         is the lowest loss globally (haven't verified this)
+
+Current Algorithms
+        random_align():
+                for some batches with random tripod tilts etc:
+                        the batch index means:
+                        for each target
+                        for each observation
+                                assume that observation was while pointing at that target
+                                compute the raw angles that would imply
+                                figure out full target assignments and losses
+                                optionally refine the models
+                        choose the best
+New Algorithms
+        so compute_best_loss_and_target just gives the one best, what if it gave top k?
+        we could then test all perms of those k, O(k^obs)
+
+        top_align():
+                for random samples of tripod tilts and other model params
+                        for each target
+                        for each observation
+                                assign encoder offsets based on assumption of pointing exactly at this target for this observation
+                                for each other target
+                                        find top k closest stars
+                                        get permutations
+                                                O((targets^2*observations*k^targets)

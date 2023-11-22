@@ -11,22 +11,27 @@ from astrolock.model.util import *
 class AlignmentSettings:
     def __init__(self):
         self.optimize_zenith_errors = True
-        self.optimize_mount_errors = True
+        self.optimize_mount_errors = False
         # TODO: don't think this is correct until we can invert it also...
         self.optimize_refraction = False
 
         self.min_alt = -20.0 * u.deg
         self.max_alt = 89.0 * u.deg
         self.num_batches = 50
-        self.refine_during_search_steps = 0
+        self.refine_during_search_steps = 100
 
         self.full_random = False
         self.full_random_batch_size=5000
         self.final_refine_steps = 1000
 
+        self.model_samples = 1
+        self.max_batch_size = 10000
+        self.top_k = 50
+        self.max_loss_to_consider = np.deg2rad(3.0)
+
         self.zenith_error_stdev_degrees = 6.0
         self.mount_errors_stdev_degrees = 0.1
-        self.encoder_fuzz_stdev_degrees = 0.1
+        self.encoder_fuzz_stdev_degrees = 0.5
         
         # TODO:
         #self.is_equatorial = False
@@ -158,7 +163,7 @@ def wrap_to_pi(theta):
 
 def compute_dir_losses(predicted_dirs, observed_dirs):
     # this one seems to work
-    losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False)
+    #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False)
 
     # works okay but unmotivated
     #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).square()
@@ -170,7 +175,7 @@ def compute_dir_losses(predicted_dirs, observed_dirs):
     #losses = torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False).sqrt()
     # but, meh, epsilon does the trick...
     #losses = (torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False) + 1.175494e-38).sqrt()
-    #losses = (torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False) + 1e-10).sqrt()
+    losses = (torch.sum((predicted_dirs - observed_dirs).square(), dim=-1, keepdim=False) + 1e-6).sqrt()
     
     # this one works (and was the original one), but seems like it wouldn't be as numerically stable
     #losses = 1 - torch.einsum('...d,...d->...', predicted_dirs, observed_dirs)
@@ -178,9 +183,9 @@ def compute_dir_losses(predicted_dirs, observed_dirs):
     return losses
 
 def compute_model_losses(dir_losses, time_dim):
-    model_losses = dir_losses.mean(dim=time_dim)
+    #model_losses = dir_losses.mean(dim=time_dim)
     #model_losses = dir_losses.square().mean(dim=time_dim).sqrt()
-    #model_losses = dir_losses.square().mean(dim=time_dim)
+    model_losses = dir_losses.square().mean(dim=time_dim)
     #model_losses = dir_losses.square().mean(dim=time_dim).square()
 
     return model_losses
@@ -202,6 +207,25 @@ def compute_best_loss_and_target(batch_to_model, time_to_raw_axis_values, target
     (batch_time_to_best_loss, batch_time_to_best_target) = torch.min(target_batch_time_to_loss, dim=0)
 
     return (batch_time_to_best_loss, batch_time_to_best_target)
+
+
+def compute_best_k_losses_and_targets(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir, k):
+    # At each time, for each model, figure out where it thinks it was pointing (time_batch_to_observed_dir).
+    time_batch_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(1)
+    time_batch_to_observed_dir = batch_to_model.dir_given_raw_axis_values(time_batch_to_raw_axis_values)
+
+    # todo swizzle better?    
+    target_time_batch_to_predicted_dir = target_time_to_predicted_dir.unsqueeze(2)
+    target_time_batch_to_observed_dir = time_batch_to_observed_dir.unsqueeze(0)
+
+    target_time_batch_to_loss = compute_dir_losses(target_time_batch_to_predicted_dir, target_time_batch_to_observed_dir)
+
+    target_batch_time_to_loss = target_time_batch_to_loss.permute((0, 2, 1))
+
+    # For each model at each time, find the dot of the angle to, and the index of, the target we think we were closest to.
+    (k_batch_time_to_loss, k_batch_time_to_target) = torch.topk(target_batch_time_to_loss, dim=0, k=k, largest=False)
+
+    return (k_batch_time_to_loss, k_batch_time_to_target)
 
 
 def random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings):
@@ -378,6 +402,7 @@ def brute_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings 
                         batch_to_predicted_dir = batch_time_to_predicted_dir[:, init_time, :]
                         with torch.no_grad():
                             batch_to_model.encoder_offsets[:] += raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
+                    # todo: not correct!  need to consider wrapping...
                     batch_to_model.encoder_offsets[:] /= current_step_num_times
             
 
@@ -436,6 +461,178 @@ def brute_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings 
     print(f'Selected model {best_bracket_index} with loss {best_loss_in_bracket}')
 
     return best_model, best_time_to_target
+
+
+
+
+
+
+
+
+
+
+
+
+
+def top_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings):
+    """
+    
+    """
+
+    num_targets, num_observations, num_spatial_dimensions = target_time_to_predicted_dir.shape
+    
+    optimize_zenith_errors = settings.optimize_zenith_errors and num_observations >= 3
+    optimize_mount_errors = settings.optimize_mount_errors and num_observations >= 4
+
+    
+    model_samples_per_batch = max(1, int(settings.max_batch_size / (num_targets * num_observations)))
+    num_batches = int(math.ceil(settings.model_samples / model_samples_per_batch))
+
+    batch_size = model_samples_per_batch * num_targets * num_observations
+
+    good_assignments = []
+    good_models = []
+
+    for batch in range(0, num_batches):
+        print(f'Evaluating {batch_size} models, batch {batch+1} of {num_batches}, doing math...')
+
+        # First, we create a bunch of models, with parameters that are random (except possibly ensuring we are pointing directly at one single observation).
+
+        batch_to_model = AlignmentModel((batch_size, ))
+
+        if optimize_zenith_errors:
+            batch_to_model.randomize_zenith_error(np.deg2rad(settings.zenith_error_stdev_degrees))
+        if optimize_mount_errors:
+            batch_to_model.randomize_mount_errors(np.deg2rad(settings.mount_errors_stdev_degrees))
+
+    
+        # This is copying our raw axis values (with known times but unknown target) into each target.
+        target_time_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(0).expand((num_targets, -1, -1))
+
+        # Reshape these so we can jam them through the batched model.
+        batch_to_raw_axis_values = target_time_to_raw_axis_values.unsqueeze(0).expand((model_samples_per_batch, -1, -1, -1)).reshape((batch_size, 2))
+        batch_to_predicted_dir = target_time_to_predicted_dir.unsqueeze(0).expand((model_samples_per_batch, -1, -1, -1)).reshape(batch_size, num_spatial_dimensions)
+        
+        # For each element in the batch (each assumption about which target and time we were looking at), what would our encoder offsets have needed to be?
+        with torch.no_grad():
+            batch_to_model.encoder_offsets[:] = batch_to_raw_axis_values - batch_to_model.raw_axis_values_given_dir(batch_to_predicted_dir)
+
+            if settings.encoder_fuzz_stdev_degrees != 0:
+                batch_to_model.encoder_offsets[:] += torch.normal(mean=0, std=np.deg2rad(settings.encoder_fuzz_stdev_degrees), size=batch_to_raw_axis_values.size())
+
+        (k_batch_time_to_loss, k_batch_time_to_target) = compute_best_k_losses_and_targets(batch_to_model, time_to_raw_axis_values, target_time_to_predicted_dir, k = settings.top_k)
+
+        print(f'Evaluating {batch_size} models, batch {batch+1} of {num_batches}, reading matches...')
+        add_good_assignments_magic(good_assignments, good_models, batch_to_model, k_batch_time_to_loss, k_batch_time_to_target, settings)
+
+    # now "batch" takes a different meaning, it's just the index into good_assignments, all the good sets of time->target mappings we found.
+    # todo: two functions!
+
+    batch_time_to_target = torch.tensor(good_assignments)
+    print(f"Found {len(batch_time_to_target)} total candidates, {len(set(good_assignments))} unique assignments")
+        
+    batch_size = batch_time_to_target.shape[0]
+    
+    batch_to_model = AlignmentModel((batch_size,))
+    for index, model in enumerate(good_models):
+        AlignmentModel.assign_submodel(batch_to_model, index, model)
+
+    indices=batch_time_to_target.unsqueeze(-1).expand((-1, -1, num_spatial_dimensions))
+    batch_time_to_predicted_dir = torch.gather(input=target_time_to_predicted_dir, dim=0, index=indices)
+
+    
+    # swizzle things a bit for refine_alignment()
+    time_batch_to_raw_axis_values = time_to_raw_axis_values.unsqueeze(1)            
+    time_batch_to_predicted_dir = batch_time_to_predicted_dir.permute((1, 0, 2))
+    refine_alignment(batch_to_model, time_batch_to_raw_axis_values, time_batch_to_predicted_dir, num_steps=settings.final_refine_steps, settings=settings)
+
+    # after refining, compute the losses
+    time_batch_to_observed_dir = batch_to_model.dir_given_raw_axis_values(time_batch_to_raw_axis_values)
+    batch_time_to_observed_dir = time_batch_to_observed_dir.permute((1, 0, 2))
+    batch_time_to_loss = compute_dir_losses(batch_time_to_predicted_dir, batch_time_to_observed_dir)
+    batch_to_loss = compute_model_losses(batch_time_to_loss, time_dim=1)
+
+    min_loss, min_loss_index = batch_to_loss.min(dim=-1)
+
+    best_model = AlignmentModel.choose_submodel(batch_to_model, min_loss_index)
+    best_time_to_target = batch_time_to_target[min_loss_index, ...]
+
+    return best_model, best_time_to_target
+
+
+def add_good_assignments(good_assignments, good_models, batch_to_model, k_batch_time_to_loss, k_batch_time_to_target, settings):
+    num_k, num_batches, num_times = k_batch_time_to_loss.shape
+    for batch in range(num_batches):
+        add_good_assignments_recursive(good_assignments, good_models, batch_to_model, k_batch_time_to_loss, k_batch_time_to_target, settings, (), batch)
+
+def add_good_assignments_recursive(good_assignments, good_models, batch_to_model, k_batch_time_to_loss, k_batch_time_to_target, settings, base_partial_assignment, batch):
+
+    num_k, num_batches, num_times = k_batch_time_to_loss.shape
+
+    time_to_check = len(base_partial_assignment)
+
+    for k in range(num_k):
+        if k_batch_time_to_loss[k, batch, time_to_check] <= settings.max_loss_to_consider:
+            assignment = base_partial_assignment + (k_batch_time_to_target[k, batch, time_to_check].item(), )
+            if time_to_check == num_times - 1:
+                good_assignments.append(assignment)
+                good_models.append(AlignmentModel.choose_submodel(batch_to_model, batch))
+            else:
+                add_good_assignments_recursive(good_assignments, good_models, batch_to_model, k_batch_time_to_loss, k_batch_time_to_target, settings, assignment, batch)
+            
+
+def add_good_assignments_magic(good_assignments, good_models, batch_to_model, k_batch_time_to_loss, k_batch_time_to_target, settings):
+    num_k, num_batches, num_times = k_batch_time_to_loss.shape
+    
+    for batch in range(num_batches):
+        dp = [([], 0)]  # List of (assignment as tuple, time_to_check)
+        time_to_check = 0
+        
+        while time_to_check < num_times:
+            new_dp = []
+            for assignment, time in dp:
+                k_losses = k_batch_time_to_loss[:, batch, time]
+                mask = k_losses <= settings.max_loss_to_consider
+                
+                for k in range(num_k):
+                    if mask[k]:
+                        k_assignment = k_batch_time_to_target[k, batch, time].item()
+                        new_assignment = (*assignment, k_assignment)  # Convert to tuple
+                        new_time = time + 1
+                        
+                        if new_time == num_times:
+                            good_assignments.append(new_assignment)  # Output as tuple
+                            good_models.append(AlignmentModel.choose_submodel(batch_to_model, batch))
+                        else:
+                            new_dp.append((new_assignment, new_time))
+            
+            dp = new_dp
+            time_to_check += 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def refine_alignment(model, time_modelbatch_to_raw_axis_values, time_modelbatch_to_predicted_dir, num_steps, settings, debug_string_prefix = ''):
@@ -516,9 +713,13 @@ def align(tracker, alignment_data, targets, settings=AlignmentSettings()):
     if False:
         print("Running brute alignment...")
         alignment, time_to_target = brute_align(target_time_to_predicted_dir, time_to_raw_axis_values)
-    else:
+    if False:
         print("Running random alignment...")
         alignment, time_to_target = random_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings=settings)
+    
+    if True:
+        print("Running top alignment...")
+        alignment, time_to_target = top_align(target_time_to_predicted_dir, time_to_raw_axis_values, settings=settings)
 
     print("Identification:")
     for time_index, filtered_target_index in enumerate(time_to_target):
@@ -639,7 +840,7 @@ class AlignmentModel(torch.nn.Module):
                 param[...] = getattr(batched_model, name)[indices, ...]
         return submodels
     
-    def assign_submodel(self, self_index, other, other_index):
+    def assign_submodel(self, self_index, other, other_index = None):
         for name, param in self.named_parameters():
             with torch.no_grad():
                 param[self_index, ...] = getattr(other, name)[other_index, ...]
