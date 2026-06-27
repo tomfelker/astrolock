@@ -1,9 +1,12 @@
 astropy >= 5.2
-tkinter
+numpy
+# tkinter ships with Python as stdlib; it is NOT installable via pip (used by the legacy GUI)
 pygame
 requests
 pyserial
 skyfield
 torch
 pandas
+dearpygui
+zwoasi
 

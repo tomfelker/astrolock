@@ -1,5 +1,7 @@
 **/__pycache__/**
 **/*.bsp
+sessions/
+.venv/
 .vs/**
 hip_main.dat
 data/skyfield_cache/**

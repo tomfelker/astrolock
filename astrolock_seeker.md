@@ -275,14 +275,23 @@ on disk, and the socket only carries *live control*.
 
 ### `astrolock_seeker_cam`
 
-Minimal, robust, fast. One process per camera.
+Minimal, robust, fast. One process per camera, and a **standalone-useful recorder** —
+point it at a config and it writes `.ser` segments; everything else is reconfigurable live.
 
-- Input: a config (camera index/serial, ROI, image type, exposure, gain, bayer pattern,
-  output dir).
-- Loop: `capture_video_frame()` → append raw bytes to `.ser` → append metadata line to
-  `.frames.jsonl`. Keep heavy processing out of here.
-- Control surface (MVP): fixed config + a clean stop signal. Live exposure/gain changes
-  can come later via the same command channel the backend uses.
+- Input: source config (camera index/ROI/exposure/gain/bayer or sim) + capture settings.
+- Loop: `capture()` → append raw bytes to the current `.ser` → append a `.frames.jsonl`
+  line (incl. the `important` flag). Keep heavy processing out of here.
+- **Settings** (CLI sets initial; the `--control-file` JSONL changes them live, read by a
+  small reader thread — works for a file or `-`/stdin):
+  - `frame-limit` (-1 unlimited): frames for the current file before rolling to the next.
+  - `file-limit` (1; -1 unlimited): how many files to capture; exit when 0.
+  - `important` (1; 0 = not recording): written per frame; the backend deletes only files
+    with **no** important frame.
+  - `exposure`/`gain`/`fps`: live-settable.
+  - `{"stop": true}` (or `file-limit` 0) ends it.
+- Files are timestamped per segment (`<segment_stamp>_<role>.ser`, ms resolution so they
+  sort), so the cam can roll over without clobbering. No stop/pause flag-files — it stops
+  via its control channel.
 
 ### `astrolock_seeker_detect`
 
@@ -496,21 +505,37 @@ fire-and-forget; **state changes are confirmed via `state.jsonl`, not the ack** 
 just says "received/valid").
 
 ```jsonc
-{ "type": "select_target", "id": 7, "candidate_id": 3 }          // or "px": [x, y]
+// implemented:
+{ "type": "set_rate", "az": <deg/s>, "alt": <deg/s> }            // manual slew (press-and-hold)
+{ "type": "stop" }                                              // zero rates
+{ "type": "estop" }                                             // zero + latch idle
+{ "type": "record", "on": true }                                // mark cam frames important (kept)
+{ "type": "capture", "role": "guide", "on": false }             // stop/(re)start a camera
+// aspirational (tracking/calibration, not yet wired):
+{ "type": "select_target", "candidate_id": 3 }                  // or "px": [x, y]
 { "type": "go" }                                                 // engage closed-loop tracking
-{ "type": "stop" }                                               // disengage; mount to zero rate
-{ "type": "estop" }                                              // emergency: zero + latch idle
-{ "type": "nudge_rate", "axis": 0, "delta_arcsec_s": 30 }        // manual rate bump (milestone 2)
-{ "type": "set_camera", "role": "guide", "exposure_us": 1000, "gain": 200 }
-{ "type": "calibrate", "step": "altitude_zero" }                 // record current alt encoder as level
-{ "type": "calibrate", "step": "set_boresight", "px": [1920, 1080] }  // guide px aligned to main center
-
-// ack:
-{ "type": "ack", "id": 7, "ok": true, "error": null }
+{ "type": "calibrate", "step": "altitude_zero" | "set_boresight", "px": [x, y] }
 ```
 
-The backend → cam control surface (exposure/gain/stop) carries the same `set_camera` /
-`stop` shapes, over a socket or a plain OS pipe/FIFO per the cam's simpler needs.
+**Two-tier control.** The socket above is the *live hub* (latency-sensitive, GUI ⇄ backend).
+The backend in turn drives each camera over a **per-cam control JSONL** (`control_<role>.jsonl`),
+which the cam tails — a file, consistent with everything else cams touch (no sockets, crash-
+resilient, replay-free since the backend truncates it per launch). The backend translates the
+socket commands into control lines:
+
+```jsonc
+// backend -> cam, in control_<role>.jsonl (merge semantics; only keys present change):
+{ "important": 1 }          // from record on/off
+{ "frame_limit": 600 }      // segment length / roll trigger
+{ "file_limit": 0 }         // graceful shutdown ("enough files")
+{ "stop": true }            // immediate finalize + exit
+{ "exposure_us": 1000, "gain": 200, "fps": 15 }
+```
+
+So *record* sets `important`, *capture off* sends `{stop:true}` (cam finalizes + exits) while
+*capture on* relaunches the cam (+ its detector); on exit the backend deletes any `.ser`
+segment whose sidecar has no important frame, and removes the session if nothing important
+remains.
 
 ## Calibration (MVP)
 
