@@ -1,0 +1,162 @@
+okay, at some point i broke this, so here's the correct answers to all the test data
+
+
+718ccd7d2516bc1ca32af24d02b0b2c685f37731 - good
+ca37ad31d18ec0b74593cfb7cd70d247b9db0a73 - good
+6445ad6bd0676062da42d40899dd1d625e9fafcd - good
+fb48d8b8795cb821863c9df48b0b273f9db895fa - bad?
+
+real_5x
+Accuracy:
+        Observation 0, Antares (HIP 80763), was off by 0.02993815654014063 deg
+        Observation 1, Dschubba (HIP 78401), was off by 0.006863132826566162 deg
+        Observation 2, Altair (HIP 97649), was off by 0.026800259913215 deg
+        Observation 3, Arcturus (HIP 69673), was off by 0.011049131653284836 deg
+        Observation 4, Alkaid (HIP 67301), was off by 0.015543007593443115 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [-97.07418 323.95294] deg
+        zenith_roll: -0.3093475117616491 deg
+        zenith_pitch: -0.7123690402776133 deg
+        non_perpendicular_axes_error: 0.269902662376723 deg
+        collimation_error_in_azimuth: 0.4738013648222047 deg
+        extra_refraction_coefficient: 0.0
+
+
+
+real_first
+Accuracy:
+        Observation 0, Antares (HIP 80763), was off by 0.01959060004044982 deg
+        Observation 1, Dschubba (HIP 78401), was off by 0.017001639847424296 deg
+        Observation 2, Altair (HIP 97649), was off by 0.0034160930165897606 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [262.52872 323.8907 ] deg
+        zenith_roll: -0.34969640071624986 deg
+        zenith_pitch: -0.76933116376908 deg
+        non_perpendicular_axes_error: 0.0 deg
+        collimation_error_in_azimuth: 0.0 deg
+        extra_refraction_coefficient: 0.0
+		
+		
+real5
+
+Accuracy:
+        Observation 0, SATURN BARYCENTER, was off by 0.007371359932290604 deg
+        Observation 1, Altair (HIP 97649), was off by 0.011830677216332202 deg
+        Observation 2, Rasalhague (HIP 86032), was off by 0.040424004360204366 deg
+        Observation 3, Altair (HIP 97649), was off by 0.004124169022839863 deg
+        Observation 4, Altair (HIP 97649), was off by 0.06842314756821508 deg
+        Observation 5, SATURN BARYCENTER, was off by 0.03970953589053062 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [104.18232  -29.992369] deg
+        zenith_roll: -0.03808649217868651 deg
+        zenith_pitch: 0.3811249558931082 deg
+        non_perpendicular_axes_error: -0.10961769264932142 deg
+        collimation_error_in_azimuth: -0.07233781312809102 deg
+        extra_refraction_coefficient: 0.0
+		
+		
+test_observations
+Accuracy:
+        Observation 0, Spica (HIP 65474), was off by 0.005721532824230316 deg
+        Observation 1, Algorab (HIP 60965), was off by 0.004542003677530744 deg
+        Observation 2, Arcturus (HIP 69673), was off by 0.0061910666415023715 deg
+        Observation 3, MOON, was off by 0.007962534816307026 deg
+        Observation 4, MARS BARYCENTER, was off by 0.00386260829594608 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [-0.21950881  0.01605925] deg
+        zenith_roll: -0.0006013440868679045 deg
+        zenith_pitch: -0.0030413560051230667 deg
+        non_perpendicular_axes_error: -0.19756275483515603 deg
+        collimation_error_in_azimuth: -0.2934698832623082 deg
+        extra_refraction_coefficient: 0.0
+		
+test_observations_with_fuzz
+Accuracy:
+        Observation 0, Spica (HIP 65474), was off by 0.00537419285878804 deg
+        Observation 1, Algorab (HIP 60965), was off by 0.004807538120438233 deg
+        Observation 2, Arcturus (HIP 69673), was off by 0.007888092257707832 deg
+        Observation 3, MOON, was off by 0.007574545553648587 deg
+        Observation 4, MARS BARYCENTER, was off by 0.007993730904928265 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [ 82.289505 132.75842 ] deg
+        zenith_roll: -0.0021654426075017807 deg
+        zenith_pitch: -0.002960656469640773 deg
+        non_perpendicular_axes_error: 0.24471620641016875 deg
+        collimation_error_in_azimuth: 0.31040581755703084 deg
+        extra_refraction_coefficient: 0.0
+
+test_stellarium_daytime_solar_system
+Accuracy:
+        Observation 0, MARS BARYCENTER, was off by 0.0012565787790000563 deg
+        Observation 1, VENUS, was off by 0.002973253382857953 deg
+        Observation 2, MERCURY, was off by 0.002609681921417812 deg
+        Observation 3, SUN, was off by 0.0008506259812535359 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [ 34.37098 184.61926] deg
+        zenith_roll: 0.5164420223671827 deg
+        zenith_pitch: -0.7177663304649514 deg
+        non_perpendicular_axes_error: 0.059997088700692806 deg
+        collimation_error_in_azimuth: 0.04992754224456267 deg
+        extra_refraction_coefficient: 0.0
+		
+woot
+Accuracy:
+        Observation 0, SATURN BARYCENTER, was off by 0.006276192626484616 deg
+        Observation 1, Altair (HIP 97649), was off by 0.020680460442683162 deg
+        Observation 2, Vega (HIP 91262), was off by 0.016329536559892478 deg
+        Observation 3, Deneb (HIP 102098), was off by 0.013459351331919615 deg
+        Observation 4, Polaris (HIP 11767), was off by 0.006962112206098498 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [262.0121  196.95357] deg
+        zenith_roll: -0.002281946024628761 deg
+        zenith_pitch: -0.010766487553155932 deg
+        non_perpendicular_axes_error: -0.04046433182477653 deg
+        collimation_error_in_azimuth: -0.05474293566618075 deg
+        extra_refraction_coefficient: 0.0
+		
+y_you_no_work
+Accuracy:
+        Observation 0, SATURN BARYCENTER, was off by 0.010821423384970259 deg
+        Observation 1, Altair (HIP 97649), was off by 0.009877017163847096 deg
+        Observation 2, Rasalhague (HIP 86032), was off by 0.0024120360320413784 deg
+        Observation 3, Vega (HIP 91262), was off by 0.007747430548197903 deg
+        Observation 4, Eltanin (HIP 87833), was off by 0.009845593457837745 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [128.45114   33.377716] deg
+        zenith_roll: 3.637761740156553 deg
+        zenith_pitch: -0.656454123524127 deg
+        non_perpendicular_axes_error: 0.3752098786697449 deg
+        collimation_error_in_azimuth: 0.37888339986530106 deg
+        extra_refraction_coefficient: 0.0
+
+tiagong_6_deg_offset
+Refining alignment: step 5000 of 5000: avg loss 1.195e-07, best loss 1.195e-07 with model 0
+Accuracy:
+        Observation 0, Arcturus (HIP 69673), was off by 0.009646177280478495 deg
+        Observation 1, Altair (HIP 97649), was off by 0.022387329051838645 deg
+        Observation 2, Vega (HIP 91262), was off by 0.024139679450450206 deg
+Done!
+Final alignment:
+AlignmentModel
+        encoder_offsets: [33.601837    0.18461345] deg
+        zenith_roll: -3.696126133501135 deg
+        zenith_pitch: -4.162482058519497 deg
+        non_perpendicular_axes_error: 0.0 deg
+        collimation_error_in_azimuth: 0.0 deg
+        extra_refraction_coefficient: 0.0
