@@ -353,9 +353,11 @@ zero steady-state lag on a constant-velocity target; the integral settles to the
 rate and is clamped to the max motor rate). A **dead-zoned derivative brake** opposes only
 image speed above a threshold, so it damps the acquisition slew / motion blur without
 throttling a locked fast mover (whose target is held still in-frame). The detection→rate
-mapping uses the cam's `bin` (frame sidecar) × optics `rad/px`. **Not yet built:** boresight
-calibration and `÷cos(alt)` azimuth compensation — so tracking degrades near the zenith (the
-azimuth singularity), which is a useful failure to observe.
+mapping uses the cam's `bin` (frame sidecar) × optics `rad/px`. Azimuth is `÷cos(alt)` gimbal-
+compensated (constant az loop gain, correct sign past 90°); within a small zenith zone az is
+zeroed (chasing the singularity is futile) while altitude tips over and the loop re-acquires on
+the far side — so it tracks straight through a near-zenith pass. **Not yet built:** boresight
+calibration (hold the target at a calibrated boresight pixel rather than the frame centre).
 
 ### `astrolock_seeker_gui` (Dear PyGui)
 

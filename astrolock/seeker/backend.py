@@ -88,6 +88,9 @@ def main(argv=None):
     p.add_argument('--track-lost-s', type=float, default=1.5, help="give up tracking after this long unmatched")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
+    p.add_argument('--track-zenith-zone-deg', type=float, default=3.0,
+                   help="within this angle of the zenith, zero the az slew (chasing the az singularity "
+                        "is futile); altitude tips over and we re-acquire once the target leaves the zone")
     p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
                    help="sky source: satellite TLE file (default: the ISS)")
     p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky source: satellite magnitude")
@@ -144,6 +147,7 @@ def main(argv=None):
     track_seen_index = -1
     rad_per_px = (math.radians(args.arcsec_per_px / 3600.0) if args.arcsec_per_px > 0
                   else args.sky_pixel_um * 1e-3 / args.sky_focal_mm)
+    zenith_zone_cos = math.sin(math.radians(args.track_zenith_zone_deg))   # |cos(alt)| below this = zone
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
     launch_seq = {role: 0 for role in roles}
@@ -328,6 +332,7 @@ def main(argv=None):
                 apply_command(cmd)
             update_detections()
 
+            st = mount.get_state()
             track_status = None
             if tracking and tracker is not None and not estop:
                 role = track_role
@@ -336,12 +341,19 @@ def main(argv=None):
                     if ft is not None:                            # ...clocked by its capture time
                         track_seen_index = latest_det_index[role]
                         raz, ralt, track_status, tpx = tracker.update(latest_blobs[role], True, ft)
+                        # Gimbal compensation: the image's response to an azimuth slew scales
+                        # with cos(alt) -- it shrinks toward the zenith and reverses past it. So
+                        # divide the az command by cos(alt) to keep the az loop gain constant (and
+                        # correctly signed above 90 deg). Inside the zenith zone, just zero az:
+                        # chasing the singularity is futile and would fling the mount around;
+                        # altitude tips over and we re-acquire once the target leaves the zone.
+                        ca = math.cos(st['alt_rad'])
+                        raz = 0.0 if abs(ca) < zenith_zone_cos else raz / ca
                         mount.set_rates(raz, ralt)
                         track_target = list(tpx) if track_status == 'track' else None
                         if track_status == 'lost':
                             tracking = False
 
-            st = mount.get_state()
             moving = abs(st['rate_az_rad_s']) > 1e-9 or abs(st['rate_alt_rad_s']) > 1e-9
             if tracking:
                 mode = 'track'
