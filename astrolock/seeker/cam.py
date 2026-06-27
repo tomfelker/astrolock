@@ -162,7 +162,10 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         except Exception:
             return None
 
-    return capture, width, height, color_id, bit_depth, get_settings
+    # Sensor->frame mapping for this capture (constant); the backend uses it to map detection
+    # pixels back to sensor angles. We capture full-frame, so roi origin is (0,0).
+    meta = {'bin': [bins, bins], 'roi': [0, 0, width, height]}
+    return capture, width, height, color_id, bit_depth, get_settings, meta
 
 
 def _open_sky(args, state_path=None):
@@ -203,7 +206,7 @@ def _open_sky(args, state_path=None):
     pose = {'n': 0, 'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt}
 
     def capture():
-        t = pose['n'] * period
+        t = pose['n'] * period * args.sky_time_scale
         pose['n'] += 1
         if tailer is not None:
             for rec in tailer.poll():            # latest backend encoder estimate wins
@@ -217,7 +220,8 @@ def _open_sky(args, state_path=None):
         return sim.render(t, az, alt, pose['raz'], pose['ralt'],
                           exposure_s=args.sky_exposure_s, substeps=args.sky_substeps)
 
-    return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None
+    meta = {'bin': [1, 1], 'roi': [0, 0, cfg.width, cfg.height]}
+    return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta
 
 
 def main(argv=None):
@@ -254,6 +258,8 @@ def main(argv=None):
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky: scripted alt slew (deg/s)")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky: simulated exposure (s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
+    p.add_argument('--sky-time-scale', type=float, default=1.0,
+                   help="sky: accelerate sim time (sidereal drift x this; for testing tracking)")
     p.add_argument('--sky-follow-state', action='store_true',
                    help="sky: render from the backend's encoder estimate in <ts>_state.jsonl")
     p.add_argument('--camera-index', type=int, default=0, help="zwo camera index")
@@ -284,15 +290,18 @@ def main(argv=None):
     width, height = args.width, args.height
     color_id = ser_mod.ColorId.MONO
     pixel_depth = 16  # synthetic frames are full-range 16-bit
+    frame_meta = None
     if args.source == 'zwo':
-        capture, width, height, color_id, pixel_depth, get_settings = _open_zwo(
+        capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_zwo(
             args.camera_index, args.exposure_us, args.gain, force_mono=args.mono,
             auto=args.auto, auto_max_exp_ms=args.auto_max_exp_ms,
             auto_max_gain=args.auto_max_gain, auto_target=args.auto_target,
             neutral_wb=not args.camera_wb)
     elif args.source == 'sky':
-        capture, width, height, color_id, pixel_depth, get_settings = _open_sky(
+        capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_sky(
             args, state_path=os.path.join(out_dir, session_mod.state_name(ts)))
+    if frame_meta is None:                                  # synthetic: full frame, no binning
+        frame_meta = {'bin': [1, 1], 'roi': [0, 0, width, height]}
 
     control = control_mod.ControlReader(args.control_file) if args.control_file else None
     cfg = {'frame_limit': args.frame_limit, 'file_limit': args.file_limit,
@@ -344,6 +353,7 @@ def main(argv=None):
                         't_mono_ns': time.perf_counter_ns(),
                         't_utc': session_mod.utc_now_iso(),
                         'important': bool(cfg['important']),
+                        **frame_meta,                          # bin + roi (sensor->frame mapping)
                     })
                     frames_in_file += 1
                     total += 1

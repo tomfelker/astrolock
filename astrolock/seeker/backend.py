@@ -26,10 +26,12 @@ import sys
 import time
 
 from astrolock.seeker import control
+from astrolock.seeker import mount as mount_mod
 from astrolock.seeker import session as session_mod
 from astrolock.seeker import sidecar
+from astrolock.seeker.controller import PixelTracker
 from astrolock.seeker.follower import SerFollower
-from astrolock.seeker.sidecar import JsonlWriter
+from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
 
 def _spawn(module, args):
@@ -52,6 +54,25 @@ def main(argv=None):
     p.add_argument('--start-az-deg', type=float, default=299.3, help="initial encoder az estimate")
     p.add_argument('--start-alt-deg', type=float, default=62.3, help="initial encoder alt estimate")
     p.add_argument('--max-rate-deg-s', type=float, default=8.0, help="clamp on commanded slew rate")
+    p.add_argument('--mount', default='sim', choices=['sim', 'celestron'],
+                   help="sim integrates commanded rates; celestron drives the real NexStar mount")
+    p.add_argument('--mount-url', default=None, help="celestron: e.g. celestron_nexstar_hc:COM3")
+    # auto-tracking (pixel-space closed loop)
+    p.add_argument('--sky-pixel-um', type=float, default=2.0, help="guide sensor pixel pitch (um)")
+    p.add_argument('--arcsec-per-px', type=float, default=0.0,
+                   help="guide plate scale override (0 = derive from --sky-pixel-um / --sky-focal-mm)")
+    p.add_argument('--track-kp', type=float, default=1.5, help="tracker position gain")
+    p.add_argument('--track-ki', type=float, default=0.5, help="tracker integral gain (carries the slew rate)")
+    p.add_argument('--track-kd', type=float, default=1.0,
+                   help="tracker derivative braking gain (on image speed above --track-max-px-s)")
+    p.add_argument('--track-max-px-s', type=float, default=120.0,
+                   help="image-speed dead zone (px/s): brake the slew above this during acquisition")
+    p.add_argument('--track-gate-px', type=float, default=80.0, help="max px to associate a blob to the target")
+    p.add_argument('--track-lost-s', type=float, default=1.5, help="give up tracking after this long unmatched")
+    p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
+    p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
+    p.add_argument('--sky-time-scale', type=float, default=1.0,
+                   help="sky source: accelerate sim time (makes sidereal drift visible for testing)")
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky source: scripted az slew (deg/s)")
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky source: scripted alt slew (deg/s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky source: substeps per exposure")
@@ -78,15 +99,26 @@ def main(argv=None):
 
     sky_args = (['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                  '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
-                 '--sky-focal-mm', str(args.sky_focal_mm), '--sky-follow-state']
+                 '--sky-focal-mm', str(args.sky_focal_mm), '--sky-pixel-um', str(args.sky_pixel_um),
+                 '--sky-time-scale', str(args.sky_time_scale), '--sky-follow-state']
                 if args.source == 'sky' else [])
 
-    # Mount-estimate state (rad, rad/s) and record state.
-    enc = [math.radians(args.start_az_deg), math.radians(args.start_alt_deg)]
-    rate = [0.0, 0.0]
+    max_rate = math.radians(args.max_rate_deg_s)
+    mount = mount_mod.make_mount(args.mount,
+                                 az0_rad=math.radians(args.start_az_deg),
+                                 alt0_rad=math.radians(args.start_alt_deg),
+                                 max_rate_rad_s=max_rate, url=args.mount_url)
     estop = False
     recording = False
-    max_rate = math.radians(args.max_rate_deg_s)
+
+    # Auto-tracking state (pixel-space closed loop).
+    tracker = None
+    tracking = False
+    track_role = None
+    track_target = None
+    track_seen_index = -1
+    rad_per_px = (math.radians(args.arcsec_per_px / 3600.0) if args.arcsec_per_px > 0
+                  else args.sky_pixel_um * 1e-3 / args.sky_focal_mm)
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
     launch_seq = {role: 0 for role in roles}
@@ -126,6 +158,37 @@ def main(argv=None):
 
     followers = {role: SerFollower(session_dir, role) for role in roles}
 
+    det_tailers = {role: None for role in roles}     # follow each role's detections across rollover
+    det_ser = {role: None for role in roles}
+    latest_blobs = {role: [] for role in roles}
+    latest_det_index = {role: -1 for role in roles}
+
+    def update_detections():
+        for role in roles:
+            f = followers[role]
+            f.committed_count()                      # refresh which segment is newest
+            sp = f.ser_path
+            if not sp:
+                continue
+            if det_ser[role] != sp:                  # rolled to a new segment -> re-point tailer
+                if det_tailers[role] is not None:
+                    det_tailers[role].close()
+                det_tailers[role] = JsonlTailer(sp[:-len('.ser')] + '.detections.jsonl')
+                det_ser[role] = sp
+            for rec in det_tailers[role].poll():
+                latest_blobs[role] = rec.get('blobs', [])
+                latest_det_index[role] = rec.get('index', latest_det_index[role])
+
+    def frame_binning(role):
+        """Sensor pixels per frame pixel for a role (from the cam's frame sidecar; default 1)."""
+        sp = followers[role].ser_path
+        if not sp:
+            return 1.0
+        for r in sidecar.read_complete_lines(sp[:-len('.ser')] + '.frames.jsonl'):
+            if 'bin' in r:
+                return float(r['bin'][0])
+        return 1.0
+
     def control_write(role, obj):
         if role in control_writers:
             control_writers[role].append(obj)
@@ -156,17 +219,39 @@ def main(argv=None):
                             pass
 
     def apply_command(cmd):
-        nonlocal estop, recording
+        nonlocal estop, recording, tracking, track_role, tracker
         t = cmd.get('type')
         if t == 'set_rate':
-            rate[0] = max(-max_rate, min(max_rate, math.radians(cmd.get('az', 0.0))))
-            rate[1] = max(-max_rate, min(max_rate, math.radians(cmd.get('alt', 0.0))))
+            tracking = False                          # manual slew overrides auto-track
+            mount.set_rates(math.radians(cmd.get('az', 0.0)), math.radians(cmd.get('alt', 0.0)))
             estop = False
         elif t == 'stop':
-            rate[0] = rate[1] = 0.0
+            tracking = False
+            mount.set_rates(0.0, 0.0)
         elif t == 'estop':
-            rate[0] = rate[1] = 0.0
+            tracking = False
+            mount.set_rates(0.0, 0.0)
             estop = True
+        elif t == 'track':                            # lock the pixel-space loop onto a target
+            role = cmd.get('role', roles[0])
+            px = cmd.get('px')
+            if role in roles and px and followers[role].header is not None:
+                hdr = followers[role].header
+                # Blobs are in frame image space; hold the target at the frame centre. rad_per_px
+                # is per *sensor* pixel, so scale by the cam's binning to get rad per frame pixel.
+                rpp = rad_per_px * frame_binning(role)
+                tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
+                                       kp=args.track_kp, ki=args.track_ki, kd=args.track_kd,
+                                       gate_px=args.track_gate_px, lost_s=args.track_lost_s,
+                                       max_track_px_s=args.track_max_px_s, max_rate_rad_s=max_rate,
+                                       sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
+                tracker.start(float(px[0]), float(px[1]), time.perf_counter())
+                tracking = True
+                track_role = role
+                estop = False
+        elif t == 'untrack':
+            tracking = False
+            mount.set_rates(0.0, 0.0)
         elif t == 'record':
             recording = bool(cmd.get('on', False))
             # Record: whole pass in one important file (stop rolling). Stop: resume rolling,
@@ -190,7 +275,6 @@ def main(argv=None):
                 restart_cam(role, stop_first=True)       # swap sim <-> real live
 
     start = time.perf_counter()
-    last = start
     last_health = start
     last_cleanup = start
     clean = False
@@ -198,25 +282,45 @@ def main(argv=None):
         while True:
             time.sleep(0.05)                      # ~20 Hz control loop
             now = time.perf_counter()
-            dt = now - last
-            last = now
 
             for cmd in cmd_server.drain():
                 apply_command(cmd)
+            update_detections()
 
-            enc[0] = (enc[0] + rate[0] * dt) % (2 * math.pi)
-            enc[1] = max(-math.pi / 2, min(math.pi / 2, enc[1] + rate[1] * dt))
-            mode = 'estop' if estop else ('slew' if (rate[0] or rate[1]) else 'idle')
+            track_status = None
+            if tracking and tracker is not None and not estop:
+                role = track_role
+                new_data = latest_det_index[role] != track_seen_index
+                track_seen_index = latest_det_index[role]
+                raz, ralt, track_status, tpx = tracker.update(latest_blobs[role], new_data, now)
+                mount.set_rates(raz, ralt)
+                track_target = list(tpx) if track_status == 'track' else None
+                if track_status == 'lost':
+                    tracking = False
+
+            st = mount.get_state()
+            moving = abs(st['rate_az_rad_s']) > 1e-9 or abs(st['rate_alt_rad_s']) > 1e-9
+            if track_status:
+                mode = track_status               # 'track' or 'lost'
+            elif estop:
+                mode = 'estop'
+            elif moving:
+                mode = 'slew'
+            else:
+                mode = 'idle'
 
             state_writer.append({
                 't_mono_ns': time.perf_counter_ns(),
                 't_utc': session_mod.utc_now_iso(),
                 'mode': mode,
-                'enc_az_deg': round(math.degrees(enc[0]), 4),
-                'enc_alt_deg': round(math.degrees(enc[1]), 4),
-                'rate_az_deg_s': round(math.degrees(rate[0]), 4),
-                'rate_alt_deg_s': round(math.degrees(rate[1]), 4),
+                'enc_az_deg': round(math.degrees(st['az_rad']), 4),
+                'enc_alt_deg': round(math.degrees(st['alt_rad']), 4),
+                'rate_az_deg_s': round(math.degrees(st['rate_az_rad_s']), 4),
+                'rate_alt_deg_s': round(math.degrees(st['rate_alt_rad_s']), 4),
                 'recording': recording,
+                'tracking': tracking,
+                'track_role': track_role if tracking else None,
+                'target_px': track_target if tracking else None,
                 'sources': dict(sources),
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},
@@ -227,7 +331,8 @@ def main(argv=None):
                 last_health = now
                 health = ', '.join(f"{role}={followers[role].committed_count()}f" for role in roles)
                 print(f"[backend] {mode}{' REC' if recording else ''} "
-                      f"az={math.degrees(enc[0]):.2f} alt={math.degrees(enc[1]):.2f} | {health}", flush=True)
+                      f"az={math.degrees(st['az_rad']):.2f} alt={math.degrees(st['alt_rad']):.2f} | {health}",
+                      flush=True)
 
             if now - last_cleanup >= 2.0:
                 last_cleanup = now
@@ -252,8 +357,12 @@ def main(argv=None):
             gui_proc.terminate()
         cmd_server.close()
         state_writer.close()
+        mount.close()
         for fo in followers.values():
             fo.close()
+        for dt_ in det_tailers.values():
+            if dt_ is not None:
+                dt_.close()
 
         deadline = time.perf_counter() + 3.0
         for pr in list(cam_procs.values()) + list(detect_procs.values()) + ([gui_proc] if gui_proc else []):

@@ -239,6 +239,14 @@ def main(argv=None):
             max_size_px=args.max_size_px, psf_px=args.psf_px,
             snr=args.snr, min_roundness=args.min_roundness,
             moving_frac=args.moving_frac, scale=scale)
+        # Report blobs in the frame's image space. We may analyse a downsampled grid (Bayer ->
+        # half-res mono sum), so scale coords back up; consumers then need no idea how we work.
+        coord_scale = reader.header.image_width / work.shape[1]
+        if coord_scale != 1:
+            for b in blobs:
+                b['px'] = [b['px'][0] * coord_scale, b['px'][1] * coord_scale]
+                if 'size_px' in b:
+                    b['size_px'] = b['size_px'] * coord_scale
         writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(), 'blobs': blobs})
         prev = bp
         total += 1

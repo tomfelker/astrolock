@@ -126,6 +126,7 @@ def main(argv=None):
         if res is None or f.header is None:
             return
         _, frame = res
+        fh, fw = frame.shape[0], frame.shape[1]       # full frame size (detect coords' space)
         w, h, _rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb)
         tex_tag = f"tex_{role}"
         with dpg.texture_registry():
@@ -139,13 +140,15 @@ def main(argv=None):
             status = dpg.add_text("waiting...")
             # Draw the image and overlay boxes as crisp vector rectangles (Dear PyGui draws
             # them at display resolution, so no aliasing from the downscaled texture).
-            with dpg.drawlist(width=disp_w, height=disp_h):
+            with dpg.drawlist(width=disp_w, height=disp_h) as drawlist:
                 dpg.draw_image(tex_tag, (0, 0), (disp_w, disp_h))
                 box_layer = dpg.add_draw_layer()
+                track_layer = dpg.add_draw_layer()      # the locked-target marker (on top)
         det_path = f.ser_path[:-len('.ser')] + '.detections.jsonl'
         views[role] = dict(tex=tex_tag, status=status, det_tailer=JsonlTailer(det_path),
                            ser_path=f.ser_path, blobs=[], box_layer=box_layer,
-                           sx=disp_w / w, sy=disp_h / h, w=w, h=h, last_idx=-1, det_idx=-1, peak=0)
+                           track_layer=track_layer, drawlist=drawlist,
+                           ox=disp_w / fw, oy=disp_h / fh, w=w, h=h, last_idx=-1, det_idx=-1, peak=0)
 
     def rebuild_view(role):
         """Drop a role's view (window + texture) so ensure_view recreates it -- used when the
@@ -168,6 +171,42 @@ def main(argv=None):
     def _send(obj):
         if ctrl['client'] is not None:
             ctrl['client'].send(obj)
+
+    def _view_at(mx, my):
+        """Which view's image contains viewport point (mx,my)? -> (role, view, rect_min)."""
+        for role, v in views.items():
+            dl = v.get('drawlist')
+            if dl is None or not dpg.does_item_exist(dl):
+                continue
+            rmin = dpg.get_item_rect_min(dl)
+            rsz = dpg.get_item_rect_size(dl)
+            if rmin[0] <= mx <= rmin[0] + rsz[0] and rmin[1] <= my <= rmin[1] + rsz[1]:
+                return role, v, rmin
+        return None, None, None
+
+    def on_left_click():
+        """Click the image to lock the nearest blob (or the bare click point) and start tracking."""
+        mx, my = dpg.get_mouse_pos(local=False)
+        role, v, rmin = _view_at(mx, my)
+        if v is None:
+            return
+        ix = (mx - rmin[0]) / v['ox']                  # -> frame image-space pixels (detect's space)
+        iy = (my - rmin[1]) / v['oy']
+        best, bd = None, 1e18
+        for b in v['blobs']:
+            dx, dy = b['px'][0] - ix, b['px'][1] - iy
+            d = dx * dx + dy * dy
+            if d < bd:
+                bd, best = d, b
+        px = best['px'] if (best is not None and bd <= 40 * 40) else [ix, iy]
+        _send({'type': 'track', 'role': role, 'px': [float(px[0]), float(px[1])]})
+
+    def on_right_click():
+        _send({'type': 'untrack'})
+
+    with dpg.handler_registry():
+        dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Left, callback=on_left_click)
+        dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Right, callback=on_right_click)
 
     def on_start():
         _send({'type': 'capture', 'role': dpg.get_value('cam_combo'), 'on': True})
@@ -204,6 +243,7 @@ def main(argv=None):
             dpg.add_spacer(width=72)
             btn_alt_dn = dpg.add_button(label="Alt -", width=64, height=40)
         dpg.add_text("hold a direction to slew", color=(150, 150, 150))
+        dpg.add_text("click image to track, right-click to stop", color=(150, 150, 150))
 
     def update_control():
         # Keep the camera selector populated with the roles present in the session.
@@ -311,14 +351,29 @@ def main(argv=None):
             a = 255 if v['det_idx'] >= v['last_idx'] else 70
             for b in v['blobs']:
                 cx, cy = b['px']
-                half = max(4.0, b.get('size_px', 4) * v['sx']) + 3.0
-                x, y = cx * v['sx'], cy * v['sy']
+                half = max(4.0, b.get('size_px', 4) * v['ox']) + 3.0
+                x, y = cx * v['ox'], cy * v['oy']
                 color = (60, 255, 60, a) if b.get('moving') else (255, 200, 40, a)
                 dpg.draw_rectangle((x - half, y - half), (x + half, y + half),
                                    color=color, thickness=1, parent=v['box_layer'])
             dpg.set_value(v['status'],
                           f"frame {v['last_idx']}  {_color_name(f.header.color_id)}  "
                           f"peak {v.get('peak', 0)}  blobs {len(v['blobs'])}")
+
+            # Locked-target marker (magenta crosshair) from the backend's tracking state.
+            dpg.delete_item(v['track_layer'], children_only=True)
+            stt = ctrl['state']
+            if (stt and stt.get('tracking') and stt.get('track_role') == role
+                    and stt.get('target_px')):
+                tx, ty = stt['target_px']
+                X, Y = tx * v['ox'], ty * v['oy']
+                col = (255, 60, 220, 255)
+                r = 14
+                dpg.draw_circle((X, Y), r, color=col, thickness=2, parent=v['track_layer'])
+                for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    dpg.draw_line((X + ex * (r + 6), Y + ey * (r + 6)),
+                                  (X + ex * 4, Y + ey * 4), color=col, thickness=2,
+                                  parent=v['track_layer'])
 
         dpg.render_dearpygui_frame()
         if not new_work:

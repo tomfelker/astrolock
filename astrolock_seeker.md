@@ -335,6 +335,21 @@ The brain. Single control loop, no GUI dependencies, **no raw CV** (that's `dete
    commanded rates, altitude, loop timings, per-camera/detector health). Persisted +
    tailable.
 
+**As built (closed loop in sim).** The backend commands a **`Mount`** abstraction —
+`SimMount` integrates commanded rates into the encoder estimate (which the sky-sim camera
+follows), `CelestronMount` drives the real NexStar mount on a dedicated serial thread
+(reusing `model/telescope_connections`; only that thread touches the port — the Prolific
+drivers BSOD on multi-threaded access). `--mount` selects them. The controller
+(`controller.PixelTracker`) closes the loop in guide pixels: nearest-blob association with a
+gate + coast, then **PI** on the position error (the mount is itself an integrator, so PI →
+zero steady-state lag on a constant-velocity target; the integral settles to the target's sky
+rate and is clamped to the max motor rate). A **dead-zoned derivative brake** opposes only
+image speed above a threshold, so it damps the acquisition slew / motion blur without
+throttling a locked fast mover (whose target is held still in-frame). The detection→rate
+mapping uses the cam's `bin` (frame sidecar) × optics `rad/px`. **Not yet built:** boresight
+calibration and `÷cos(alt)` azimuth compensation — so tracking degrades near the zenith (the
+azimuth singularity), which is a useful failure to observe.
+
 ### `astrolock_seeker_gui` (Dear PyGui)
 
 - Live views of guide + main from the `.ser` tails (as a follower).
@@ -497,6 +512,11 @@ the GUI tails it. Nulls where a stage hasn't produced data yet.
 Candidate boxes come from `detections.jsonl` (the GUI reads that directly); `state.jsonl`
 only reports which one is *locked* (`target_id` / `target_px`) and the resulting control.
 
+*As built*, the backend publishes a leaner line: `mode` (`idle|slew|estop|track|lost`),
+`enc_az_deg`/`enc_alt_deg`, `rate_az_deg_s`/`rate_alt_deg_s`, `recording`, `tracking`,
+`track_role`, `target_px` (the locked target in frame image space, or null), `sources`,
+`capturing`, and `cameras`. Boresight/error/`÷cos(alt)` fields arrive with calibration.
+
 ### Command messages (GUI → backend)
 
 Newline-delimited JSON over the localhost socket, each with a `type` and an optional
@@ -511,9 +531,10 @@ just says "received/valid").
 { "type": "estop" }                                             // zero + latch idle
 { "type": "record", "on": true }                                // mark cam frames important (kept)
 { "type": "capture", "role": "guide", "on": false }             // stop/(re)start a camera
-// aspirational (tracking/calibration, not yet wired):
-{ "type": "select_target", "candidate_id": 3 }                  // or "px": [x, y]
-{ "type": "go" }                                                 // engage closed-loop tracking
+{ "type": "set_source", "role": "guide", "source": "sky" }      // swap sim <-> real live
+{ "type": "track", "role": "guide", "px": [x, y] }              // lock nearest blob + engage PI loop
+{ "type": "untrack" }                                           // disengage tracking, stop
+// aspirational (calibration, not yet wired):
 { "type": "calibrate", "step": "altitude_zero" | "set_boresight", "px": [x, y] }
 ```
 
