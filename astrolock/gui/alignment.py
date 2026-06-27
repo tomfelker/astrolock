@@ -279,8 +279,8 @@ class AlignmentFrame(tk.Frame):
     def load_observations_from_filename(self, filename):
         with open(filename, 'r') as f:
             self.observation_items.clear()
-            alignmen_data_arr = json.load(f)
-            for alignment_datum_dict in alignmen_data_arr:
+            alignment_data_arr = json.load(f)
+            for alignment_datum_dict in alignment_data_arr:
                 datum = astrolock.model.alignment.AlignmentDatum.from_json(alignment_datum_dict)
                 item = AlignmentDatumTreeviewItem(datum)
                 self.observation_items.append(item)
