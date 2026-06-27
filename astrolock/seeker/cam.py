@@ -183,6 +183,12 @@ def _open_sky(args, state_path=None):
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um)
     if args.sky_epoch:
         cfg.epoch_utc = args.sky_epoch
+    if args.sky_lat is not None:
+        cfg.lat_deg = args.sky_lat
+    if args.sky_lon is not None:
+        cfg.lon_deg = args.sky_lon
+    if args.sky_elev is not None:
+        cfg.elev_m = args.sky_elev
     if args.sky_tle_file:
         lines = [ln.strip() for ln in open(args.sky_tle_file) if ln.strip()]
         name, l1, l2 = (lines[0], lines[1], lines[2]) if len(lines) >= 3 else ('TARGET', lines[0], lines[1])
@@ -211,9 +217,9 @@ def _open_sky(args, state_path=None):
     t0 = time.perf_counter()
 
     def capture():
-        # Advance sim time by wall-clock (x time_scale) so an ephemeris pass plays in real
-        # time regardless of how fast we can render frames.
-        t = (time.perf_counter() - t0) * args.sky_time_scale
+        # Sim time is wall-clock from t0: if rendering lags, that's just a lower effective
+        # framerate (we render the latest mount state), exactly like a slow real camera.
+        t = time.perf_counter() - t0
         if tailer is not None:
             for rec in tailer.poll():            # latest backend encoder estimate wins
                 pose['az'] = _math.radians(rec.get('enc_az_deg', _math.degrees(pose['az'])))
@@ -254,6 +260,9 @@ def main(argv=None):
     p.add_argument('--auto-target', type=int, default=100, help="auto: target brightness (0-255)")
     # sky simulator (--source sky)
     p.add_argument('--sky-epoch', default=None, help="sky: UTC epoch ISO (default: config)")
+    p.add_argument('--sky-lat', type=float, default=None, help="sky: observer latitude (deg)")
+    p.add_argument('--sky-lon', type=float, default=None, help="sky: observer longitude (deg)")
+    p.add_argument('--sky-elev', type=float, default=None, help="sky: observer elevation (m)")
     p.add_argument('--sky-width', type=int, default=1920, help="sky: sensor width (px)")
     p.add_argument('--sky-height', type=int, default=1080, help="sky: sensor height (px)")
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky: lens focal length (mm); FoV = w*pitch/focal")
@@ -267,8 +276,6 @@ def main(argv=None):
     p.add_argument('--sky-tle-file', default=None,
                    help="sky: TLE file (2 or 3 lines) for a satellite target (e.g. data/iss_25544.tle)")
     p.add_argument('--sky-target-mag', type=float, default=1.0, help="sky: satellite target magnitude")
-    p.add_argument('--sky-time-scale', type=float, default=1.0,
-                   help="sky: accelerate sim time (sidereal drift x this; for testing tracking)")
     p.add_argument('--sky-follow-state', action='store_true',
                    help="sky: render from the backend's encoder estimate in <ts>_state.jsonl")
     p.add_argument('--camera-index', type=int, default=0, help="zwo camera index")

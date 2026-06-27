@@ -57,6 +57,14 @@ def main(argv=None):
     p.add_argument('--mount', default='sim', choices=['sim', 'celestron'],
                    help="sim integrates commanded rates; celestron drives the real NexStar mount")
     p.add_argument('--mount-url', default=None, help="celestron: e.g. celestron_nexstar_hc:COM3")
+    # simulated site (the sim mount's GPS) + dynamics + global sim time scale
+    p.add_argument('--lat', type=float, default=37.51089, help="sim site latitude (deg)")
+    p.add_argument('--lon', type=float, default=-122.2719388888889, help="sim site longitude (deg)")
+    p.add_argument('--elev', type=float, default=60.0, help="sim site elevation (m)")
+    p.add_argument('--epoch', default='2026-03-20T04:00:00Z',
+                   help="sim start UTC -- the sim mount's GPS time and the sky-sim epoch")
+    p.add_argument('--mount-accel-deg-s2', type=float, default=20.0, help="sim mount acceleration limit (deg/s^2)")
+    p.add_argument('--mount-update-hz', type=float, default=10.0, help="sim mount update rate (Hz)")
     # auto-tracking (pixel-space closed loop)
     p.add_argument('--sky-pixel-um', type=float, default=2.0, help="guide sensor pixel pitch (um)")
     p.add_argument('--arcsec-per-px', type=float, default=0.0,
@@ -71,9 +79,6 @@ def main(argv=None):
     p.add_argument('--track-lost-s', type=float, default=1.5, help="give up tracking after this long unmatched")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
-    p.add_argument('--sky-time-scale', type=float, default=1.0,
-                   help="sky source: accelerate sim time (makes sidereal drift visible for testing)")
-    p.add_argument('--sky-epoch', default=None, help="sky source: UTC epoch ISO (e.g. 2026-07-06T05:20:00Z)")
     p.add_argument('--sky-tle-file', default=None,
                    help="sky source: satellite TLE file (e.g. data/iss_25544.tle)")
     p.add_argument('--sky-target-mag', type=float, default=1.0, help="sky source: satellite magnitude")
@@ -101,22 +106,24 @@ def main(argv=None):
     print(f"[backend] session {session_dir} roles={roles} source={args.source} "
           f"cmd_port={cmd_server.port}", flush=True)
 
+    max_rate = math.radians(args.max_rate_deg_s)
+    site = {'lat_deg': args.lat, 'lon_deg': args.lon, 'elev_m': args.elev, 'epoch_utc': args.epoch}
+    mount = mount_mod.make_mount(
+        args.mount, az0_rad=math.radians(args.start_az_deg), alt0_rad=math.radians(args.start_alt_deg),
+        site=site, max_rate_rad_s=max_rate, accel_rad_s2=math.radians(args.mount_accel_deg_s2),
+        update_hz=args.mount_update_hz, url=args.mount_url)
+    msite = mount.get_site()        # GPS/site comes from the mount; it drives the sky-sim camera
+
     sky_args = []
     if args.source == 'sky':
         sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                     '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
                     '--sky-focal-mm', str(args.sky_focal_mm), '--sky-pixel-um', str(args.sky_pixel_um),
-                    '--sky-time-scale', str(args.sky_time_scale), '--sky-follow-state']
-        if args.sky_epoch:
-            sky_args += ['--sky-epoch', args.sky_epoch]
+                    '--sky-lat', str(msite['lat_deg']), '--sky-lon', str(msite['lon_deg']),
+                    '--sky-elev', str(msite['elev_m']), '--sky-epoch', str(msite['epoch_utc']),
+                    '--sky-follow-state']
         if args.sky_tle_file:
             sky_args += ['--sky-tle-file', args.sky_tle_file, '--sky-target-mag', str(args.sky_target_mag)]
-
-    max_rate = math.radians(args.max_rate_deg_s)
-    mount = mount_mod.make_mount(args.mount,
-                                 az0_rad=math.radians(args.start_az_deg),
-                                 alt0_rad=math.radians(args.start_alt_deg),
-                                 max_rate_rad_s=max_rate, url=args.mount_url)
     estop = False
     recording = False
 

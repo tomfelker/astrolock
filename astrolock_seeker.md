@@ -335,11 +335,18 @@ The brain. Single control loop, no GUI dependencies, **no raw CV** (that's `dete
    commanded rates, altitude, loop timings, per-camera/detector health). Persisted +
    tailable.
 
-**As built (closed loop in sim).** The backend commands a **`Mount`** abstraction —
-`SimMount` integrates commanded rates into the encoder estimate (which the sky-sim camera
-follows), `CelestronMount` drives the real NexStar mount on a dedicated serial thread
-(reusing `model/telescope_connections`; only that thread touches the port — the Prolific
-drivers BSOD on multi-threaded access). `--mount` selects them. The controller
+**As built (closed loop in sim).** The backend talks to a **`Mount`** *driver* and treats sim
+and real identically: `set_rates()`, `get_state()` (pose + rates), and `get_site()` (lat/lon/
+elev + epoch — like the mount's GPS). `SimMount` is a real driver, not just an integrator: its
+own loop runs at `--mount-update-hz` with speed + acceleration limits (periodic error etc. can
+follow) and reports a configurable test site/clock; the backend feeds that site to the sky-sim
+camera, so the simulated sky matches where/when the (simulated) mount thinks it is. Everything
+runs in real time (sim time = epoch + elapsed wall-clock); if the synth lags it's just a lower
+effective framerate (the cam renders the latest mount state). A global time-scale is deferred --
+when added it must multiply *all* elapsed-monotonic-time reads uniformly. `CelestronMount` drives the
+real NexStar mount on a dedicated serial thread (reusing `model/telescope_connections`; only
+that thread touches the port — the Prolific drivers BSOD on multi-threaded access; real GPS read
+is still TODO). `--mount` selects them. The controller
 (`controller.PixelTracker`) closes the loop in guide pixels: nearest-blob association with a
 gate + coast, then **PI** on the position error (the mount is itself an integrator, so PI →
 zero steady-state lag on a constant-velocity target; the integral settles to the target's sky
