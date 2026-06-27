@@ -200,9 +200,11 @@ def _open_sky(args, state_path=None):
     if args.sky_az_deg is None or args.sky_alt_deg is None:
         import torch
         alt, az, mag = sim.sources_altaz(sim._sf_time(0.0))
-        up = alt > _math.radians(40)
-        i = int(torch.argmin(torch.where(up, mag, torch.full_like(mag, float('inf')))))
-        az0, alt0 = float(az[i]), float(alt[i])
+        if sim.satellite is not None:
+            az0, alt0 = float(az[-1]), float(alt[-1])      # point at the satellite target (last source)
+        else:
+            i = int(torch.argmin(mag))                     # just the brightest source (no alt limit)
+            az0, alt0 = float(az[i]), float(alt[i])
     else:
         az0, alt0 = _math.radians(args.sky_az_deg), _math.radians(args.sky_alt_deg)
     rate_az, rate_alt = _math.radians(args.sky_rate_az), _math.radians(args.sky_rate_alt)
@@ -258,8 +260,8 @@ def main(argv=None):
     p.add_argument('--auto-max-exp-ms', type=int, default=200, help="auto: max exposure (ms)")
     p.add_argument('--auto-max-gain', type=int, default=400, help="auto: max gain")
     p.add_argument('--auto-target', type=int, default=100, help="auto: target brightness (0-255)")
-    # sky simulator (--source sky)
-    p.add_argument('--sky-epoch', default=None, help="sky: UTC epoch ISO (default: config)")
+    # sky simulator (--source sky); defaults bake in the ISS test pass over San Carlos
+    p.add_argument('--sky-epoch', default='2026-07-06T05:22:00Z', help="sky: UTC epoch ISO")
     p.add_argument('--sky-lat', type=float, default=None, help="sky: observer latitude (deg)")
     p.add_argument('--sky-lon', type=float, default=None, help="sky: observer longitude (deg)")
     p.add_argument('--sky-elev', type=float, default=None, help="sky: observer elevation (m)")
@@ -273,9 +275,9 @@ def main(argv=None):
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky: scripted alt slew (deg/s)")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky: simulated exposure (s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
-    p.add_argument('--sky-tle-file', default=None,
-                   help="sky: TLE file (2 or 3 lines) for a satellite target (e.g. data/iss_25544.tle)")
-    p.add_argument('--sky-target-mag', type=float, default=1.0, help="sky: satellite target magnitude")
+    p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
+                   help="sky: TLE file (2 or 3 lines) for a satellite target (default: the ISS)")
+    p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky: satellite target magnitude")
     p.add_argument('--sky-follow-state', action='store_true',
                    help="sky: render from the backend's encoder estimate in <ts>_state.jsonl")
     p.add_argument('--camera-index', type=int, default=0, help="zwo camera index")

@@ -42,7 +42,8 @@ def _spawn(module, args):
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker backend / orchestrator")
     p.add_argument('--roles', default='guide', help="comma-separated camera roles to launch")
-    p.add_argument('--source', default='synthetic', choices=['synthetic', 'zwo', 'sky'])
+    p.add_argument('--source', default='sky', choices=['synthetic', 'zwo', 'sky'],
+                   help="default 'sky' runs the baked-in ISS test pass; 'synthetic' needs no deps")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=30.0)
@@ -51,8 +52,10 @@ def main(argv=None):
     p.add_argument('--auto', dest='auto', action='store_true', default=True,
                    help="zwo: auto-exposure + auto-gain (default on)")
     p.add_argument('--no-auto', dest='auto', action='store_false', help="zwo: fixed exposure/gain")
-    p.add_argument('--start-az-deg', type=float, default=299.3, help="initial encoder az estimate")
-    p.add_argument('--start-alt-deg', type=float, default=62.3, help="initial encoder alt estimate")
+    p.add_argument('--start-az-deg', type=float, default=228.0,
+                   help="sim mount initial az -- roughly (not exactly) at the ISS test target, so "
+                        "acquisition is exercised")
+    p.add_argument('--start-alt-deg', type=float, default=19.5, help="sim mount initial alt")
     p.add_argument('--max-rate-deg-s', type=float, default=8.0, help="clamp on commanded slew rate")
     p.add_argument('--mount', default='sim', choices=['sim', 'celestron'],
                    help="sim integrates commanded rates; celestron drives the real NexStar mount")
@@ -61,8 +64,9 @@ def main(argv=None):
     p.add_argument('--lat', type=float, default=37.51089, help="sim site latitude (deg)")
     p.add_argument('--lon', type=float, default=-122.2719388888889, help="sim site longitude (deg)")
     p.add_argument('--elev', type=float, default=60.0, help="sim site elevation (m)")
-    p.add_argument('--epoch', default='2026-03-20T04:00:00Z',
-                   help="sim start UTC -- the sim mount's GPS time and the sky-sim epoch")
+    p.add_argument('--epoch', default='2026-07-06T05:22:00Z',
+                   help="sim start UTC -- the sim mount's GPS time and the sky-sim epoch "
+                        "(default: the ISS test pass over San Carlos, just rising)")
     p.add_argument('--mount-accel-deg-s2', type=float, default=20.0, help="sim mount acceleration limit (deg/s^2)")
     p.add_argument('--mount-update-hz', type=float, default=10.0, help="sim mount update rate (Hz)")
     # auto-tracking (pixel-space closed loop)
@@ -79,9 +83,9 @@ def main(argv=None):
     p.add_argument('--track-lost-s', type=float, default=1.5, help="give up tracking after this long unmatched")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
-    p.add_argument('--sky-tle-file', default=None,
-                   help="sky source: satellite TLE file (e.g. data/iss_25544.tle)")
-    p.add_argument('--sky-target-mag', type=float, default=1.0, help="sky source: satellite magnitude")
+    p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
+                   help="sky source: satellite TLE file (default: the ISS)")
+    p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky source: satellite magnitude")
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky source: scripted az slew (deg/s)")
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky source: scripted alt slew (deg/s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky source: substeps per exposure")
