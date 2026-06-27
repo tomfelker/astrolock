@@ -6,10 +6,10 @@ replayed) frame, updating every render frame. Same code path for live tailing an
 historical playback -- it's just a follower reading growing-or-complete files.
 
 Bayer frames are debayered to half-res RGB for display (the 4-plane split, see bayer.py);
-mono frames are shown as grayscale. Each frame is auto-stretched (divided by its peak) and
-gamma-corrected so the preview is visible regardless of exposure. If a <role>.detections.jsonl
-is present, candidate blobs are overlaid as square boxes (green = moving, amber = static) --
-detect coords share the working-image grid (half-res for Bayer), so they align directly.
+mono frames are shown as grayscale. Each frame maps the full container range to [0,1] (no
+per-frame auto-stretch -- brightness stays stable, so expose/gain the camera) then applies
+gamma. If a <role>.detections.jsonl is present, candidate blobs are overlaid as square boxes
+(green = moving, amber = static) in the frame's image space, so they align directly.
 
     python -m astrolock.seeker.gui --session sessions/<ts>
     python -m astrolock.seeker.gui --session sessions/<ts> --roles guide,main
@@ -54,8 +54,11 @@ def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0)):
     """
     Raw frame (mosaic or mono) -> (w, h, (h,w,4) float32 RGBA).
     Debayers Bayer frames to half-res RGB; applies display-only WB (R,B gains -- the stored
-    data stays pristine raw); auto-stretches by peak; applies gamma.
+    data stays pristine raw); maps the full container range to [0,1] with NO per-frame
+    auto-stretch (so brightness is stable -- expose/gain the camera instead); applies gamma.
     """
+    white = (float(np.iinfo(frame_raw.dtype).max)
+             if np.issubdtype(frame_raw.dtype, np.integer) else 1.0)
     if bayer.is_bayer(color_id):
         rgb = bayer.debayer_to_rgb(frame_raw, color_id)          # (h/2, w/2, 3)
         rgb[..., 0] *= wb[0]                                      # display WB on R
@@ -64,8 +67,7 @@ def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0)):
         f = frame_raw.astype(np.float32)
         rgb = np.repeat(f[:, :, None], 3, axis=2)
 
-    peak = float(rgb.max())
-    norm = rgb / peak if peak > 0 else rgb
+    norm = rgb / white
     if gamma and gamma != 1.0:
         norm = np.clip(norm, 0.0, 1.0) ** (1.0 / gamma)
 

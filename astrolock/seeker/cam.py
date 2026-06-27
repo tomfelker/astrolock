@@ -183,6 +183,11 @@ def _open_sky(args, state_path=None):
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um)
     if args.sky_epoch:
         cfg.epoch_utc = args.sky_epoch
+    if args.sky_tle_file:
+        lines = [ln.strip() for ln in open(args.sky_tle_file) if ln.strip()]
+        name, l1, l2 = (lines[0], lines[1], lines[2]) if len(lines) >= 3 else ('TARGET', lines[0], lines[1])
+        cfg.target_tle = (l1, l2, name)
+        cfg.target_mag = args.sky_target_mag
     sim = SkySim(cfg)
     fov_x = _math.degrees(2 * _math.atan(cfg.width * cfg.pixel_pitch_um * 1e-3 / (2 * cfg.focal_length_mm)))
 
@@ -195,19 +200,20 @@ def _open_sky(args, state_path=None):
     else:
         az0, alt0 = _math.radians(args.sky_az_deg), _math.radians(args.sky_alt_deg)
     rate_az, rate_alt = _math.radians(args.sky_rate_az), _math.radians(args.sky_rate_alt)
-    period = 1.0 / args.fps if args.fps > 0 else args.sky_exposure_s
-
+    tgt = f" target={cfg.target_tle[2]}(mag {cfg.target_mag})" if cfg.target_tle else ""
     print(f"[cam] sky sim {cfg.width}x{cfg.height} FoV {fov_x:.1f}deg epoch {cfg.epoch_utc} "
           f"point=({_math.degrees(az0):.2f},{_math.degrees(alt0):.2f})deg "
-          f"slew=({args.sky_rate_az},{args.sky_rate_alt})deg/s exp={args.sky_exposure_s}s", flush=True)
+          f"slew=({args.sky_rate_az},{args.sky_rate_alt})deg/s exp={args.sky_exposure_s}s{tgt}", flush=True)
 
     follow = args.sky_follow_state and state_path is not None
     tailer = JsonlTailer(state_path) if follow else None
-    pose = {'n': 0, 'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt}
+    pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt}
+    t0 = time.perf_counter()
 
     def capture():
-        t = pose['n'] * period * args.sky_time_scale
-        pose['n'] += 1
+        # Advance sim time by wall-clock (x time_scale) so an ephemeris pass plays in real
+        # time regardless of how fast we can render frames.
+        t = (time.perf_counter() - t0) * args.sky_time_scale
         if tailer is not None:
             for rec in tailer.poll():            # latest backend encoder estimate wins
                 pose['az'] = _math.radians(rec.get('enc_az_deg', _math.degrees(pose['az'])))
@@ -258,6 +264,9 @@ def main(argv=None):
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky: scripted alt slew (deg/s)")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky: simulated exposure (s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
+    p.add_argument('--sky-tle-file', default=None,
+                   help="sky: TLE file (2 or 3 lines) for a satellite target (e.g. data/iss_25544.tle)")
+    p.add_argument('--sky-target-mag', type=float, default=1.0, help="sky: satellite target magnitude")
     p.add_argument('--sky-time-scale', type=float, default=1.0,
                    help="sky: accelerate sim time (sidereal drift x this; for testing tracking)")
     p.add_argument('--sky-follow-state', action='store_true',

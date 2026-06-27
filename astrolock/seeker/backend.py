@@ -73,6 +73,10 @@ def main(argv=None):
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
     p.add_argument('--sky-time-scale', type=float, default=1.0,
                    help="sky source: accelerate sim time (makes sidereal drift visible for testing)")
+    p.add_argument('--sky-epoch', default=None, help="sky source: UTC epoch ISO (e.g. 2026-07-06T05:20:00Z)")
+    p.add_argument('--sky-tle-file', default=None,
+                   help="sky source: satellite TLE file (e.g. data/iss_25544.tle)")
+    p.add_argument('--sky-target-mag', type=float, default=1.0, help="sky source: satellite magnitude")
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky source: scripted az slew (deg/s)")
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky source: scripted alt slew (deg/s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky source: substeps per exposure")
@@ -97,11 +101,16 @@ def main(argv=None):
     print(f"[backend] session {session_dir} roles={roles} source={args.source} "
           f"cmd_port={cmd_server.port}", flush=True)
 
-    sky_args = (['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
-                 '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
-                 '--sky-focal-mm', str(args.sky_focal_mm), '--sky-pixel-um', str(args.sky_pixel_um),
-                 '--sky-time-scale', str(args.sky_time_scale), '--sky-follow-state']
-                if args.source == 'sky' else [])
+    sky_args = []
+    if args.source == 'sky':
+        sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
+                    '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
+                    '--sky-focal-mm', str(args.sky_focal_mm), '--sky-pixel-um', str(args.sky_pixel_um),
+                    '--sky-time-scale', str(args.sky_time_scale), '--sky-follow-state']
+        if args.sky_epoch:
+            sky_args += ['--sky-epoch', args.sky_epoch]
+        if args.sky_tle_file:
+            sky_args += ['--sky-tle-file', args.sky_tle_file, '--sky-target-mag', str(args.sky_target_mag)]
 
     max_rate = math.radians(args.max_rate_deg_s)
     mount = mount_mod.make_mount(args.mount,
