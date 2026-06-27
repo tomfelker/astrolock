@@ -358,6 +358,7 @@ def main(argv=None):
                 't_mono_ns': time.perf_counter_ns(),
                 't_utc': session_mod.utc_now_iso(),
                 'mode': mode,
+                'enc_t_mono_ns': st.get('t_mono_ns'),   # when the angles were measured (for extrapolation)
                 'enc_az_deg': round(math.degrees(st['az_rad']), 4),
                 'enc_alt_deg': round(math.degrees(st['alt_rad']), 4),
                 'rate_az_deg_s': round(math.degrees(st['rate_az_rad_s']), 4),

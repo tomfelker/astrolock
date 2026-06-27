@@ -216,7 +216,7 @@ def _open_sky(args, state_path=None):
 
     follow = args.sky_follow_state and state_path is not None
     tailer = JsonlTailer(state_path) if follow else None
-    pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt}
+    pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt, 'enc_t': None}
     t0 = time.perf_counter()
 
     def capture():
@@ -229,7 +229,15 @@ def _open_sky(args, state_path=None):
                 pose['alt'] = _math.radians(rec.get('enc_alt_deg', _math.degrees(pose['alt'])))
                 pose['raz'] = _math.radians(rec.get('rate_az_deg_s', 0.0))
                 pose['ralt'] = _math.radians(rec.get('rate_alt_deg_s', 0.0))
-            az, alt = pose['az'], pose['alt']
+                pose['enc_t'] = rec.get('enc_t_mono_ns')
+            # The state's angle is from when the mount measured it; extrapolate to *now* (the
+            # exposure) using the reported rate, so the rendered pose isn't stale by the
+            # mount->backend->cam latency.
+            ahead = 0.0
+            if pose['enc_t']:
+                ahead = min(0.2, max(0.0, time.perf_counter() - pose['enc_t'] * 1e-9))
+            az = pose['az'] + pose['raz'] * ahead
+            alt = pose['alt'] + pose['ralt'] * ahead
         else:
             az, alt = az0 + rate_az * t, alt0 + rate_alt * t
         return sim.render(t, az, alt, pose['raz'], pose['ralt'],

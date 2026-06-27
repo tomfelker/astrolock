@@ -72,6 +72,7 @@ class SimMount(Mount):
         self._stop = False
         self._last = time.perf_counter()
         self._wall0 = self._last
+        self._angle_t_ns = time.perf_counter_ns()   # when the reported angles were valid
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -89,6 +90,7 @@ class SimMount(Mount):
                 # rather than a 180-deg azimuth whip.
                 self._az = (self._az + self._rate[0] * dt) % (2 * math.pi)
                 self._alt = (self._alt + self._rate[1] * dt) % (2 * math.pi)
+                self._angle_t_ns = time.perf_counter_ns()
             time.sleep(self._period)
 
     def set_rates(self, az_rad_s, alt_rad_s):
@@ -99,7 +101,8 @@ class SimMount(Mount):
     def get_state(self):
         with self._lock:
             return {'az_rad': self._az, 'alt_rad': self._alt,
-                    'rate_az_rad_s': self._rate[0], 'rate_alt_rad_s': self._rate[1]}
+                    'rate_az_rad_s': self._rate[0], 'rate_alt_rad_s': self._rate[1],
+                    't_mono_ns': self._angle_t_ns}
 
     def get_site(self):
         return dict(self._site)
@@ -133,6 +136,7 @@ class CelestronMount(Mount):
         self._desired = [0.0, 0.0]
         self._angles = [az0_rad, alt0_rad]
         self._rates = [0.0, 0.0]
+        self._angle_t_ns = time.perf_counter_ns()
         self._stop = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -155,6 +159,7 @@ class CelestronMount(Mount):
                         if last_t[axis] is not None and t != last_t[axis]:
                             self._rates[axis] = _wrap_pi(a - last_a[axis]) / ((t - last_t[axis]) * 1e-9)
                         self._angles[axis] = a
+                        self._angle_t_ns = t          # serial measurement time of the angle
                     last_a[axis], last_t[axis] = a, t
 
     def set_rates(self, az_rad_s, alt_rad_s):
@@ -165,7 +170,8 @@ class CelestronMount(Mount):
     def get_state(self):
         with self._lock:
             return {'az_rad': self._angles[0], 'alt_rad': self._angles[1],
-                    'rate_az_rad_s': self._rates[0], 'rate_alt_rad_s': self._rates[1]}
+                    'rate_az_rad_s': self._rates[0], 'rate_alt_rad_s': self._rates[1],
+                    't_mono_ns': self._angle_t_ns}
 
     def get_site(self):
         return dict(self._site)        # TODO: read the mount's GPS (lat/lon/time)
