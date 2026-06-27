@@ -73,11 +73,20 @@ class SerFollower:
         return self._reader.read_frame(index, to_float=to_float)
 
     def read_latest(self, to_float=False):
-        """Return (index, frame) for the newest committed frame, or None if none yet."""
-        idx = self.latest_index()
-        if idx < 0:
+        """
+        Return (index, frame) for the newest committed frame, or None if none yet.
+
+        Resolves the current segment exactly once and reads the count + frame from that same
+        reader, so a rollover between resolving and reading can't ask a freshly-created (empty)
+        segment for a stale index (the previous version resolved twice and could race at the
+        300-frame rollover boundary).
+        """
+        if not self._resolve():
             return None
-        return idx, self.read_frame(idx, to_float=to_float)
+        n = min(sidecar.count_complete_lines(self._frames_path), self._reader.frames_on_disk())
+        if n <= 0:
+            return None
+        return n - 1, self._reader.read_frame(n - 1, to_float=to_float)
 
     @property
     def header(self):

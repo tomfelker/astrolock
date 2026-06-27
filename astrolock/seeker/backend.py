@@ -56,7 +56,8 @@ def main(argv=None):
                    help="sim mount initial az -- roughly (not exactly) at the ISS test target, so "
                         "acquisition is exercised")
     p.add_argument('--start-alt-deg', type=float, default=19.5, help="sim mount initial alt")
-    p.add_argument('--max-rate-deg-s', type=float, default=8.0, help="clamp on commanded slew rate")
+    p.add_argument('--max-rate-deg-s', type=float, default=3.0,
+                   help="max slew rate -- matches the real CPC (~3 deg/s, battery-dependent)")
     p.add_argument('--mount', default='sim', choices=['sim', 'celestron'],
                    help="sim integrates commanded rates; celestron drives the real NexStar mount")
     p.add_argument('--mount-url', default=None, help="celestron: e.g. celestron_nexstar_hc:COM3")
@@ -73,12 +74,16 @@ def main(argv=None):
     p.add_argument('--sky-pixel-um', type=float, default=2.0, help="guide sensor pixel pitch (um)")
     p.add_argument('--arcsec-per-px', type=float, default=0.0,
                    help="guide plate scale override (0 = derive from --sky-pixel-um / --sky-focal-mm)")
-    p.add_argument('--track-kp', type=float, default=1.5, help="tracker position gain")
-    p.add_argument('--track-ki', type=float, default=0.5, help="tracker integral gain (carries the slew rate)")
+    p.add_argument('--track-ki', type=float, default=0.3,
+                   help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
+    p.add_argument('--track-damping', type=float, default=1.3,
+                   help="P is derived for critical damping (kp=2*sqrt(ki)); >1 over-damps for lag margin")
     p.add_argument('--track-kd', type=float, default=1.0,
                    help="tracker derivative braking gain (on image speed above --track-max-px-s)")
     p.add_argument('--track-max-px-s', type=float, default=120.0,
                    help="image-speed dead zone (px/s): brake the slew above this during acquisition")
+    p.add_argument('--track-vel-smoothing', type=float, default=0.1,
+                   help="velocity-estimate smoothing per frame (0 = none/trust new; higher = smoother)")
     p.add_argument('--track-gate-px', type=float, default=80.0, help="max px to associate a blob to the target")
     p.add_argument('--track-lost-s', type=float, default=1.5, help="give up tracking after this long unmatched")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
@@ -209,6 +214,18 @@ def main(argv=None):
                 return float(r['bin'][0])
         return 1.0
 
+    def frame_time_s(role, index):
+        """Capture time (seconds) of frame `index` for a role, from the cam's frame sidecar.
+        The whole control loop is clocked off these so PID dt is the true inter-frame interval
+        (the cam's monotonic clock), not the backend's polling jitter."""
+        sp = followers[role].ser_path
+        if not sp or index < 0:
+            return None
+        lines = sidecar.read_complete_lines(sp[:-len('.ser')] + '.frames.jsonl')
+        if index < len(lines) and 't_mono_ns' in lines[index]:
+            return lines[index]['t_mono_ns'] * 1e-9
+        return None
+
     def control_write(role, obj):
         if role in control_writers:
             control_writers[role].append(obj)
@@ -239,7 +256,7 @@ def main(argv=None):
                             pass
 
     def apply_command(cmd):
-        nonlocal estop, recording, tracking, track_role, tracker
+        nonlocal estop, recording, tracking, track_role, tracker, track_seen_index
         t = cmd.get('type')
         if t == 'set_rate':
             tracking = False                          # manual slew overrides auto-track
@@ -260,15 +277,19 @@ def main(argv=None):
                 # Blobs are in frame image space; hold the target at the frame centre. rad_per_px
                 # is per *sensor* pixel, so scale by the cam's binning to get rad per frame pixel.
                 rpp = rad_per_px * frame_binning(role)
-                tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
-                                       kp=args.track_kp, ki=args.track_ki, kd=args.track_kd,
-                                       gate_px=args.track_gate_px, lost_s=args.track_lost_s,
-                                       max_track_px_s=args.track_max_px_s, max_rate_rad_s=max_rate,
-                                       sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
-                tracker.start(float(px[0]), float(px[1]), time.perf_counter())
-                tracking = True
-                track_role = role
-                estop = False
+                ft = frame_time_s(role, latest_det_index[role])    # clock off the frame, not wall time
+                if ft is not None:
+                    tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
+                                           ki=args.track_ki, damping=args.track_damping, kd=args.track_kd,
+                                           gate_px=args.track_gate_px, lost_s=args.track_lost_s,
+                                           vel_smoothing=args.track_vel_smoothing,
+                                           max_track_px_s=args.track_max_px_s, max_rate_rad_s=max_rate,
+                                           sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
+                    tracker.start(float(px[0]), float(px[1]), ft)
+                    track_seen_index = latest_det_index[role]
+                    tracking = True
+                    track_role = role
+                    estop = False
         elif t == 'untrack':
             tracking = False
             mount.set_rates(0.0, 0.0)
@@ -310,18 +331,22 @@ def main(argv=None):
             track_status = None
             if tracking and tracker is not None and not estop:
                 role = track_role
-                new_data = latest_det_index[role] != track_seen_index
-                track_seen_index = latest_det_index[role]
-                raz, ralt, track_status, tpx = tracker.update(latest_blobs[role], new_data, now)
-                mount.set_rates(raz, ralt)
-                track_target = list(tpx) if track_status == 'track' else None
-                if track_status == 'lost':
-                    tracking = False
+                if latest_det_index[role] != track_seen_index:   # act once per new frame...
+                    ft = frame_time_s(role, latest_det_index[role])
+                    if ft is not None:                            # ...clocked by its capture time
+                        track_seen_index = latest_det_index[role]
+                        raz, ralt, track_status, tpx = tracker.update(latest_blobs[role], True, ft)
+                        mount.set_rates(raz, ralt)
+                        track_target = list(tpx) if track_status == 'track' else None
+                        if track_status == 'lost':
+                            tracking = False
 
             st = mount.get_state()
             moving = abs(st['rate_az_rad_s']) > 1e-9 or abs(st['rate_alt_rad_s']) > 1e-9
-            if track_status:
-                mode = track_status               # 'track' or 'lost'
+            if tracking:
+                mode = 'track'
+            elif track_status == 'lost':
+                mode = 'lost'
             elif estop:
                 mode = 'estop'
             elif moving:

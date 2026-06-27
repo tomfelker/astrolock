@@ -20,7 +20,7 @@ CX, CY = 960.0, 540.0
 
 
 def run_plant(dt, steps, start_off=0.0, v_saz=0.0, v_salt=0.0, kd=1.0, thresh=120.0):
-    trk = PixelTracker(CX, CY, RADPP, kp=1.5, ki=0.5, kd=kd, max_track_px_s=thresh,
+    trk = PixelTracker(CX, CY, RADPP, ki=0.5, damping=1.3, kd=kd, max_track_px_s=thresh,
                        gate_px=80.0, max_rate_rad_s=math.radians(8.0))
     px, py = CX + start_off, CY
     trk.start(px, py, 0.0)

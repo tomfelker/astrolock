@@ -45,15 +45,20 @@ def _excess(v, thr):
 
 
 class PixelTracker:
-    def __init__(self, cx, cy, rad_per_px, kp=1.5, ki=0.5, kd=1.0, gate_px=80.0, lost_s=1.5,
-                 vel_smooth=0.5, max_track_px_s=120.0, max_rate_rad_s=math.radians(8.0),
+    def __init__(self, cx, cy, rad_per_px, ki=0.3, damping=1.3, kd=1.0, gate_px=80.0, lost_s=1.5,
+                 vel_smoothing=0.1, max_track_px_s=120.0, max_rate_rad_s=math.radians(8.0),
                  sign_az=1.0, sign_alt=-1.0):
         self.cx, self.cy = cx, cy
         self.rad_per_px = rad_per_px
-        self.kp, self.ki, self.kd = kp, ki, kd
+        self.ki, self.kd = ki, kd
+        # For the loop (mount = integrator, PI control) the position error obeys
+        # e'' + kp e' + ki e = 0, so kp = 2*sqrt(ki) is critically damped. `damping` >= 1 pushes
+        # it slightly over-damped for margin against the real system's lags (mount update rate,
+        # frame latency). I is kept modest for the same reason -- too much integral oscillates.
+        self.kp = damping * 2.0 * math.sqrt(ki)
         self.gate_px = gate_px
         self.lost_s = lost_s
-        self.vel_smooth = vel_smooth
+        self.vel_smoothing = vel_smoothing        # 0 = trust each new velocity fully; higher = smoother
         self.v_thresh = max_track_px_s           # dead-zone: brake image speed above this
         self.max_rate = max_rate_rad_s           # mount rate clamp
         self.i_clamp = max_rate_rad_s / rad_per_px   # integral alone can't exceed max motor rate
@@ -65,6 +70,8 @@ class PixelTracker:
         self.active = True
         self.meas = [float(px), float(py)]      # last measured position
         self.vel = [0.0, 0.0]                    # smoothed image velocity (px/s): predict + brake
+        self._vel_raw = [0.0, 0.0]                # raw EMA (biased toward 0 early)
+        self._vel_w = 0.0                          # EMA of 1's (0 -> 1): warm-start bias correction
         self.integ = [0.0, 0.0]                  # integral of position error (px/s)
         self.meas_t = now
         self.good_t = now                        # last successful association
@@ -94,9 +101,16 @@ class PixelTracker:
                 dt = now - self.meas_t
                 if dt > 1e-3:
                     inst = ((mx - self.meas[0]) / dt, (my - self.meas[1]) / dt)
-                    s = self.vel_smooth
-                    self.vel = [self.vel[0] * (1 - s) + inst[0] * s,
-                                self.vel[1] * (1 - s) + inst[1] * s]
+                    # Per-frame EMA (the velocity noise is per detection -- tracker centroid
+                    # error -- not per unit time), warm-started by dividing by an EMA of 1s that
+                    # rises 0->1 with the same weight (bias correction: the first estimate is the
+                    # raw measurement, no warm-up lag). inst itself uses the real dt, so the speed
+                    # is correct; only the noise smoothing is per-frame.
+                    a = 1.0 - self.vel_smoothing          # weight of the new sample
+                    self._vel_raw = [self._vel_raw[0] * (1 - a) + inst[0] * a,
+                                     self._vel_raw[1] * (1 - a) + inst[1] * a]
+                    self._vel_w = self._vel_w * (1 - a) + a
+                    self.vel = [self._vel_raw[0] / self._vel_w, self._vel_raw[1] / self._vel_w]
                 self.meas = [mx, my]
                 self.meas_t = now
                 self.good_t = now

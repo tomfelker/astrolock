@@ -84,8 +84,11 @@ class SimMount(Mount):
                 for ax in (0, 1):
                     dv = _clamp(self._cmd[ax] - self._rate[ax], -self._accel * dt, self._accel * dt)
                     self._rate[ax] = _clamp(self._rate[ax] + dv, -self._max, self._max)
+                # Both axes rotate freely (no limits, clutches): altitude can tip past the zenith
+                # and keep going, so a near-zenith meridian crossing is tracked by tipping over
+                # rather than a 180-deg azimuth whip.
                 self._az = (self._az + self._rate[0] * dt) % (2 * math.pi)
-                self._alt = _clamp(self._alt + self._rate[1] * dt, -math.pi / 2, math.pi / 2)
+                self._alt = (self._alt + self._rate[1] * dt) % (2 * math.pi)
             time.sleep(self._period)
 
     def set_rates(self, az_rad_s, alt_rad_s):

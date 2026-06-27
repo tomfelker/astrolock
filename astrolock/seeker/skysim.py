@@ -140,17 +140,21 @@ class SkySim:
     # --- geometry -----------------------------------------------------------
 
     def boresight_basis(self, enc_az_rad, enc_alt_rad):
-        """True boresight unit vector b and tangent axes (A=az dir, L=alt dir), all (3,)."""
+        """
+        True boresight unit vector b and camera tangent axes A (image right = the fixed alt
+        rotation axis) and L (image up = d boresight / d alt). Both come from the *mount-frame*
+        orientation rotated by the tripod tilt, so they stay continuous and correct past the
+        zenith (alt > 90: the tube tips over, L rolls past horizontal). For alt < 90 with no
+        tilt this is identical to the simple altaz basis.
+        """
         c = self.cfg
         az_m = self._t(enc_az_rad - math.radians(c.az_offset_deg))
         alt_m = self._t(enc_alt_rad - math.radians(c.alt_offset_deg))
-        b = self._R_tilt @ _enu(az_m, alt_m)
-        b_alt = torch.asin(torch.clamp(b[2], -1.0, 1.0))
-        b_az = torch.atan2(b[0], b[1])
         z = torch.zeros((), device=self.device)
-        A = torch.stack([torch.cos(b_az), -torch.sin(b_az), z])
-        L = torch.stack([-torch.sin(b_alt) * torch.sin(b_az),
-                         -torch.sin(b_alt) * torch.cos(b_az), torch.cos(b_alt)])
+        b = self._R_tilt @ _enu(az_m, alt_m)
+        A = self._R_tilt @ torch.stack([torch.cos(az_m), -torch.sin(az_m), z])
+        L = self._R_tilt @ torch.stack([-torch.sin(alt_m) * torch.sin(az_m),
+                                        -torch.sin(alt_m) * torch.cos(az_m), torch.cos(alt_m)])
         return b, A, L
 
     def project(self, alt, az, b, A, L):
