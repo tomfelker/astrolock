@@ -20,6 +20,7 @@ import dataclasses
 import datetime
 import math
 import os
+import random
 
 import numpy as np
 import torch
@@ -49,8 +50,10 @@ class SkySimConfig:
 
     # rendering
     psf_sigma_px: float = 1.3
+    star_recompute_s: float = 1.0             # recompute star apparent positions at most this
+                                              # often (sim seconds); the satellite is per-substep
     mag_limit: float = 7.0
-    mag_flux_scale: float = 1.0e6             # electrons/s for a mag-0 source
+    mag_flux_scale: float = 4.0e6             # electrons/s for a mag-0 source (brighter stars)
     sky_bg_rate_e: float = 80.0              # sky background electrons / pixel / s
     read_noise_e: float = 2.0
     adu_per_e: float = 0.05                   # gain: electrons -> 12-bit ADU
@@ -58,6 +61,8 @@ class SkySimConfig:
     # optional satellite target: (tle_line1, tle_line2, name), plus a magnitude
     target_tle: tuple = None
     target_mag: float = 1.0
+    sat_window_s: float = 600.0               # precompute the satellite ephemeris over this span
+    sat_sample_s: float = 0.1                  # at this step, then interpolate (no per-frame SGP4)
 
 
 def _enu(az, alt):
@@ -115,6 +120,20 @@ class SkySim:
         self._R_tilt = (_rot_x(math.radians(c.zenith_pitch_deg))
                         @ _rot_y(math.radians(c.zenith_roll_deg))).to(device)
 
+        self._star_interval = c.star_recompute_s   # cached-star recompute cadence (+ jitter)
+        self._star_cache = None
+        self._next_star_t = 0.0
+        # FoV culling radius: half-diagonal of the frame + a margin for slew during the exposure
+        half_x = math.atan(c.width * c.pixel_pitch_um * 1e-3 / (2 * c.focal_length_mm))
+        half_y = math.atan(c.height * c.pixel_pitch_um * 1e-3 / (2 * c.focal_length_mm))
+        self._cull_cos = math.cos(math.hypot(half_x, half_y) + math.radians(3.0))
+
+        # Precompute the satellite ephemeris once (one vectorised SGP4 pass) and interpolate it
+        # at render time -- no per-frame propagation.
+        self._sat_table = None
+        if self.satellite is not None:
+            self._sat_table = self._precompute_satellite(c.sat_window_s, c.sat_sample_s)
+
     def _t(self, v):
         return torch.as_tensor(v, dtype=torch.float32, device=self.device)
 
@@ -166,6 +185,39 @@ class SkySim:
             mag = torch.cat([mag, self._t([self.cfg.target_mag])])
         return alt, az, mag
 
+    def _stars_altaz(self, t_s):
+        """
+        Cached star apparent (alt, az) radians. Recomputed at most every star_recompute_s sim
+        seconds (the dominant cost -- Skyfield over thousands of stars); stars move only at the
+        sidereal rate so this is harmless. Jittered so multiple cameras don't recompute in
+        lockstep.
+        """
+        if self._star_cache is None or t_s >= self._next_star_t:
+            alt, az, _ = self.observer.at(self._sf_time(t_s)).observe(self.stars).apparent().altaz()
+            a, z = self._t(alt.radians), self._t(az.radians)
+            self._star_cache = (a, z, _enu(z, a))      # cache ENU dirs too, for FoV culling
+            self._next_star_t = t_s + self._star_interval * random.uniform(0.75, 1.25)
+        return self._star_cache
+
+    def _precompute_satellite(self, window_s, dt_s):
+        """One vectorised SGP4 pass over [epoch, epoch+window] at dt_s -> (dt_s, n, alt, az_unwrapped)."""
+        n = int(round(window_s / dt_s)) + 1
+        secs = np.arange(n) * dt_s
+        t0 = self._t0
+        sec0 = t0.second + t0.microsecond * 1e-6
+        times = self.ts.utc(t0.year, t0.month, t0.day, t0.hour, t0.minute, sec0 + secs)
+        alt, az, _ = (self.satellite - self._topos).at(times).altaz()
+        az_unwrapped = np.unwrap(az.radians)        # continuous so linear interp can't jump at 0/2pi
+        return dt_s, n, self._t(alt.radians), self._t(az_unwrapped)
+
+    def _sat_altaz_at(self, seconds_list):
+        """Interpolate the cached satellite ephemeris (radians) at the given sim-times."""
+        dt_s, n, alt_tab, az_tab = self._sat_table
+        idx = torch.tensor([s / dt_s for s in seconds_list], dtype=torch.float32).clamp(0, n - 1 - 1e-3)
+        i0 = idx.floor().long()
+        f = idx - i0
+        return alt_tab[i0] * (1 - f) + alt_tab[i0 + 1] * f, az_tab[i0] * (1 - f) + az_tab[i0 + 1] * f
+
     # --- rendering ----------------------------------------------------------
 
     def _splat(self, fb, px, py, flux):
@@ -198,14 +250,31 @@ class SkySim:
                rate_az_rad_s=0.0, rate_alt_rad_s=0.0, exposure_s=0.05, substeps=6):
         """Render one frame -> uint16 (H, W) ndarray (12-bit data left-shifted into 16 bits)."""
         c = self.cfg
+        star_alt, star_az, star_s = self._stars_altaz(seconds_from_epoch + 0.5 * exposure_s)
+        # Cull stars to the field of view (thousands -> the few dozen actually in frame): keep
+        # those within the FoV diagonal (+margin) of the frame-centre boresight.
+        b0, _, _ = self.boresight_basis(enc_az_rad + rate_az_rad_s * 0.5 * exposure_s,
+                                        enc_alt_rad + rate_alt_rad_s * 0.5 * exposure_s)
+        keep = (star_s @ b0) > self._cull_cos
+        c_alt, c_az, c_mag = star_alt[keep], star_az[keep], self.star_mag[keep]
+
+        fracs = [(i + 0.5) / substeps for i in range(substeps)]
+        if self.satellite is not None:                       # interpolate the precomputed ephemeris
+            sat_alt_all, sat_az_all = self._sat_altaz_at(
+                [seconds_from_epoch + f * exposure_s for f in fracs])
+            sat_mag = self._t([c.target_mag])
+
         fb = torch.zeros((c.height, c.width), dtype=torch.float32, device=self.device)
-        for i in range(substeps):
-            frac = (i + 0.5) / substeps
-            t_s = seconds_from_epoch + frac * exposure_s
+        for i, frac in enumerate(fracs):
             az = enc_az_rad + rate_az_rad_s * frac * exposure_s
             alt = enc_alt_rad + rate_alt_rad_s * frac * exposure_s
             b, A, L = self.boresight_basis(az, alt)
-            s_alt, s_az, mag = self.sources_altaz(self._sf_time(t_s))
+            if self.satellite is not None:                   # stars cached+culled; satellite batched
+                s_alt = torch.cat([c_alt, sat_alt_all[i:i + 1]])
+                s_az = torch.cat([c_az, sat_az_all[i:i + 1]])
+                mag = torch.cat([c_mag, sat_mag])
+            else:
+                s_alt, s_az, mag = c_alt, c_az, c_mag
             px, py, vis = self.project(s_alt, s_az, b, A, L)
             flux_e = c.mag_flux_scale * (10.0 ** (-0.4 * mag)) * exposure_s / substeps
             self._splat(fb, px[vis], py[vis], flux_e[vis])

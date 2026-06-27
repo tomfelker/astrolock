@@ -180,7 +180,8 @@ def _open_sky(args, state_path=None):
     from astrolock.seeker.skysim import SkySim, SkySimConfig
 
     cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
-                       focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um)
+                       focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
+                       star_recompute_s=args.sky_star_interval)
     if args.sky_epoch:
         cfg.epoch_utc = args.sky_epoch
     if args.sky_lat is not None:
@@ -275,6 +276,8 @@ def main(argv=None):
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky: scripted alt slew (deg/s)")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky: simulated exposure (s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
+    p.add_argument('--sky-star-interval', type=float, default=1.0,
+                   help="sky: recompute star positions at most this often (s); speeds up rendering")
     p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
                    help="sky: TLE file (2 or 3 lines) for a satellite target (default: the ISS)")
     p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky: satellite target magnitude")
