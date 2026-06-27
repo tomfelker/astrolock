@@ -13,6 +13,37 @@ This document is the architecture/MVP plan. It is intentionally scoped down — 
 [Out of scope (for now)](#out-of-scope-for-now) for the pile of fun ideas we are
 deferring until the MVP stands up.
 
+## Running it
+
+Everything runs from the repo root with the project venv. The simplest invocation needs no
+hardware — it launches the whole pipeline (a simulated mount + sky camera, a detector, and the
+GUI) on a baked-in **ISS test pass**:
+
+```
+python -m astrolock.seeker.backend
+```
+
+The GUI opens on the rising ISS, pointed roughly (not exactly) at it so acquisition is
+exercised. **Left-click the bright ISS** to lock and track; it holds it through the near-zenith
+crossing (altitude tips over, azimuth dead-zones at the singularity) and **right-click** stops.
+The backend launches and monitors the cam + detector subprocesses and runs the ~20 Hz loop.
+
+Useful flags (all on `astrolock.seeker.backend`):
+
+- `--source synthetic` — a no-dependency moving-blob scene (no Skyfield/torch needed);
+  `--source zwo` — a real ASI camera; default `sky` is the simulator.
+- `--mount sim` (default) vs `--mount celestron --mount-url celestron_nexstar_hc:COM3` — the
+  real NexStar mount (driver written, untested at the scope).
+- `--epoch`, `--sky-tle-file`, `--sky-target-mag`, `--start-az-deg/--start-alt-deg` — pick a
+  different pass/target/pointing; `--no-gui --duration N` for headless runs.
+- `--max-rate-deg-s`, `--mount-accel-deg-s2`, `--track-ki`, `--track-damping`, `--track-kd`,
+  `--track-max-px-s`, `--track-zenith-zone-deg`, … — mount + controller tuning.
+
+Components are runnable standalone too (e.g. `python -m astrolock.seeker.cam --source sky`,
+`python -m astrolock.seeker.gui --session sessions/<ts>` to replay a recorded session). Tests:
+`python -m astrolock.seeker.tests.<name>` (ser, bayer, cam_follower, detect, gui_prep,
+cam_control, controller, skysim).
+
 ## Why this can be simple
 
 The key insight: a pixel-space PID drives the target-to-boresight error to zero
@@ -583,6 +614,15 @@ Deliberately rough:
 
 Ordered so the early ones need **no hardware** (just an old `.ser`), thanks to the
 file-driven pipeline.
+
+> **Status (as built).** Milestones 1–6 are done and validated *in simulation*: the SER/follower
+> libs, offline + live `detect`, the GUI (playback and live), live capture plumbing, the mount in
+> the loop, and the closed loop (click-to-track PI + dead-zoned-D brake, azimuth `÷cos(alt)` gimbal
+> compensation, zenith dead-zone, frame-timestamp-clocked control). Beyond the original plan we
+> also built a physically-based **sky simulator** + a **simulated mount driver** (so the whole
+> loop runs with no hardware), baked in an **ISS test pass**, and made the sim hit ~30 fps.
+> **Remaining:** run milestone 5's serial path on the **real mount** (driver written, untested),
+> and milestone 7 (**calibration UX** — boresight is currently just the frame centre).
 
 1. **SER reader/writer + follower lib.** Self-contained SER reader + writer (INT_MAX
    sentinel, frame-flush before sidecar line; adapt the small format logic), and the shared

@@ -144,6 +144,39 @@ This lets you use Google Earth (or anything that can output KML) to specify targ
 
 The focus.py tool uses a camera to help focus or collimate the telescope.  (It's a little like MetaGuide with fewer features and no UI...)  Just run it and it should connect to an ASI camera (you'll need to install the library) and show a live view.  (To adjust exposure and gain, you'll need to edit the python file... TODO autoexposure.)  It will select the brightest star, compute an exponential moving average of it, show how they are centered relative to their peaks, and tell you which screw to turn.
 
+## AstroLock Seeker (work in progress)
+
+**Seeker** is a new, simpler subsystem that realizes the "Capture and Closed Loop" idea below: a
+closed-loop tracker for any smoothly-moving bright object (satellites/ISS, planes, rockets) using
+a wide **guide camera** plus the **main scope camera**, closing the loop directly in
+**guide-camera pixel space**. It deliberately skips the main app's alignment/TLE world model —
+you just point roughly, click the target on screen, and it drives the mount to keep it centered.
+
+It's built as a Unix-style pipeline of small processes (`cam`, `detect`, `backend`, `gui`) that
+communicate through SER video files + JSONL sidecars, so the same code runs live or in replay.
+A full **simulation path** — a physically-based sky simulator (Skyfield/SGP4 + a torch renderer)
+and a simulated mount *driver* — lets the whole closed loop run with **no hardware**.
+
+Run it (from the repo root):
+
+```
+python -m astrolock.seeker.backend
+```
+
+That opens the Dear PyGui viewer already set up on a baked-in **ISS pass** (a near-zenith pass
+over San Carlos). The bright ISS rises into view slightly off-center — **left-click it to lock
+and track**; it'll hold it through the zenith (tipping the altitude axis over rather than whipping
+the azimuth around) and **right-click to stop**. Useful flags: `--source synthetic` for a
+no-dependency moving-blob scene, `--source zwo` for a real ASI camera, and
+`--mount celestron --mount-url celestron_nexstar_hc:COM3` for a real mount.
+
+**Status:** the full closed loop works end-to-end in simulation, including PID auto-tracking with
+azimuth gimbal compensation and a zenith dead-zone. The real-hardware mount driver is written
+(reusing the NexStar driver) but untested at the scope; boresight calibration and the auditory
+"Sidewinder" lock-on are the next steps.
+
+Design, internals, and roadmap: see [astrolock_seeker.md](astrolock_seeker.md).
+
 ## Future Directions
 
 ### New tracking modes:
@@ -178,7 +211,9 @@ The code is already multithreaded, but Python's GIL being what it is, that doesn
 
 ### Capture and Closed Loop
 
-There's a nice Python library for Zwo cameras (and likely others...), PyTorch for processing frames, and Tensorez has some code for .SER files.  So it'd be cool to make a GUI for doing the focusing and video capture also.  Quickly detecting the center of mass of the image could give a steering signal.  Also it'd be cool to have auditory feedback - it should sound like a Sidewinder when it locks on.  This would likely have to be a different program for threading reasons, but tightly integrated.
+This is now in progress as **AstroLock Seeker** (see the section above): a separate, file-driven
+pipeline that captures video, detects the target, and closes the tracking loop in image space.
+The auditory "Sidewinder" lock-on feedback is still on the wishlist.
 
 # License
 
