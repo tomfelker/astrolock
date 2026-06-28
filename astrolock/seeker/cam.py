@@ -23,6 +23,7 @@ import numpy as np
 from astrolock.seeker import control as control_mod
 from astrolock.seeker import ser as ser_mod
 from astrolock.seeker import session as session_mod
+from astrolock.seeker import sidecar
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
 
@@ -247,11 +248,58 @@ def _open_sky(args, state_path=None):
     return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta
 
 
+def _open_playback(args):
+    """
+    Replay an existing .ser as if it were a live camera, paced by its frame timestamps (x
+    --playback-speed). Loops at the end. Lets the whole live pipeline (detect, gui, tracking)
+    run on a recording -- the easy way to review a capture with detections overlaid.
+    """
+    src = ser_mod.SerReader(args.playback_ser)
+    h = src.header
+    n = src.frames_on_disk()
+    if n < 1:
+        raise RuntimeError(f"no frames in {args.playback_ser}")
+    recs = (sidecar.read_complete_lines(args.playback_ser[:-len('.ser')] + '.frames.jsonl')
+            if os.path.exists(args.playback_ser[:-len('.ser')] + '.frames.jsonl') else [])
+    times = [r.get('t_mono_ns') for r in recs]
+    meta = {'bin': [1, 1], 'roi': [0, 0, h.image_width, h.image_height]}
+    for r in recs:
+        if 'bin' in r:
+            meta = {'bin': r['bin'], 'roi': r.get('roi', meta['roi'])}
+            break
+    print(f"[cam] playback {os.path.basename(args.playback_ser)} {h.image_width}x{h.image_height} "
+          f"{n} frames x{args.playback_speed}", flush=True)
+
+    st = {'i': 0, 'wall0': None, 't0': None}
+
+    def capture():
+        if st['i'] >= n:
+            if not args.playback_loop:
+                return None                       # one-shot: signal end of stream
+            st['i'], st['wall0'] = 0, None        # loop back to the start
+        i = st['i']
+        frame = src.read_frame(i)
+        if times and i < len(times) and times[i] is not None:   # pace to the recorded cadence
+            if st['wall0'] is None:
+                st['wall0'], st['t0'] = time.perf_counter(), times[i]
+            delay = (st['wall0'] + (times[i] - st['t0']) * 1e-9 / max(1e-6, args.playback_speed)
+                     - time.perf_counter())
+            if delay > 0:
+                time.sleep(delay)
+        st['i'] = i + 1
+        return frame
+
+    return capture, h.image_width, h.image_height, h.color_id, h.pixel_depth_per_plane, None, meta
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker camera capture")
     p.add_argument('--role', default='guide', help="camera role / file basename (e.g. guide, main)")
     p.add_argument('--out-dir', default=None, help="session dir to write into (default: a new sessions/<ts>)")
-    p.add_argument('--source', default='synthetic', choices=['synthetic', 'zwo', 'sky'])
+    p.add_argument('--source', default='synthetic', choices=['synthetic', 'zwo', 'sky', 'playback'])
+    p.add_argument('--playback-ser', default=None, help="playback: the .ser file to replay")
+    p.add_argument('--playback-speed', type=float, default=1.0, help="playback: speed multiplier")
+    p.add_argument('--playback-loop', action='store_true', help="playback: loop instead of stopping at the end")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=15.0)
@@ -329,6 +377,8 @@ def main(argv=None):
     elif args.source == 'sky':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_sky(
             args, state_path=os.path.join(out_dir, session_mod.state_name(ts)))
+    elif args.source == 'playback':
+        capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_playback(args)
     if frame_meta is None:                                  # synthetic: full frame, no binning
         frame_meta = {'bin': [1, 1], 'roi': [0, 0, width, height]}
 
@@ -372,6 +422,10 @@ def main(argv=None):
                     if capture is not None:
                         frame = capture()
                         if frame is None:
+                            if args.source == 'playback' and not args.playback_loop:
+                                print(f"[cam:{args.role}] playback complete", flush=True)
+                                stop = True
+                                break
                             print(f"[cam:{args.role}] capture timeout, skipping", flush=True)
                             continue
                     else:

@@ -607,6 +607,9 @@ Deliberately rough:
    need to be precise.
 2. **Boresight.** Point at a bright star, center it in the **main** camera, and record its
    pixel in the **guide** camera. That guide pixel is the target everything is driven to.
+   *(Preferred per the backlog: instead of a separate step, nudge the boresight offset live while
+   tracking until the target centers in the main cam — that becomes the calibration, and absorbs
+   mirror flop.)*
 3. **Angle-per-pixel.** Compute from config (focal length + sensor pixel pitch) for both
    cameras. Optional later refinement: slew a known amount, measure the pixel shift.
 
@@ -641,6 +644,192 @@ file-driven pipeline.
    driving the target to boresight; GO/stop from the GUI; main cam recording throughout.
 7. **Calibration UX.** The three calibration steps, driven from the GUI, persisted to
    `config/seeker.json`.
+
+## Backlog (brainstorm)
+
+Captured ideas, not yet scheduled. Grouped by area.
+
+### GUI
+- **Live camera settings** per camera (guide + main): exposure time, frame rate, gain, bit
+  depth. Exposure/gain/fps already go over the per-cam control channel; **bit depth / ROI need
+  a cam relaunch** (format change). Each setting gets **+/- buttons to bump by a half f-stop**
+  (×/÷ √2 on exposure / linear gain) for fast dialing-in.
+- **Histograms** per camera, as a **readout** (judge exposure, spot clipping) — *not* a stretch
+  control. The preview stays **WYSIWYG (no display stretch)** so exposure can be set accurately;
+  you expose/gain the camera until it looks right rather than stretching pixels.
+- **ROI (region of interest)** per camera (most useful on the narrow main cam): a checkbox + size
+  text boxes to read out a sub-window (higher framerate, less data). Plus an **"auto ROI"** mode:
+  once the target is tracked and near center, switch to a small ROI and **move it each frame to
+  keep the target centered** — *electronic* following on the sensor while the mount tracks
+  *mechanically*. Feasibility: ZWO can move the ROI start position live, and **moving (not
+  resizing) keeps the `.ser` dimensions fixed**, so only the ROI origin changes — recorded
+  per-frame in the frames sidecar (which already carries `roi`); a resize is a new segment. The
+  backend tracks in **full-sensor coords** (`roi_origin + in-ROI pos × bin`) against the sensor
+  boresight, so it still has the target's position even though it ideally stays centered in the
+  window — i.e. two loops: the mount (coarse) and the ROI (fine).
+- **Adjustable preview size**: the preview is currently the debayered half-res scaled to
+  `--display-width` (default 640) — ~6× down from a 3840 sensor; make it a GUI control / larger
+  default.
+- **WYSIWYG display, no white balance.** Neutral WB on the camera (pristine raw — already the
+  default); the display does *only* a standard linear→sRGB conversion (standard gamma), with **no
+  per-channel display gains** (drop the current `wb_r`/`wb_b`). Casts are real (e.g. a baby-blue
+  wall; foliage blown white by an IR spotlight with no IR-cut filter), and we want to see truth.
+- **Playback source** (built — `cam --source playback --playback-ser <file>`): replays any
+  recorded `.ser` through the *live* pipeline at its recorded cadence (`--playback-speed`,
+  `--playback-loop`), so `detect`/GUI/tracking all run on it — the easy way to review a capture
+  with detections overlaid (the GUI alone only shows the newest frame of a finalized file). TODO:
+  a **GUI file picker** to choose the `.ser` to replay.
+- **Zoomed target inset(s)**: a magnified live view of the tracked target (and/or the boresight),
+  great for focusing and for eyeballing detection. **(stretch) integrate the focus/collimation
+  tool** (`focus.py`): show its star-profile EMA + screw-turn guidance on the tracked target.
+- **Reticles**: crosshair/circle at the boresight pixel; outline the **main camera's FOV** on
+  the guide view (both follow from boresight + plate scale).
+- **Alt/az grid** (and later RA/dec) drawn over the guide view from the mount pose + plate
+  scale — effectively the first world-model overlay.
+- **Auto-record when tracking starts** — a **per-camera** toggle; each camera independently
+  records from lock to unlock.
+- Two-camera layout throughout (guide + main panes), since both are coming.
+- **Camera enumeration**: ask each driver which cameras it sees (zwo already has
+  `list_cameras()`; generalize across drivers) and let the GUI assign physical cameras to roles
+  (guide / main). Needed once we run two cameras.
+- **Gamepad slewing**: reuse the main app's PS4/PS5 gamepad support for manual slew — it feeds the
+  same `set_rate` command path the on-screen pad already uses.
+- **2D slew pad** (replace the four direction buttons): a box whose circle always **displays the
+  current commanded slew rate** (center = zero). The command is a **priority mux** — mouse
+  click/drag in the pad > gamepad stick > tracking-loop output > zero. "Spring return" just means a
+  source deactivates when released, so the displayed/commanded rate **falls through to the next
+  active source**: e.g. mouse-nudge while tracking, release, and the **tracker resumes** (a
+  momentary override, not a cancel — unlike today's "manual stops tracking"). Optional **log-scale
+  axes** (fine near center, full slew at the edges). Implies a small **rate-source arbiter** in the
+  backend replacing the current "`set_rate` cancels tracking" behavior.
+
+### Sim camera
+- **Optics + sensor presets**: rather than maintain our own library, **vendor a snapshot of
+  Stellarium's Oculars data** (`ocular.ini`: `[ccd]` chip size/resolution/pixel size,
+  `[telescope]` focal length/aperture — read with `configparser`), deriving pixel pitch + FOV.
+  The contents are bare facts (no copyright concern); refresh the snapshot occasionally. Doubles
+  as real-camera config later.
+- **(stretch) Physically accurate star brightness**: electrons from aperture × QE × bandpass ×
+  exposure × a zero-point, so sim ADU matches what a real sensor would record.
+- **Render the ISS as a crude multi-point sketch** (~tens of points: truss/backbone + solar
+  arrays + modules) rather than a single point, to convey its angular *size* in frame. Offset each
+  body point from the satellite center by `body_meters / slant_range` in direction space and
+  project through the normal pipeline, so the size is automatically distance-correct; spread the
+  total flux over the points. Not meant to be accurate — a rough heuristic orientation (long axis
+  ⟂ ground-track velocity) is enough. Mostly visible in a long-focal main-scope view; in the wide
+  guide cam the ISS is genuinely ~1px.
+- **(very stretch) Dynamic seeing via fine-step drizzle**: integrate each exposure at a fixed
+  ~1 ms step, **lerping every source along its PWL world-path** (cheap — no per-step astrometry)
+  and perturbing by a **time-correlated atmospheric tip/tilt** (common across the field for the
+  small FoV; correlation time + amplitude as Fried-ish knobs). Integrating over the exposure then
+  *produces* the seeing itself — a dancing/displaced star on short exposures (lucky-imaging),
+  blurred into a seeing disk on long ones — replacing/augmenting the fixed Gaussian PSF. Bonus: it
+  gives the tracker realistic centroid jitter to be robust against.
+
+### Detection
+- **Only fixed-source detection really matters.** The point is to *track*, which holds the target
+  ~still in frame, so detecting a crisp **point source** is the case that counts. Streaked/moving
+  detection only matters in the brief pre-lock acquisition transient (covered by the mover-finding
+  below) — so tune for fixed points and don't over-engineer streak handling.
+- **Works poorly on real, non-starfield scenes.** Indoors with a laser pointer: finds nothing
+  (not even the dot) or false-positives on a flat textured surface. On a real night capture
+  (3840×2160 RGGB, 8 mm lens, out a shed door, auto-exposure 0.2 s / gain 400 — many stars incl.
+  the Big Dipper, plus two very dim moving dots): it detects *some* stars but not all,
+  false-positives on the **door frame** (a straight edge → exactly what the determinant-of-Hessian test rejects), and **misses
+  the dim movers**. The starfield-tuned band-pass + SNR doesn't transfer to bright/cluttered
+  scenes. Action: **trim a short clip as a checked-in test fixture** (full captures are multi-GB).
+- **Temporal differencing to surface dim movers** — but **not** naive pairwise. *Finding (real
+  capture, `framediff` tool):* the magnitude of successive-frame differences was **harder to see
+  than the raw** — a dim, slowly-moving dot nearly overlaps itself between 0.2 s frames, so it
+  largely **self-cancels** while √2× noise fills the frame. Pairwise diff only helps *fast*
+  movers. Better for slow/dim ones: (a) **longer baseline** — diff against frame `i−K` (seconds
+  back) so the mover separates into two distinct dots; (b) **temporal-median background
+  subtraction** — median over a window removes static stars/clutter, and a moving dot isn't in
+  the median at its current spot so it pops without self-cancellation (the standard technique).
+  Then run the determinant-of-Hessian blob test on the result. (We already frame-diff for the `moving` flag — this
+  is about using it to *find*, with the right baseline.)
+- **False positives are OK for tracking** (so masking isn't worth it): as long as detection also
+  gets the *real* targets, the backend's gated selection picks the right one near the prediction.
+  FP-cleanliness matters mainly for **plate-solving**. And when the mount is **not slewing**,
+  frame-differencing already cancels static clutter (door frame, tree) for free.
+- **Match the PSF to a few pixels (slight defocus) + matched low-pass.** A focused star ≈ 1px —
+  the *same spatial frequency* as read/hot-pixel noise — so no filter can separate them. Slightly
+  defocus the **guide** cam so the PSF spans ~2–3px (Nyquist), then **low-pass / matched-filter**
+  at that scale (small Gaussian convolution): it passes the blob while cutting 1px noise → higher
+  detection SNR, and it enables **sub-pixel centroiding** (tighter tracking). Sweet spot ~2–3px
+  FWHM (over-defocus spreads the energy thin and lowers peak SNR). Keep the **main** cam focused
+  (resolve/record). The sim already uses a ~3px PSF; the real guide cam is likely undersampled,
+  which partly explains the poor real-scene detection above. (Names: **matched filtering** /
+  PSF-matched filter — relatives are the *Laplacian of Gaussian* and *Difference of Gaussians*;
+  the optics practice is **defocused photometry** and keeping the PSF **Nyquist / critically
+  sampled** for centroiding.)
+- **Determinant-of-Hessian blob detector**: convolve with Gaussian 2nd-derivative filters
+  (Lxx, Lyy, Lxy) and take the determinant Lxx·Lyy − Lxy². Peaks are round blobs (stars, a laser dot);
+  edges/lines (telephone wires) score ~0 because one principal curvature vanishes. Replaces /
+  augments the current pointlike + roundness heuristics. [open: single scale at the known guide
+  PSF, or a small scale-space?]
+- **Candidate pipeline: PSF-scale band-pass → determinant of the Hessian.** Band-pass matched to
+  the PSF (low-pass to cut the highest frequency = 1px noise; high-pass to cut frequencies below
+  the PSF = background / large structure), then the determinant of the Hessian to keep round blobs
+  and reject lines/edges. **But the determinant of the Hessian already bakes the band-pass in** —
+  it's computed by convolving with *Gaussian second-derivative* filters, so the Gaussian's width
+  is the scale + the noise low-pass, and differentiating kills the flat/slow background (the
+  high-pass). So a separate band-pass is largely redundant; **determinant of the Hessian at the PSF
+  scale likely does the whole job**. (If a cheap explicit band-pass is wanted, a *Difference of
+  Gaussians* — narrow blur minus wide blur — approximates a *Laplacian of Gaussian*; our current
+  box-blur background-subtract is a crude cousin.) Pairs naturally with the slightly-defocused,
+  PSF-matched guide cam above.
+- **Track-aware target selection (backend).** Once locked, weight targetness by proximity to the
+  *expected* target position and reject far false matches. This is a decision-stage job and the
+  backend already has the prediction (controller pos + vel), so do it there — **no detect coupling**,
+  detect stays a pure file→file perception stage (live == replay). The backend extrapolates its
+  last `{pos, t, vel}` to the detection's frame timestamp and picks/weights among detect's
+  candidates. (Mostly the controller's existing gated association, generalized to soft weighting.)
+- **Detect-side ROI gating (deferred perf optimization).** The *only* extra benefit of pushing the
+  gate into detect is not running the detector over the whole frame — worth it only once detection
+  is expensive (e.g. the determinant of the Hessian over a big main-cam frame). When profiling says so, add a **backend→detect
+  kinematic-hint feedback path** `{pos, timestamp, velocity}`; detect extrapolates to the new
+  frame's own capture timestamp and searches only that region. Couples the stages, so don't do it
+  before it pays for itself.
+  - *Caveats for later (the split isn't permanent):* (a) once targets are **resolved/imaged**
+    rather than points, the detector carries **identity/appearance** cues worth fusing into
+    selection, not just position; (b) the gate is **time-dependent** — it should grow with elapsed
+    time since the last good fix as positional uncertainty accumulates, not a fixed radius.
+- **Distractor rejection** (a dim target flying past a bright star): when locked, **don't select
+  by brightness** — a bright star near the dim mover must not steal the lock. Score by proximity
+  to the prediction + **velocity-consistency** (the star is ~sidereal/stationary while the target
+  moves along its predicted track), and by brightness/appearance *similarity* once the target is
+  characterized. If genuinely ambiguous through the conjunction, **coast on the prediction** and
+  re-acquire on the far side.
+
+### Guiding / control
+- **Scale-invariant tuning**: the PI *loop gain* is already pixel-scale-invariant (`rad_per_px`
+  cancels between command and plant), but the px-denominated tunables (gate, dead-zone,
+  velocity) are not — express those in **angular units (arcsec)** so a tuning transfers across
+  cameras/FOVs.
+- **Live boresight-offset nudge = the calibration.** The loop holds the target at
+  `frame_center + boresight_offset`; let the operator nudge that offset (gamepad/keys) *while
+  tracking* until the target sits where they want (e.g. centered in the main cam). That nudge,
+  persisted, *is* the boresight calibration — no separate ritual — and it can be redone on the fly
+  to absorb **mirror flop**. (Supersedes the milestone-7 boresight step.)
+- **Track on the main (narrow) camera** for finer guiding: a **new main-cam detect process** using
+  a **centroid** algorithm (the target is resolved/bright there, not a peak-blob); the controller
+  takes the main-cam error when locked on it. **Keep the guide-cam lock alive as a fallback** so we
+  re-acquire when the narrow field loses it. Needs the scale-invariant-tuning item above (very
+  different plate scale). A guide→main handoff, with the guide as the safety net.
+
+### World model as a process (very stretch)
+- Pull the world model out of the sim camera into its **own process**. It emits, per target, a
+  **piecewise-linear path in world *direction* space** over time — sampled **ENU unit vectors**
+  (renormalized-lerp between samples, which avoids the alt/az pole singularity), plus magnitude /
+  identity. The sim camera and the GUI both **interpolate by timestamp** to place targets
+  smoothly at any instant. This is the satellite precompute-and-interpolate already in `skysim`,
+  generalized to all targets and exposed as just another file in the pipeline.
+- Payoffs: decouples the heavy astrometry (compute once → many consumers); becomes the **single
+  source for GUI world-model overlays** (the circle/line convention — satellites, aircraft,
+  landmarks); serves both **sim** (render the truth) and **real** (overlay predictions on the live
+  guide cam); and is the natural **bridge to the main AstroLock world model**, which already
+  computes these positions and could emit the same track file.
 
 ## Out of scope (for now)
 

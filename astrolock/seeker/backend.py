@@ -42,8 +42,12 @@ def _spawn(module, args):
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker backend / orchestrator")
     p.add_argument('--roles', default='guide', help="comma-separated camera roles to launch")
-    p.add_argument('--source', default='sky', choices=['synthetic', 'zwo', 'sky'],
-                   help="default 'sky' runs the baked-in ISS test pass; 'synthetic' needs no deps")
+    p.add_argument('--source', default='sky', choices=['synthetic', 'zwo', 'sky', 'playback'],
+                   help="default 'sky' runs the baked-in ISS test pass; 'synthetic' needs no deps; "
+                        "'playback' replays a recorded .ser through the live pipeline")
+    p.add_argument('--playback-ser', default=None, help="playback source: the .ser file to replay")
+    p.add_argument('--playback-speed', type=float, default=1.0, help="playback source: speed multiplier")
+    p.add_argument('--playback-loop', action='store_true', help="playback source: loop instead of stopping")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=30.0)
@@ -136,6 +140,9 @@ def main(argv=None):
                     '--sky-follow-state']
         if args.sky_tle_file:
             sky_args += ['--sky-tle-file', args.sky_tle_file, '--sky-target-mag', str(args.sky_target_mag)]
+    playback_args = (['--playback-ser', args.playback_ser, '--playback-speed', str(args.playback_speed)]
+                     + (['--playback-loop'] if args.playback_loop else [])
+                     if args.source == 'playback' and args.playback_ser else [])
     estop = False
     recording = False
 
@@ -167,7 +174,7 @@ def main(argv=None):
             '--width', str(args.width), '--height', str(args.height), '--fps', str(args.fps),
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
             '--important', '1' if recording else '0', '--control-file', cf,
-            *(['--auto'] if args.auto else []), *sky_args,
+            *(['--auto'] if args.auto else []), *sky_args, *playback_args,
         ])
         control_writers[role].append({'important': 1 if recording else 0})
 
