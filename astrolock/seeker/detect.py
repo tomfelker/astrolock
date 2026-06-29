@@ -22,7 +22,6 @@ import math
 import os
 import time
 
-import numpy as np
 import torch
 
 from astrolock.seeker import bayer, ser as ser_mod, sidecar
@@ -135,22 +134,21 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
                  min_blob_px, max_size_px, psf_px, snr=0.0, min_roundness=0.0, moving_frac, scale,
                  tile_grid=0, per_tile=0):
     """
-    Peak detection on the detection surface ``bp`` (band-pass or determinant-of-Hessian), with
-    non-max suppression. ``work`` is the original grayscale (absolute brightness score) and
-    ``prev_bp`` the previous surface (the "moving" flag).
+    Peak detection on the detection surface ``bp`` (band-pass or determinant-of-Hessian), fully
+    vectorized in torch (device-agnostic; no Python per-pixel loop -- only the final
+    <= max_candidates results cross back to Python as dicts). ``work`` is the original grayscale
+    (absolute brightness ``score``) and ``prev_bp`` the previous surface (the "moving" flag).
 
-    NMS: local maxima (>= every neighbor within ``suppress_radius``) are found in one max-pool
-    pass, then taken strongest-first while suppressing a radius-r neighborhood around each (so a
-    flat ridge yields one peak per r, as before). Each blob gets a sub-pixel center, size,
-    brightness ``score``, ``pointlike`` (1 = PSF-sized, →0 = extended), and ``roundness`` (1 =
-    circular, →0 = line/edge). Peaks must clear ``snr`` sigma above the surface background (robust
-    MAD) and/or a ``threshold_rel`` floor; ``max_size_px`` / ``min_roundness`` reject extended
-    clutter and edges/streaks.
+    Candidates are the max of each ``2*suppress_radius+1`` tile (a strided max-pool, already
+    ~r-spaced). For all candidates at once we compute a sub-pixel centre, size, ``pointlike``
+    (1 = PSF-sized, →0 = extended) and ``roundness`` (1 = circular, →0 = line/edge, from the
+    second-moment eigenvalues), then cut: peaks must clear ``snr`` sigma over the surface
+    background (robust MAD) and/or a ``threshold_rel`` floor, and pass ``min_blob_px`` /
+    ``max_size_px`` / ``min_roundness``.
 
-    Density cap: with ``tile_grid`` > 0 the frame is split into a grid ~``tile_grid`` tiles across
-    and at most ``per_tile`` blobs are kept per tile. This stops a dense bright region (a foliage
-    blob-field) from eating the whole ``max_candidates`` budget and starving real targets
-    elsewhere -- we limit target *density*, not just the total.
+    Density cap: with ``tile_grid`` > 0 the frame is split into ~``tile_grid`` tiles across and at
+    most ``per_tile`` blobs are kept per tile (strongest first) -- so a dense bright region (a
+    foliage blob-field) can't eat the whole ``max_candidates`` budget and starve real targets.
     """
     bp = torch.as_tensor(bp, dtype=torch.float32)
     work = torch.as_tensor(work, dtype=torch.float32)
@@ -172,88 +170,92 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
         if prev_bp.shape == bp.shape:
             diff = bp - prev_bp
 
-    # Candidate peaks: one max per (2r+1) tile via a *strided* max-pool -- O(N) single pass, far
-    # cheaper than a stride-1 NMS, and the tile already enforces ~suppress_radius spacing.
-    # return_indices gives each tile-max's location directly. A peak straddling a tile boundary can
-    # be the max of both neighbours; the taken-mask in the loop merges that duplicate (it's within
-    # r). The candidate count is now bounded by the tile count, so the Python loop stays cheap.
+    # Candidates: one max per (2r+1) tile via a strided max-pool (return_indices gives locations);
+    # already ~r-spaced, so no extra NMS. A blob straddling a tile boundary may give two
+    # near-coincident candidates -- harmless (they centroid to ~the same point).
+    dev = bp.device
+    F = torch.nn.functional
     r = max(1, suppress_radius)
     t = 2 * r + 1
-    F = torch.nn.functional
     vals, idx = F.max_pool2d(bp[None, None], kernel_size=t, stride=t, ceil_mode=True, return_indices=True)
     vals, idx = vals.reshape(-1), idx.reshape(-1)
-    keep = vals >= thresh
-    if not bool(keep.any()):
+    sel = vals >= thresh
+    if not bool(sel.any()):
         return blobs
-    order = torch.argsort(vals[keep], descending=True)
-    kidx = idx[keep][order]                                # flat tile-max indices, value-descending
-    oys = (kidx // w).tolist()                             # -> (y, x) in the image
-    oxs = (kidx % w).tolist()
+    vals, idx = vals[sel], idx[sel]
+    order = torch.argsort(vals, descending=True)            # strongest first
+    vals, idx = vals[order], idx[order]
+    cy, cx = idx // w, idx % w                               # (K,) peak-pixel coords
+    K = cy.numel()
 
-    bp_np = bp.detach().numpy()                            # zero-copy CPU views for fast window reads
-    work_np = work.detach().numpy()
-    diff_np = diff.detach().numpy() if diff is not None else None
+    # Batched window around every candidate at once; out-of-bounds pixels masked to 0.
+    off = torch.arange(-r, r + 1, device=dev)
+    yraw = cy[:, None, None] + off[None, :, None]
+    xraw = cx[:, None, None] + off[None, None, :]
+    valid = (yraw >= 0) & (yraw < h) & (xraw >= 0) & (xraw < w)        # (K, t, t) by broadcast
+    yy = yraw.clamp(0, h - 1).expand(K, t, t)
+    xx = xraw.clamp(0, w - 1).expand(K, t, t)
+    win = torch.where(valid, bp[yy, xx], torch.zeros((), device=dev))  # (K, t, t)
+    peak = vals[:, None, None]
 
-    tile_px = math.ceil(w / tile_grid) if (tile_grid > 0 and per_tile > 0) else 0
-    tile_counts = {}
-    taken = np.zeros((h, w), dtype=bool)                   # merges boundary dups + density NMS
-    found = 0
-    for y, x in zip(oys, oxs):
-        if found >= max_candidates:
-            break
-        if taken[y, x]:                                    # within an already-claimed neighborhood
-            continue
-        y0, y1 = max(0, y - r), min(h, y + r + 1)
-        x0, x1 = max(0, x - r), min(w, x + r + 1)
-        tk = (y // tile_px, x // tile_px) if tile_px else None
-        if tk is not None and tile_counts.get(tk, 0) >= per_tile:
-            taken[y0:y1, x0:x1] = True                     # tile full: suppress + skip metrics (fast)
-            continue
-        peak = float(bp_np[y, x])
-        win = bp_np[y0:y1, x0:x1]
-        n_above = int((win >= 0.5 * peak).sum())
-        taken[y0:y1, x0:x1] = True                         # suppress this neighborhood regardless
-        if n_above < min_blob_px:
-            continue
+    n_above = (win >= 0.5 * peak).sum(dim=(1, 2))                      # (K,)
+    wsub = (win - 0.5 * peak).clamp(min=0.0)
+    tot = wsub.sum(dim=(1, 2)).clamp(min=1e-6)
+    cxf = (xx * wsub).sum(dim=(1, 2)) / tot                            # sub-pixel centroid
+    cyf = (yy * wsub).sum(dim=(1, 2)) / tot
+    dxw, dyw = xx - cxf[:, None, None], yy - cyf[:, None, None]
+    ixx = (wsub * dxw * dxw).sum(dim=(1, 2)) / tot                     # second moments -> roundness
+    iyy = (wsub * dyw * dyw).sum(dim=(1, 2)) / tot
+    ixy = (wsub * dxw * dyw).sum(dim=(1, 2)) / tot
+    tr = ixx + iyy
+    s = torch.sqrt(torch.clamp((tr / 2) ** 2 - (ixx * iyy - ixy * ixy), min=0.0))
+    l1, l2 = tr / 2 + s, tr / 2 - s
+    roundness = torch.where(l1 > 1e-6, l2 / l1.clamp(min=1e-6), torch.ones_like(l1))
+    size_px = torch.sqrt(n_above.float() / math.pi) * 2.0
+    pointlike = torch.clamp(psf_px / size_px.clamp(min=psf_px), max=1.0)
 
-        ys_w, xs_w = np.mgrid[y0:y1, x0:x1]
-        wsub = np.clip(win - 0.5 * peak, 0.0, None)
-        tot = float(wsub.sum()) or 1.0
-        cx = float((xs_w * wsub).sum()) / tot
-        cy = float((ys_w * wsub).sum()) / tot
+    keep = n_above >= min_blob_px                                      # cuts (vectorized)
+    if max_size_px:
+        keep &= size_px <= max_size_px
+    if min_roundness:
+        keep &= roundness >= min_roundness
 
-        # Second-moment eigenvalues -> roundness (minor/major axis variance ratio).
-        dx, dy = xs_w - cx, ys_w - cy
-        ixx = float((wsub * dx * dx).sum()) / tot
-        iyy = float((wsub * dy * dy).sum()) / tot
-        ixy = float((wsub * dx * dy).sum()) / tot
-        tr = ixx + iyy
-        s = math.sqrt(max(0.0, (tr / 2.0) ** 2 - (ixx * iyy - ixy * ixy)))
-        l1, l2 = tr / 2.0 + s, tr / 2.0 - s
-        roundness = (l2 / l1) if l1 > 1e-6 else 1.0
+    # Density cap: <= per_tile surviving blobs per coarse grid tile (value order preserved).
+    if tile_grid > 0 and per_tile > 0:
+        tpx = math.ceil(w / tile_grid)
+        ncols = math.ceil(w / tpx)
+        s_pos = torch.nonzero(keep, as_tuple=False).squeeze(1)        # survivors, value order
+        if s_pos.numel() > 0:
+            tid = (cy[s_pos] // tpx) * ncols + (cx[s_pos] // tpx)
+            g = torch.argsort(tid, stable=True)
+            tid_s = tid[g]
+            M = tid.numel()
+            ar = torch.arange(M, device=dev)
+            newg = torch.ones(M, dtype=torch.bool, device=dev)
+            if M > 1:
+                newg[1:] = tid_s[1:] != tid_s[:-1]
+            gstart = torch.cummax(torch.where(newg, ar, torch.zeros_like(ar)), dim=0).values
+            rank = torch.empty(M, dtype=torch.long, device=dev)
+            rank[g] = ar - gstart                                     # rank within tile (value order)
+            keep[s_pos[rank >= per_tile]] = False
 
-        size_px = math.sqrt(n_above / math.pi) * 2.0
-        pointlike = min(1.0, psf_px / max(size_px, psf_px))
-        if max_size_px and size_px > max_size_px:
-            continue                          # too extended (rooftop)
-        if min_roundness and roundness < min_roundness:
-            continue                          # too elongated (edge / streak / wire)
-
-        if tk is not None:                    # density cap: count this accepted blob in its tile
-            tile_counts[tk] = tile_counts.get(tk, 0) + 1
-
-        moving = bool(diff_np[y, x] > moving_frac * peak) if diff_np is not None else None
-        blobs.append({
-            'id': found,
-            'px': [round(cx, 2), round(cy, 2)],      # [x, y] in the work image
-            'score': round(float(work_np[y, x]) / scale, 4),  # absolute brightness 0..1
-            'size_px': round(size_px, 1),
-            'pointlike': round(pointlike, 3),
-            'roundness': round(roundness, 3),
-            'moving': moving,
-        })
-        found += 1
-    return blobs
+    # Global cap, then bring just the <= max_candidates survivors back to Python as dicts.
+    final = torch.nonzero(keep, as_tuple=False).squeeze(1)[:max_candidates]
+    if final.numel() == 0:
+        return blobs
+    px, py = cxf[final].tolist(), cyf[final].tolist()
+    sz, pt, rd = size_px[final].tolist(), pointlike[final].tolist(), roundness[final].tolist()
+    sc = (work[cy[final], cx[final]] / scale).tolist()
+    mv = (diff[cy[final], cx[final]] > moving_frac * vals[final]).tolist() if diff is not None else None
+    return [{
+        'id': i,
+        'px': [round(px[i], 2), round(py[i], 2)],            # [x, y] in the work image
+        'score': round(sc[i], 4),                            # absolute brightness 0..1
+        'size_px': round(sz[i], 1),
+        'pointlike': round(pt[i], 3),
+        'roundness': round(rd[i], 3),
+        'moving': (bool(mv[i]) if mv is not None else None),
+    } for i in range(final.numel())]
 
 
 def _segments(session, role):

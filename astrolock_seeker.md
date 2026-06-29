@@ -785,8 +785,13 @@ Captured ideas, not yet scheduled. Grouped by area.
     targets elsewhere. Limits target *density*, not just the total.
   - **fast peak-finding**: a *strided* max-pool with `return_indices` (one max + location per
     `2·suppress_radius+1` tile, O(N) single pass) replaced a stride-1 NMS + a Python loop over
-    ~25k local maxima that cost ~3 s/frame. Boundary-straddling duplicates merge in the per-peak
-    `taken` mask. detect went ~3100 ms → ~80 ms/frame (~12 fps). [open: small scale-space?]
+    ~25k local maxima that cost ~3 s/frame; the tile spacing is the NMS, and a blob straddling a
+    tile boundary may yield two near-coincident candidates (harmless). detect ~3100 ms → ~80 ms/frame.
+  - **all torch, device-parameterized**: `detect_blobs` is fully vectorized in torch (batched
+    window metrics for every candidate at once — no Python per-pixel loop; only the final
+    ≤`max-candidates` results cross to Python). Runs on `--device` (CPU now, CUDA later) and is
+    `torch.compile`-able. Likewise the GUI `prepare_rgba` (int32 ingest → torch debayer + gamma LUT
+    → CPU only for the dpg upload). [open: small scale-space? GPU once a CUDA torch is installed.]
 - **Candidate pipeline: PSF-scale band-pass → determinant of the Hessian.** Band-pass matched to
   the PSF (low-pass to cut the highest frequency = 1px noise; high-pass to cut frequencies below
   the PSF = background / large structure), then the determinant of the Hessian to keep round blobs
