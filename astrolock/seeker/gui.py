@@ -25,6 +25,7 @@ import sys
 import time
 
 import numpy as np
+import torch
 
 from astrolock.seeker import bayer, control, ser
 from astrolock.seeker.follower import SerFollower
@@ -51,32 +52,52 @@ def discover_roles(session_dir):
     return roles
 
 
-def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0)):
+_DEVICE = torch.device('cpu')        # switch to 'cuda' once a CUDA torch is installed
+_LUT_CACHE = {}
+
+
+def _gamma_lut(white_int, gain, gamma, device):
+    """Cached torch LUT: raw value [0..white_int] -> display [0,1] (WB gain + gamma). A table
+    lookup instead of a per-pixel pow -- the per-frame hot path."""
+    key = (white_int, round(gain, 4), round(gamma, 4), str(device))
+    lut = _LUT_CACHE.get(key)
+    if lut is None:
+        v = (torch.arange(white_int + 1, dtype=torch.float32, device=device) * (gain / white_int)).clamp_(0.0, 1.0)
+        if gamma and gamma != 1.0:
+            v = v.pow_(1.0 / gamma)
+        lut = _LUT_CACHE[key] = v
+    return lut
+
+
+def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0), device=None):
     """
-    Raw frame (mosaic or mono) -> (w, h, (h,w,4) float32 RGBA).
-    Debayers Bayer frames to half-res RGB; applies display-only WB (R,B gains -- the stored
-    data stays pristine raw); maps the full container range to [0,1] with NO per-frame
-    auto-stretch (so brightness is stable -- expose/gain the camera instead); applies gamma.
+    Raw frame (mosaic or mono) -> (w, h, (h,w,4) float32 RGBA on CPU, for the dpg texture).
+    All compute is torch and device-parameterized (GPU-ready); torch has no uint16, so the frame is
+    cast to int32 at the single ingest boundary, then everything stays in torch until the final
+    .cpu().numpy() for the upload. Debayers Bayer to half-res RGB (4-plane split), applies
+    display-only WB (R,B gains -- stored data stays pristine), maps the full container range to
+    [0,1] with NO auto-stretch, applies gamma -- WB+gamma via a cached LUT, not a per-pixel pow.
     """
-    white = (float(np.iinfo(frame_raw.dtype).max)
-             if np.issubdtype(frame_raw.dtype, np.integer) else 1.0)
+    device = device or _DEVICE
+    white_int = int(np.iinfo(frame_raw.dtype).max) if np.issubdtype(frame_raw.dtype, np.integer) else 1
+    frame = torch.from_numpy(np.ascontiguousarray(frame_raw).astype(np.int32, copy=False)).to(device)
+
     if bayer.is_bayer(color_id):
-        rgb = bayer.debayer_to_rgb(frame_raw, color_id)          # (h/2, w/2, 3)
-        rgb[..., 0] *= wb[0]                                      # display WB on R
-        rgb[..., 2] *= wb[1]                                      # display WB on B
+        planes = (frame[0::2, 0::2], frame[0::2, 1::2], frame[1::2, 0::2], frame[1::2, 1::2])
+        ri, (g0, g1), bi = bayer.rgb_plane_indices(color_id)
+        chans = ((planes[ri], wb[0]), ((planes[g0] + planes[g1]) // 2, 1.0), (planes[bi], wb[1]))
     else:
-        f = frame_raw.astype(np.float32)
-        rgb = np.repeat(f[:, :, None], 3, axis=2)
+        chans = ((frame, 1.0),)
 
-    norm = rgb / white
-    if gamma and gamma != 1.0:
-        norm = np.clip(norm, 0.0, 1.0) ** (1.0 / gamma)
-
-    h, w = norm.shape[:2]
-    rgba = np.empty((h, w, 4), dtype=np.float32)
-    rgba[..., 0:3] = np.clip(norm, 0.0, 1.0)
-    rgba[..., 3] = 1.0
-    return w, h, rgba
+    h, w = chans[0][0].shape
+    rgba = torch.ones((h, w, 4), dtype=torch.float32, device=device)    # alpha pre-filled to 1.0
+    for c, (idx, gain) in enumerate(chans):
+        disp = _gamma_lut(white_int, gain, gamma, device)[idx.clamp(0, white_int).long()]
+        if len(chans) == 1:                                            # mono -> gray
+            rgba[..., 0] = rgba[..., 1] = rgba[..., 2] = disp
+        else:
+            rgba[..., c] = disp
+    return w, h, rgba.cpu().numpy()                                     # CPU only at the end, for dpg
 
 
 def draw_box(rgba, cx, cy, half, color):
@@ -102,15 +123,17 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker GUI viewer")
     p.add_argument('--session', required=True, help="session directory to view")
     p.add_argument('--roles', default=None, help="comma-separated roles (default: auto-detect)")
-    p.add_argument('--display-width', type=int, default=640, help="on-screen width per view")
+    p.add_argument('--display-width', type=int, default=640, help="(unused: views now render 1:1)")
     p.add_argument('--gamma', type=float, default=2.2, help="display gamma (1 = linear)")
     p.add_argument('--wb-r', type=float, default=1.24, help="display-only WB gain for red")
     p.add_argument('--wb-b', type=float, default=1.98, help="display-only WB gain for blue")
     p.add_argument('--slew-rate', type=float, default=3.0, help="slew rate while a button is held (deg/s)")
     p.add_argument('--ui-scale', type=float, default=0.0,
                    help="UI/DPI scale factor (0 = auto-detect from the OS; e.g. 1.5 for a 150%% display)")
+    p.add_argument('--device', default='cpu', help="torch device for image processing (cpu / cuda)")
     args = p.parse_args(argv)
     wb = (args.wb_r, args.wb_b)
+    device = torch.device(args.device)
 
     import dearpygui.dearpygui as dpg
 
@@ -156,13 +179,12 @@ def main(argv=None):
             return
         _, frame = res
         fh, fw = frame.shape[0], frame.shape[1]       # full frame size (detect coords' space)
-        w, h, _rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb)
+        w, h, _rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
         tex_tag = f"tex_{role}"
         with dpg.texture_registry():
             dpg.add_raw_texture(w, h, np.zeros(w * h * 4, dtype=np.float32),
                                 format=dpg.mvFormat_Float_rgba, tag=tex_tag)
-        disp_w = S(args.display_width)
-        disp_h = int(round(disp_w * h / w))
+        disp_w, disp_h = w, h          # 1:1 -- one image pixel per physical pixel (no down-scaling)
         win_kwargs = {'pos': view_pos[role]} if role in view_pos else {}
         with dpg.window(label=role, tag=f"win_{role}", width=disp_w + S(30), height=disp_h + S(70),
                         **win_kwargs):
@@ -367,7 +389,7 @@ def main(argv=None):
             # The expensive part (debayer + texture upload) only runs on a *new* frame, so
             # the loop stays responsive (input + redraw) while waiting for the next one.
             if idx != v['last_idx']:
-                w, h, rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb)
+                w, h, rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
                 if (w, h) != (v['w'], v['h']):    # frame size changed (source switch) -> rebuild
                     rebuild_view(role)
                     continue

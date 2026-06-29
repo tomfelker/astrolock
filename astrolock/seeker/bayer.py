@@ -41,6 +41,14 @@ _LAYOUT = {
 }
 
 
+def rgb_plane_indices(color_id):
+    """(r, (g0, g1), b) -- which of the 4 split planes hold the R / two-G / B sites."""
+    layout = _LAYOUT.get(int(color_id))
+    if layout is None:
+        raise ValueError(f"not a Bayer color_id: {color_id}")
+    return layout['r'], layout['g'], layout['b']
+
+
 def debayer_to_rgb(mosaic, color_id):
     """
     Decode a raw Bayer mosaic to a half-resolution float32 RGB image (H//2, W//2, 3).
