@@ -54,6 +54,9 @@ def main(argv=None):
     p.add_argument('--playback-ser', default=None, help="playback source: the .ser file to replay")
     p.add_argument('--playback-speed', type=float, default=1.0, help="playback source: speed multiplier")
     p.add_argument('--playback-loop', action='store_true', help="playback source: loop instead of stopping")
+    p.add_argument('--detect-roles', default='guide',
+                   help="comma-separated roles to run blob detection on (default: guide only -- the "
+                        "main cam is narrow-field and will get centroid tracking later, not blob detect)")
     p.add_argument('--detector', default='doh', choices=['bandpass', 'doh'],
                    help="detection surface: 'doh' (default) = determinant of the Hessian, or 'bandpass'")
     p.add_argument('--doh-sigma', type=float, default=0.0, help="doh detector: Gaussian scale px (0 = psf default)")
@@ -139,6 +142,7 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     roles = [r.strip() for r in args.roles.split(',') if r.strip()]
+    detect_roles = {r.strip() for r in args.detect_roles.split(',') if r.strip()} & set(roles)
     session_dir, ts = session_mod.new_session_dir()
     stop_file = os.path.join(session_dir, 'stop')          # for detect (cams use control files)
 
@@ -265,9 +269,11 @@ def main(argv=None):
         except Exception as e:
             print(f"[backend] ephemeris pre-warm skipped: {e}", flush=True)
 
+    print(f"[backend] detect roles: {sorted(detect_roles) or 'none'}", flush=True)
     for role in roles:
         launch_cam(role)
-        launch_detect(role)
+        if role in detect_roles:
+            launch_detect(role)
     gui_proc = _spawn('astrolock.seeker.gui',
                       ['--session', session_dir, '--wb-r', str(args.wb_r), '--wb-b', str(args.wb_b),
                        '--device', args.device]) \
@@ -327,7 +333,7 @@ def main(argv=None):
             control_write(role, {'stop': True})    # old cam finalizes its file + exits
         launch_seq[role] += 1
         launch_cam(role)                           # new cam (new source / fresh segment)
-        if role not in detect_procs or detect_procs[role].poll() is not None:
+        if role in detect_roles and (role not in detect_procs or detect_procs[role].poll() is not None):
             launch_detect(role)                    # safety: detect normally rolls on its own
 
     def delete_old_segments():
