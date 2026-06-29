@@ -72,6 +72,16 @@ def run():
     print(f"test_controller: fast mover locked at {r['final_rate']:.4f} rad/s "
           f"(>> dead-zone {thr_equiv:.4f}): OK")
 
+    # 3b. Diagnostics self-check: clean tune is quiet; an over-strong kii or too-low framerate warn.
+    trk = PixelTracker(CX, CY, RADPP, ki=0.3, damping=1.3, kd=1.0, kii=0.0)
+    info, warn = trk.diagnostics()                               # no arg -> checks at nominal rate
+    assert any('nominal' in ln for ln in info) and not warn, (info, warn)
+    _, warn = PixelTracker(CX, CY, RADPP, ki=0.3, damping=1.3, kii=0.6).diagnostics()
+    assert any('kii' in w for w in warn), warn                   # kii past kp*ki -> flagged
+    _, warn = trk.diagnostics(frame_dt=1 / 3.0)                  # measured-rate override
+    assert any('fps' in w for w in warn), warn                   # 3 fps -> framerate margin flagged
+    print("test_controller: diagnostics (quiet when good, warns on aggressive kii / low fps): OK")
+
     # 4. Lost fallback: no matching blobs -> 'lost' and zero rate.
     trk = PixelTracker(CX, CY, RADPP)
     trk.start(CX, CY, 0.0)

@@ -52,12 +52,16 @@ def _excess(v, thr):
 
 
 class PixelTracker:
-    def __init__(self, cx, cy, rad_per_px, ki=0.3, damping=1.3, kd=1.0, kii=0.0, gate_px=80.0,
+    def __init__(self, cx, cy, rad_per_px, ki=0.3, damping=1.3, kd=1.0, kii=0.0,
+                 nominal_rate_hz=10.0, gate_px=80.0,
                  lost_s=1.5, vel_smoothing=0.1, max_track_px_s=120.0, max_rate_rad_s=math.radians(8.0),
                  sign_az=1.0, sign_alt=-1.0):
         self.cx, self.cy = cx, cy
         self.rad_per_px = rad_per_px
         self.ki, self.kd, self.kii = ki, kd, kii
+        # The framerate the gains are characterized at: the diagnostics check the tune at this rate,
+        # and (later, optionally) the effective gains derate below it / buff above it.
+        self.nominal_rate_hz = nominal_rate_hz
         # For the loop (mount = integrator, PI control) the position error obeys
         # e'' + kp e' + ki e = 0, so kp = 2*sqrt(ki) is critically damped. `damping` >= 1 pushes
         # it slightly over-damped for margin against the real system's lags (mount update rate,
@@ -75,6 +79,49 @@ class PixelTracker:
         self.kii_step = (kii / ki) if ki > 0 else 0.0
         self.sign_az, self.sign_alt = sign_az, sign_alt
         self.active = False
+
+    def diagnostics(self, frame_dt=None):
+        """Bandwidth + stability summary for the current gains, as (info_lines, warnings) -- lists
+        of strings the caller prints. Pure (no I/O). The sample-rate check uses frame_dt (s) if
+        given, else the nominal rate the gains are characterized at. Warnings flag tunes likely to
+        ring or go unstable, so a bad --track-* set is caught at lock time instead of mid-pass."""
+        nominal = frame_dt is None
+        if nominal and self.nominal_rate_hz > 0:
+            frame_dt = 1.0 / self.nominal_rate_hz
+        wn = math.sqrt(self.ki) if self.ki > 0 else 0.0            # loop natural frequency (rad/s)
+        zeta = (self.kp / (2.0 * wn)) if wn > 0 else float('inf')   # damping ratio (= `damping` arg)
+        settle = (4.0 / (zeta * wn)) if (wn > 0 and zeta > 0) else float('inf')   # ~2% settling time
+        info = [f"loop: bandwidth {wn:.3f} rad/s ({wn / (2 * math.pi):.3f} Hz), "
+                f"damping {zeta:.2f}, settling ~{settle:.1f} s"]
+        warn = []
+        if zeta < 0.7:
+            warn.append(f"damping {zeta:.2f} < 0.7: underdamped, expect overshoot/ringing")
+
+        # Second integral (kii): Routh-Hurwitz on s^3 + kp s^2 + ki s + kii needs kii < kp*ki.
+        if self.kii > 0:
+            limit = self.kp * self.ki
+            frac = self.kii / limit if limit > 0 else float('inf')
+            info.append(f"kii {self.kii:.4g} = {frac * 100:.0f}% of the kp*ki={limit:.4g} stability limit")
+            if frac >= 1.0:
+                warn.append(f"kii {self.kii:.4g} >= kp*ki {limit:.4g}: UNSTABLE second integral "
+                            f"(set --track-kii below {limit:.3g})")
+            elif frac > 0.5:
+                warn.append(f"kii is {frac * 100:.0f}% of its kp*ki limit: little margin, expect slow ringing")
+
+        # Sample-rate margin: kp*dt is ~the fraction of the position error the proportional term
+        # commands per frame. Near 1 the loop tries to null the error in a single frame, so any
+        # unmodeled lag (detection, mount accel) overshoots and rings. On this rig oscillation set in
+        # around kp*dt~0.5, so aim well below. (Heuristic -- refine once cross-process lag is measured.)
+        if frame_dt and frame_dt > 0:
+            kpt = self.kp * frame_dt
+            tag = ' nominal' if nominal else ''
+            info.append(f"at {1.0 / frame_dt:.1f} fps{tag}: kp*dt={kpt:.2f} (aim <0.25; oscillation seen ~0.5)")
+            if kpt > 0.5:
+                warn.append(f"kp*dt={kpt:.2f} at {1.0 / frame_dt:.1f} fps{tag}: oscillation likely -- "
+                            f"raise framerate or lower the gains")
+            elif kpt > 0.25:
+                warn.append(f"kp*dt={kpt:.2f} at {1.0 / frame_dt:.1f} fps{tag}: thin margin at this framerate")
+        return info, warn
 
     def start(self, px, py, now):
         """Lock onto a target at (px, py)."""

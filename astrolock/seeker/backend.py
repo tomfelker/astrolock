@@ -114,6 +114,9 @@ def main(argv=None):
                    help="tracker second-integral gain (0 = off): removes the residual lag against a "
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
                         "kii < kp*ki for stability (kp*ki ~ 0.43 at the default ki/damping)")
+    p.add_argument('--track-nominal-rate', type=float, default=10.0,
+                   help="framerate (Hz) the track gains are characterized at: used for the lock-time "
+                        "stability self-check (and, later, optional gain derate below / buff above it)")
     p.add_argument('--track-damping', type=float, default=1.3,
                    help="P is derived for critical damping (kp=2*sqrt(ki)); >1 over-damps for lag margin")
     p.add_argument('--track-kd', type=float, default=1.0,
@@ -388,7 +391,7 @@ def main(argv=None):
                 if ft is not None:
                     tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
                                            ki=args.track_ki, damping=args.track_damping, kd=args.track_kd,
-                                           kii=args.track_kii,
+                                           kii=args.track_kii, nominal_rate_hz=args.track_nominal_rate,
                                            gate_px=args.track_gate_px, lost_s=args.track_lost_s,
                                            vel_smoothing=args.track_vel_smoothing,
                                            max_track_px_s=args.track_max_px_s, max_rate_rad_s=max_rate,
@@ -398,6 +401,12 @@ def main(argv=None):
                     tracking = True
                     track_role = role
                     estop = False
+                    # Stability/bandwidth self-check at lock time, characterized at the nominal rate.
+                    info, warns = tracker.diagnostics()
+                    for ln in info:
+                        print(f"[backend] track {role}: {ln}", flush=True)
+                    for w in warns:
+                        print(f"[backend] WARNING (track {role}): {w}", flush=True)
         elif t == 'untrack':
             tracking = False
             mount.set_rates(0.0, 0.0)
