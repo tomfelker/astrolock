@@ -373,7 +373,9 @@ def main(argv=None):
         elif t == 'track':                            # lock the pixel-space loop onto a target
             role = cmd.get('role', roles[0])
             px = cmd.get('px')
-            if role in roles and px and followers[role].header is not None:
+            if role not in detect_roles:              # no detector on this role -> nothing to track
+                print(f"[backend] ignoring track on {role!r} (no detector; see --detect-roles)", flush=True)
+            elif role in roles and px and followers[role].header is not None:
                 hdr = followers[role].header
                 # Blobs are in frame image space; hold the target at the frame centre. rad_per_px
                 # is per *sensor* pixel (from this role's optics), so scale by the cam's binning.
