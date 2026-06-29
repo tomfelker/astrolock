@@ -1,5 +1,7 @@
 {
     "configurations": [
+
+
         {
             "name": "AstroLock",
             "type": "python",
@@ -13,6 +15,13 @@
             "request": "launch",
             "program": "focus.py",
             "justMyCode": true
+        },
+        {
+            "name": "Seeker",
+            "type": "python",
+            "request": "launch",
+            "module": "astrolock.seeker.backend",
+            "subProcess": false
         }
     ]
 }
