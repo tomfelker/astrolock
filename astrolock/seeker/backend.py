@@ -12,7 +12,12 @@ Cameras are driven via per-role control JSONL files (control_<role>.jsonl): reco
 their `important` flag; capture on/off (re)launches or stops a cam. On exit, any .ser whose
 sidecar has no important frame is deleted; if nothing important remains, the session goes.
 
-    python -m astrolock.seeker.backend --roles guide --source sky
+Defaults are our rig: both the guide (ASI678MC + 8mm) and main (ASI678MC + C11) sim cameras
+on the ISS sky pass, with the GUI. Use --sim-downscale N for faster/smaller views.
+
+    python -m astrolock.seeker.backend                       # the two-camera rig, defaults
+    python -m astrolock.seeker.backend --sim-downscale 4     # same, 1/4 render res (faster)
+    python -m astrolock.seeker.backend --roles guide --source synthetic   # one cam, no deps
 """
 
 import argparse
@@ -42,7 +47,7 @@ def _spawn(module, args):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker backend / orchestrator")
-    p.add_argument('--roles', default='guide', help="comma-separated camera roles to launch")
+    p.add_argument('--roles', default='guide,main', help="comma-separated camera roles to launch")
     p.add_argument('--source', default='sky', choices=['synthetic', 'zwo', 'sky', 'playback'],
                    help="default 'sky' runs the baked-in ISS test pass; 'synthetic' needs no deps; "
                         "'playback' replays a recorded .ser through the live pipeline")
@@ -63,6 +68,9 @@ def main(argv=None):
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=30.0)
+    p.add_argument('--sim-downscale', type=int, default=1,
+                   help="render sim cameras at 1/N resolution, same FoV (fewer pixels = faster + "
+                        "smaller windows); e.g. 4. Only affects DB-optic sim cams.")
     p.add_argument('--segment-frames', type=int, default=300,
                    help="roll cams to a new file every N frames (old non-important ones are deleted)")
     p.add_argument('--auto', dest='auto', action='store_true', default=True,
@@ -91,11 +99,11 @@ def main(argv=None):
     p.add_argument('--arcsec-per-px', type=float, default=0.0,
                    help="guide plate scale override (0 = derive from --sky-pixel-um / --sky-focal-mm)")
     # Per-role plate scale from the vendored optics DB (names from `python -m astrolock.seeker.optics`).
-    p.add_argument('--guide-sensor', default=None, help="guide camera sensor name in the optics DB")
-    p.add_argument('--guide-optic', default=None, help="guide optic name in the optics DB")
+    p.add_argument('--guide-sensor', default='ZWO ASI678MC', help="guide camera sensor name in the optics DB")
+    p.add_argument('--guide-optic', default='8mm CS f/1.4', help="guide optic name in the optics DB")
     p.add_argument('--guide-reducer', default=None, help="guide reducer/barlow name (optional)")
-    p.add_argument('--main-sensor', default=None, help="main camera sensor name in the optics DB")
-    p.add_argument('--main-optic', default=None, help="main optic name in the optics DB")
+    p.add_argument('--main-sensor', default='ZWO ASI678MC', help="main camera sensor name in the optics DB")
+    p.add_argument('--main-optic', default='Celestron C11 f/10', help="main optic name in the optics DB")
     p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
     p.add_argument('--track-ki', type=float, default=0.3,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
@@ -163,6 +171,7 @@ def main(argv=None):
                      if args.source == 'playback' and args.playback_ser else [])
     estop = False
     recording = False
+    gui_quit = False        # set when the GUI tells us it's closing (faster than watching it exit)
 
     # Auto-tracking state (pixel-space closed loop).
     tracker = None
@@ -175,6 +184,7 @@ def main(argv=None):
     # Per-role plate scale from the optics DB if a sensor+optic is named for that role; else the
     # sky-derived/override rad_per_px above. Print the resolved FoV so it's easy to sanity-check.
     _sensors, _optics, _reducers = optics.load_db()
+    ds = max(1, args.sim_downscale)            # render sim cams at 1/ds resolution (same FoV)
     rad_per_px_by_role = {}
     render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
@@ -188,12 +198,18 @@ def main(argv=None):
                 s, o = _sensors[sname], _optics[oname]
                 mult = _reducers[rname] if rname else 1.0
                 feff = o.focal_length_mm * mult
-                rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um, feff)
-                render_by_role[role] = (s.res_x, s.res_y, s.pixel_um, feff)
-                fx, fy = optics.fov_deg(s, feff)
+                # Downscale: 1/ds the pixels per axis, ds x the effective pixel pitch -> the FoV is
+                # unchanged (chip size constant) but each rendered pixel spans ds x the sky. The
+                # plate scale the tracker uses is per *rendered* pixel, so it scales by ds too.
+                rx, ry = max(1, s.res_x // ds), max(1, s.res_y // ds)
+                pum = s.pixel_um * ds
+                rad_per_px_by_role[role] = optics.rad_per_px(pum, feff)
+                render_by_role[role] = (rx, ry, pum, feff)
+                fx, fy = optics.fov_deg(s, feff)      # physical FoV (full sensor; ds-invariant)
                 fov_by_role[role] = (fx, fy)
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
-                      f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(s.pixel_um, feff):.3f} arcsec/px", flush=True)
+                      f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(pum, feff):.3f} arcsec/px, "
+                      f"render {rx}x{ry}{f' (downscale {ds}x)' if ds > 1 else ''}", flush=True)
         except KeyError as e:
             print(f"[backend] {role}: unknown optics {e}; using fallback plate scale", flush=True)
     zenith_zone_cos = math.sin(math.radians(args.track_zenith_zone_deg))   # |cos(alt)| below this = zone
@@ -237,6 +253,17 @@ def main(argv=None):
                                      '--min-blob-px', str(args.min_blob_px),
                                      '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile),
                                      '--device', args.device])
+
+    # Pre-warm the skyfield ephemeris/star cache once, serially. Two sky cams starting together
+    # otherwise race to download de421.bsp / hipparcos into the shared cache and one loses the
+    # rename (WinError 5) -- which is what crashed both sim cams in a fresh worktree. Best-effort:
+    # if it fails, the cams fall back to their own (racy) download exactly as before.
+    if any(s == 'sky' for s in sources.values()):
+        try:
+            from astrolock.seeker import skysim
+            skysim.ensure_cache()
+        except Exception as e:
+            print(f"[backend] ephemeris pre-warm skipped: {e}", flush=True)
 
     for role in roles:
         launch_cam(role)
@@ -321,8 +348,11 @@ def main(argv=None):
                             pass
 
     def apply_command(cmd):
-        nonlocal estop, recording, tracking, track_role, tracker, track_seen_index
+        nonlocal estop, recording, tracking, track_role, tracker, track_seen_index, gui_quit
         t = cmd.get('type')
+        if t == 'shutdown':                           # GUI is closing -> stop the whole session
+            gui_quit = True
+            return
         if t == 'set_rate':
             tracking = False                          # manual slew overrides auto-track
             mount.set_rates(math.radians(cmd.get('az', 0.0)), math.radians(cmd.get('alt', 0.0)))
@@ -459,6 +489,9 @@ def main(argv=None):
                 last_cleanup = now
                 delete_old_segments()
 
+            if gui_quit:
+                print("[backend] gui requested shutdown; stopping", flush=True)
+                break
             if gui_proc is not None and gui_proc.poll() is not None:
                 print("[backend] gui exited; stopping", flush=True)
                 break
@@ -485,15 +518,47 @@ def main(argv=None):
             if dt_ is not None:
                 dt_.close()
 
-        deadline = time.perf_counter() + 3.0
-        for pr in list(cam_procs.values()) + list(detect_procs.values()) + ([gui_proc] if gui_proc else []):
-            try:
-                pr.wait(timeout=max(0.0, deadline - time.perf_counter()))
-            except subprocess.TimeoutExpired:
-                pr.terminate()
+        # Make sure every child is fully dead before cleanup: a still-terminating cam/detect holds
+        # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow
+        # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
+        _reap(list(cam_procs.values()) + list(detect_procs.values()) + [gui_proc])
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
         print("[backend] done", flush=True)
+
+
+def _reap(procs, graceful_s=4.0, kill_s=3.0):
+    """Wait for child processes to exit, escalating wait -> terminate -> kill, and *waiting after
+    each escalation*. The wait is the point: a process that's been signalled is not dead yet, and on
+    Windows its open .ser / sidecar handles block os.remove/rmtree until it actually exits. A Ctrl-C
+    during the wait means "stop waiting, just kill" -- so we don't dump a traceback from inside it."""
+    procs = [p for p in procs if p is not None]
+    try:
+        deadline = time.perf_counter() + graceful_s
+        for p in procs:                          # phase 1: let them stop on their own (stop files)
+            try:
+                p.wait(timeout=max(0.0, deadline - time.perf_counter()))
+            except subprocess.TimeoutExpired:
+                pass
+        alive = [p for p in procs if p.poll() is None]
+        for p in alive:                          # phase 2: ask the stragglers to terminate...
+            p.terminate()
+        deadline = time.perf_counter() + kill_s
+        for p in alive:                          # ...then wait for the handles to be released
+            try:
+                p.wait(timeout=max(0.0, deadline - time.perf_counter()))
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()                     # phase 3: force, and reap
+                    p.wait(timeout=1.0)
+                except Exception:
+                    pass
+    except KeyboardInterrupt:
+        for p in procs:                          # impatient second Ctrl-C: don't wait, just kill
+            try:
+                p.kill()
+            except Exception:
+                pass
 
 
 def _cleanup(session_dir, keep, clean):

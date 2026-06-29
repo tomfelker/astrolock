@@ -224,6 +224,25 @@ def main(argv=None):
         if ctrl['client'] is not None:
             ctrl['client'].send(obj)
 
+    def _shutdown(*_):
+        """Tell the backend we're closing (it stops as soon as it drains this, at ~20 Hz -- it no
+        longer has to wait to notice our *process* exit), then drop the process immediately. os._exit
+        skips interpreter/atexit teardown and any debugger that auto-attached to this subprocess, both
+        of which could otherwise keep us -- and so the backend -- alive for seconds after the window
+        closes. Wired to dpg's exit callback (fires the instant the window closes, independent of the
+        render loop) and to the loop end, so it runs no matter how we leave."""
+        try:
+            _send({'type': 'shutdown'})
+        except Exception:
+            pass
+        try:
+            if ctrl['client'] is not None:
+                ctrl['client'].close()
+        except Exception:
+            pass
+        sys.stdout.flush()
+        os._exit(0)
+
     def _view_at(mx, my):
         """Which view's image contains viewport point (mx,my)? -> (role, view, rect_min)."""
         for role, v in views.items():
@@ -354,6 +373,10 @@ def main(argv=None):
 
     dpg.create_viewport(title="AstroLock Seeker", width=S(1400), height=S(900))
     dpg.setup_dearpygui()
+    try:
+        dpg.set_exit_callback(_shutdown)    # fires the instant the window is closed
+    except Exception:
+        pass                                # older dpg: fall back to the loop-end + poll paths
     dpg.show_viewport()
 
     while dpg.is_dearpygui_running():
@@ -453,11 +476,7 @@ def main(argv=None):
         if not new_work:
             time.sleep(0.005)            # idle: keep UI responsive without pegging a core
 
-    if ctrl['client'] is not None:
-        ctrl['client'].close()
-    for f in followers.values():
-        f.close()
-    dpg.destroy_context()
+    _shutdown()      # belt-and-suspenders: if the exit callback didn't fire, still exit immediately
 
 
 if __name__ == '__main__':

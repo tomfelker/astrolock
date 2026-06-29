@@ -81,6 +81,21 @@ def _rot_y(a):
     return torch.tensor([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=torch.float32)
 
 
+def ensure_cache(cache_dir='data/skyfield_cache'):
+    """Download the skyfield ephemeris + Hipparcos catalog into the cache if missing, serially.
+    Call this once (e.g. from the orchestrator) before launching multiple SkySim processes: they
+    share one cache and would otherwise race the first-time download and clobber each other's
+    rename. A no-op once the files are present."""
+    from skyfield.api import Loader
+    from skyfield.data import hipparcos
+    os.makedirs(cache_dir, exist_ok=True)
+    loader = Loader(cache_dir)
+    loader.timescale()
+    loader('de421.bsp')
+    with loader.open(hipparcos.URL):
+        pass
+
+
 class SkySim:
     def __init__(self, config=None, device='cpu', cache_dir='data/skyfield_cache'):
         self.cfg = config or SkySimConfig()
