@@ -16,7 +16,7 @@ slow movers. Same dimensions / color id / depth as the input (so the GUI can rep
 import argparse
 import time
 
-import numpy as np
+import torch
 
 from astrolock.seeker import ser as ser_mod
 from astrolock.seeker.sidecar import JsonlWriter
@@ -30,7 +30,9 @@ def main(argv=None):
     p.add_argument('--ema', type=float, default=0.0,
                    help="if >0, subtract an EMA background with this decay instead of pairwise diff")
     p.add_argument('--max-frames', type=int, default=0, help="limit input frames read (0 = all)")
+    p.add_argument('--device', default='cpu', help="torch device (cpu / cuda)")
     args = p.parse_args(argv)
+    device = torch.device(args.device)
 
     reader = ser_mod.SerReader(args.input)
     h = reader.header
@@ -43,12 +45,16 @@ def main(argv=None):
     writer = ser_mod.SerWriter(args.output, h.image_width, h.image_height,
                                color_id=h.color_id, pixel_depth_per_plane=h.pixel_depth_per_plane)
     sidecar = JsonlWriter(args.output[:-len('.ser')] + '.frames.jsonl')   # so the GUI can replay it
-    hi = float(np.iinfo(np.uint16).max)
-    ref = reader.read_frame(0).astype(np.float32)        # previous frame, or the EMA background
+    hi = 65535.0
+
+    def load(i):                                          # int32 ingest (torch has no uint16) -> float
+        return torch.from_numpy(reader.read_frame(i).astype('int32')).to(device).float()
+
+    ref = load(0)                                         # previous frame, or the EMA background
     for i in range(1, n):
-        cur = reader.read_frame(i).astype(np.float32)
-        diff = np.abs(cur - ref) * args.scale
-        writer.write_frame(np.clip(diff, 0, hi).astype(np.uint16))
+        cur = load(i)
+        diff = ((cur - ref).abs() * args.scale).clamp(0, hi).to(torch.int32)
+        writer.write_frame(diff.cpu().numpy().astype('uint16'))
         sidecar.append({'t_mono_ns': time.perf_counter_ns(), 'important': True})
         if args.ema > 0.0:
             ref += args.ema * (cur - ref)                # EMA background (low-noise static scene)

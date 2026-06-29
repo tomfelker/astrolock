@@ -15,10 +15,12 @@ SER header's frame count on the way out.
 """
 
 import argparse
+import math
 import os
 import time
 
 import numpy as np
+import torch
 
 from astrolock.seeker import control as control_mod
 from astrolock.seeker import ser as ser_mod
@@ -28,16 +30,18 @@ from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
 
 def make_synthetic_frame(width, height, t, max_val=65535):
-    """A faint-noise background with one bright Gaussian blob moving in a Lissajous path."""
-    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    """A faint-noise background with one bright Gaussian blob moving in a Lissajous path (torch;
+    uint16 numpy only at the SER-writer boundary)."""
+    yy, xx = torch.meshgrid(torch.arange(height, dtype=torch.float32),
+                            torch.arange(width, dtype=torch.float32), indexing='ij')
     amp_x, amp_y = width * 0.30, height * 0.30
-    cx = width * 0.5 + amp_x * np.sin(t * 0.7)
-    cy = height * 0.5 + amp_y * np.sin(t * 0.9 + 1.0)
+    cx = width * 0.5 + amp_x * math.sin(t * 0.7)
+    cy = height * 0.5 + amp_y * math.sin(t * 0.9 + 1.0)
     sigma = max(2.0, min(width, height) * 0.01)
-    blob = np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2)))
-    bg = np.random.default_rng().random((height, width), dtype=np.float32) * 0.02
-    img = np.clip(bg + 0.95 * blob, 0.0, 1.0)
-    return (img * max_val).astype(np.uint16)
+    blob = torch.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2)))
+    bg = torch.rand((height, width)) * 0.02
+    img = torch.clamp(bg + 0.95 * blob, 0.0, 1.0)
+    return (img * max_val).to(torch.int32).numpy().astype(np.uint16)
 
 
 def _zwo_module():

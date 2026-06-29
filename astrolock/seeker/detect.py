@@ -27,13 +27,16 @@ import torch
 from astrolock.seeker import bayer, ser as ser_mod, sidecar
 from astrolock.seeker.sidecar import JsonlWriter
 
+_DEVICE = torch.device('cpu')        # switch to 'cuda' once a CUDA torch is installed
 
-def work_image(frame, color_id):
-    """The grayscale image we analyze: Bayer -> sensitive half-res mono sum; else as-is."""
+
+def work_image(frame, color_id, device=None):
+    """The grayscale image we analyze: Bayer -> sensitive half-res mono sum; else as-is. All torch
+    (device-parameterized). torch has no uint16, so cast the raw frame to int32 at this ingest."""
+    mosaic = torch.from_numpy(frame.astype('int32')).to(device or _DEVICE)
     if bayer.is_bayer(color_id):
-        return torch.as_tensor(bayer.to_mono_sum(frame), dtype=torch.float32)
-    # frame is a read-only buffer view from the SER reader; astype gives a writable copy.
-    return torch.from_numpy(frame.astype('float32'))
+        return bayer.to_mono_sum(mosaic)
+    return mosaic.float()
 
 
 def _running_mean(a, r, axis):
@@ -309,7 +312,9 @@ def main(argv=None):
                    help="frame-diff at the peak must exceed this fraction of the peak to be 'moving'")
     p.add_argument('--poll', type=float, default=0.02, help="seconds between polls when caught up (live)")
     p.add_argument('--stop-file', default=None, help="stop when this file appears")
+    p.add_argument('--device', default='cpu', help="torch device for detection (cpu / cuda)")
     args = p.parse_args(argv)
+    device = torch.device(args.device)
 
     # Wait for the first segment to exist.
     while not _segments(args.session, args.role):
@@ -339,7 +344,7 @@ def main(argv=None):
         cid = reader.header.color_id
         if scale is None:
             scale = full_scale(cid, reader.header.pixel_depth_per_plane)
-        work = work_image(frame, cid)
+        work = work_image(frame, cid, device=device)
         bp = detection_surface(work, detector=args.detector, bg_radius=args.bg_radius,
                                psf_px=args.psf_px, doh_sigma=args.doh_sigma)
         blobs = detect_blobs(

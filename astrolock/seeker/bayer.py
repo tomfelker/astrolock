@@ -11,7 +11,7 @@ half-res mono for detection.
 Plane positions within a 2x2 cell: ul ur / ll lr.
 """
 
-import numpy as np
+import torch
 
 from astrolock.seeker import ser
 
@@ -21,7 +21,8 @@ def is_bayer(color_id):
 
 
 def split_planes(mosaic):
-    """Return (ul, ur, ll, lr), each (H//2, W//2), from a raw Bayer mosaic (H, W)."""
+    """Return (ul, ur, ll, lr), each (H//2, W//2), from a raw Bayer mosaic (H, W).
+    Slicing-only, so it works on a torch tensor or numpy array; the rest of this module is torch."""
     even = mosaic[0::2]
     odd = mosaic[1::2]
     return even[:, 0::2], even[:, 1::2], odd[:, 0::2], odd[:, 1::2]
@@ -57,14 +58,14 @@ def debayer_to_rgb(mosaic, color_id):
     layout = _LAYOUT.get(int(color_id))
     if layout is None:
         raise ValueError(f"not a Bayer color_id: {color_id}")
-    planes = [p.astype(np.float32) for p in split_planes(mosaic)]
+    planes = [p.float() for p in split_planes(mosaic)]
     r = planes[layout['r']]
     g = (planes[layout['g'][0]] + planes[layout['g'][1]]) * 0.5
     b = planes[layout['b']]
-    return np.stack([r, g, b], axis=-1)
+    return torch.stack([r, g, b], dim=-1)
 
 
 def to_mono_sum(mosaic):
     """Half-res mono = sum of the four Bayer planes (sensitive; good for detection)."""
-    ul, ur, ll, lr = (p.astype(np.float32) for p in split_planes(mosaic))
+    ul, ur, ll, lr = (p.float() for p in split_planes(mosaic))
     return ul + ur + ll + lr

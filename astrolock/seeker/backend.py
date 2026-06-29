@@ -58,6 +58,7 @@ def main(argv=None):
                    help="detect density cap: tiles across the frame (0 = off); keeps targets from "
                         "a dense bright region from starving the rest of the frame")
     p.add_argument('--per-tile', type=int, default=2, help="detect density cap: max blobs per tile")
+    p.add_argument('--device', default='cpu', help="torch device for detect + gui (cpu / cuda)")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=30.0)
@@ -197,13 +198,15 @@ def main(argv=None):
                                      '--detector', args.detector, '--doh-sigma', str(args.doh_sigma),
                                      '--snr', str(args.snr), '--max-candidates', str(args.max_candidates),
                                      '--min-blob-px', str(args.min_blob_px),
-                                     '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile)])
+                                     '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile),
+                                     '--device', args.device])
 
     for role in roles:
         launch_cam(role)
         launch_detect(role)
     gui_proc = _spawn('astrolock.seeker.gui',
-                      ['--session', session_dir, '--wb-r', str(args.wb_r), '--wb-b', str(args.wb_b)]) \
+                      ['--session', session_dir, '--wb-r', str(args.wb_r), '--wb-b', str(args.wb_b),
+                       '--device', args.device]) \
         if args.gui else None
 
     followers = {role: SerFollower(session_dir, role) for role in roles}
