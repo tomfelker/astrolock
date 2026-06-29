@@ -89,11 +89,11 @@ def main(argv=None):
     p.add_argument('--sky-pixel-um', type=float, default=2.0, help="guide sensor pixel pitch (um)")
     p.add_argument('--arcsec-per-px', type=float, default=0.0,
                    help="guide plate scale override (0 = derive from --sky-pixel-um / --sky-focal-mm)")
-    p.add_argument('--track-ki', type=float, default=0.3,
+    p.add_argument('--track-ki', type=float, default=0.1,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
-    p.add_argument('--track-damping', type=float, default=1.3,
+    p.add_argument('--track-damping', type=float, default=1.5,
                    help="P is derived for critical damping (kp=2*sqrt(ki)); >1 over-damps for lag margin")
-    p.add_argument('--track-kd', type=float, default=1.0,
+    p.add_argument('--track-kd', type=float, default=2.0,
                    help="tracker derivative braking gain (on image speed above --track-max-px-s)")
     p.add_argument('--track-max-px-s', type=float, default=120.0,
                    help="image-speed dead zone (px/s): brake the slew above this during acquisition")
