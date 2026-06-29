@@ -20,6 +20,13 @@ Two parts:
     image velocity is the residual rate error and feeding it back oscillates. The smoothed
     velocity feeds the dead-zoned brake, the prediction, and the association gate.)
 
+    An optional second integral term (kii, off by default) integrates the position error twice.
+    Plain PI drives the steady-state lag to zero for a constant-*velocity* target but leaves a
+    residual lag proportional to acceleration -- which is what makes the cam lag then lead a
+    satellite as it accelerates overhead. The second integral removes that constant-acceleration
+    lag too. Keep it weak: stability (Routh-Hurwitz on s^3 + kp s^2 + ki s + kii) needs
+    kii < kp*ki. It clamps and freezes-on-lost exactly like the first integral.
+
 Sign/scale convention (gnomonic sim, camera upright, az->+x, alt->-y):
     rate_az  = +rad_per_px * (kp * ex + ix + kd * excess(vx))
     rate_alt = -rad_per_px * (kp * ey + iy + kd * excess(vy))
@@ -45,12 +52,12 @@ def _excess(v, thr):
 
 
 class PixelTracker:
-    def __init__(self, cx, cy, rad_per_px, ki=0.3, damping=1.3, kd=1.0, gate_px=80.0, lost_s=1.5,
-                 vel_smoothing=0.1, max_track_px_s=120.0, max_rate_rad_s=math.radians(8.0),
+    def __init__(self, cx, cy, rad_per_px, ki=0.3, damping=1.3, kd=1.0, kii=0.0, gate_px=80.0,
+                 lost_s=1.5, vel_smoothing=0.1, max_track_px_s=120.0, max_rate_rad_s=math.radians(8.0),
                  sign_az=1.0, sign_alt=-1.0):
         self.cx, self.cy = cx, cy
         self.rad_per_px = rad_per_px
-        self.ki, self.kd = ki, kd
+        self.ki, self.kd, self.kii = ki, kd, kii
         # For the loop (mount = integrator, PI control) the position error obeys
         # e'' + kp e' + ki e = 0, so kp = 2*sqrt(ki) is critically damped. `damping` >= 1 pushes
         # it slightly over-damped for margin against the real system's lags (mount update rate,
@@ -62,6 +69,10 @@ class PixelTracker:
         self.v_thresh = max_track_px_s           # dead-zone: brake image speed above this
         self.max_rate = max_rate_rad_s           # mount rate clamp
         self.i_clamp = max_rate_rad_s / rad_per_px   # integral alone can't exceed max motor rate
+        # The second integral is fed by the first: integ holds ki*(int e), so (int int e) = integ/ki,
+        # and the kii term accumulates kii*(integ/ki)*dt -> exactly kii*(int int e). Precompute the
+        # per-step factor; if ki is 0 there's no first integral to build on, so disable kii.
+        self.kii_step = (kii / ki) if ki > 0 else 0.0
         self.sign_az, self.sign_alt = sign_az, sign_alt
         self.active = False
 
@@ -73,6 +84,7 @@ class PixelTracker:
         self._vel_raw = [0.0, 0.0]                # raw EMA (biased toward 0 early)
         self._vel_w = 0.0                          # EMA of 1's (0 -> 1): warm-start bias correction
         self.integ = [0.0, 0.0]                  # integral of position error (px/s)
+        self.integ2 = [0.0, 0.0]                 # second integral (kii term; 0 unless kii > 0)
         self.meas_t = now
         self.good_t = now                        # last successful association
         self.last_t = now
@@ -137,10 +149,14 @@ class PixelTracker:
         c = self.i_clamp
         self.integ[0] = max(-c, min(c, self.integ[0] + self.ki * ex * dt))
         self.integ[1] = max(-c, min(c, self.integ[1] + self.ki * ey * dt))
+        # Second integral (kii): integrate the first integral again, same clamp. kii_step is 0
+        # unless kii > 0, so integ2 stays 0 and this is a no-op for the default PI+D loop.
+        self.integ2[0] = max(-c, min(c, self.integ2[0] + self.kii_step * self.integ[0] * dt))
+        self.integ2[1] = max(-c, min(c, self.integ2[1] + self.kii_step * self.integ[1] * dt))
 
         m = self.max_rate
         rate_az = max(-m, min(m, self.sign_az * self.rad_per_px
-                                 * (self.kp * ex + self.integ[0] + self.kd * evx)))
+                                 * (self.kp * ex + self.integ[0] + self.integ2[0] + self.kd * evx)))
         rate_alt = max(-m, min(m, self.sign_alt * self.rad_per_px
-                                  * (self.kp * ey + self.integ[1] + self.kd * evy)))
+                                  * (self.kp * ey + self.integ[1] + self.integ2[1] + self.kd * evy)))
         return rate_az, rate_alt, status, (ex_px, ey_px)
