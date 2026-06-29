@@ -153,7 +153,6 @@ def main(argv=None):
     if args.source == 'sky':
         sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                     '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
-                    '--sky-focal-mm', str(args.sky_focal_mm), '--sky-pixel-um', str(args.sky_pixel_um),
                     '--sky-lat', str(msite['lat_deg']), '--sky-lon', str(msite['lon_deg']),
                     '--sky-elev', str(msite['elev_m']), '--sky-epoch', str(msite['epoch_utc']),
                     '--sky-follow-state']
@@ -177,7 +176,11 @@ def main(argv=None):
     # sky-derived/override rad_per_px above. Print the resolved FoV so it's easy to sanity-check.
     _sensors, _optics, _reducers = optics.load_db()
     rad_per_px_by_role = {}
+    render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
+    fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
     for role in roles:
+        rad_per_px_by_role[role] = rad_per_px
+        render_by_role[role] = (args.width, args.height, args.sky_pixel_um, args.sky_focal_mm)
         sname, oname = getattr(args, f'{role}_sensor', None), getattr(args, f'{role}_optic', None)
         rname = getattr(args, f'{role}_reducer', None)
         try:
@@ -186,14 +189,13 @@ def main(argv=None):
                 mult = _reducers[rname] if rname else 1.0
                 feff = o.focal_length_mm * mult
                 rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um, feff)
+                render_by_role[role] = (s.res_x, s.res_y, s.pixel_um, feff)
                 fx, fy = optics.fov_deg(s, feff)
+                fov_by_role[role] = (fx, fy)
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
                       f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(s.pixel_um, feff):.3f} arcsec/px", flush=True)
-            else:
-                rad_per_px_by_role[role] = rad_per_px
         except KeyError as e:
             print(f"[backend] {role}: unknown optics {e}; using fallback plate scale", flush=True)
-            rad_per_px_by_role[role] = rad_per_px
     zenith_zone_cos = math.sin(math.radians(args.track_zenith_zone_deg))   # |cos(alt)| below this = zone
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
@@ -209,12 +211,18 @@ def main(argv=None):
         if role in control_writers:
             control_writers[role].close()
         control_writers[role] = JsonlWriter(cf)
+        rx, ry, pum, fmm = render_by_role[role]       # per-role render size + sky optics (from the DB)
+        per_role_sky = []
+        if sources[role] == 'sky':
+            per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum)]
+            if role in fov_by_role:                   # DB optics named -> render at the true sensor
+                per_role_sky += ['--sky-width', str(rx), '--sky-height', str(ry)]   # res, so FoV matches
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
-            '--width', str(args.width), '--height', str(args.height), '--fps', str(args.fps),
+            '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
             '--important', '1' if recording else '0', '--control-file', cf,
-            *(['--auto'] if args.auto else []), *sky_args, *playback_args,
+            *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
         ])
         control_writers[role].append({'important': 1 if recording else 0})
 
@@ -436,6 +444,8 @@ def main(argv=None):
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},
                 'cameras': {role: {'frames': followers[role].committed_count()} for role in roles},
+                'optics': {r: {'fov_x_deg': round(fv[0], 4), 'fov_y_deg': round(fv[1], 4)}
+                           for r, fv in fov_by_role.items()},
             })
 
             if now - last_health >= 1.0:

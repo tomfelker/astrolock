@@ -715,6 +715,13 @@ Captured ideas, not yet scheduled. Grouped by area.
   `--guide-sensor/--guide-optic` (and `--main-*`, optional `--*-reducer`), printing each rig's FoV
   at startup and feeding the controller's `rad_per_px`; falls back to the sky-derived value. Refresh
   the snapshot occasionally.
+- **Multiple sim cameras** — *built*: `--roles guide,main --source sky` with per-role
+  `--{role}-sensor/-optic` renders each sky-cam at its own resolution + FoV (the backend passes the
+  DB sensor res/pixel/focal as `--sky-width/-height/-pixel-um/-focal-mm` per role), co-aligned on
+  the one mount. The backend publishes each role's FoV in the state; the **GUI draws each narrower
+  camera's footprint as a rectangle nested in the wider view** (e.g. the main cam inside the guide
+  — centred, assuming co-aligned boresights; the boresight-nudge offset can shift it later). Note:
+  two full-sensor (4K) sky renders run ~4 fps on CPU; add a sim downscale/bin if that bites.
 - **(stretch) Physically accurate star brightness**: electrons from aperture × QE × bandpass ×
   exposure × a zero-point, so sim ADU matches what a real sensor would record.
 - **Render the ISS as a crude multi-point sketch** (~tens of points: truss/backbone + solar

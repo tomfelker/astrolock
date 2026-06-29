@@ -194,11 +194,12 @@ def main(argv=None):
             with dpg.drawlist(width=disp_w, height=disp_h) as drawlist:
                 dpg.draw_image(tex_tag, (0, 0), (disp_w, disp_h))
                 box_layer = dpg.add_draw_layer()
+                fov_layer = dpg.add_draw_layer()        # nested camera-FoV rectangles
                 track_layer = dpg.add_draw_layer()      # the locked-target marker (on top)
         det_path = f.ser_path[:-len('.ser')] + '.detections.jsonl'
         views[role] = dict(tex=tex_tag, status=status, det_tailer=JsonlTailer(det_path),
                            ser_path=f.ser_path, blobs=[], box_layer=box_layer,
-                           track_layer=track_layer, drawlist=drawlist,
+                           fov_layer=fov_layer, track_layer=track_layer, drawlist=drawlist,
                            ox=disp_w / fw, oy=disp_h / fh, w=w, h=h, last_idx=-1, det_idx=-1, peak=0)
 
     def rebuild_view(role):
@@ -428,6 +429,25 @@ def main(argv=None):
                     dpg.draw_line((X + ex * (r + S(6)), Y + ey * (r + S(6))),
                                   (X + ex * S(4), Y + ey * S(4)), color=col, thickness=th,
                                   parent=v['track_layer'])
+
+            # Nested camera-FoV rectangles: each *narrower* camera's footprint inside this view
+            # (e.g. the main cam inside the wide guide). Centred -- assumes co-aligned boresights.
+            dpg.delete_item(v['fov_layer'], children_only=True)
+            optx = (ctrl['state'] or {}).get('optics', {})
+            me = optx.get(role)
+            if me:
+                for r2, fv2 in optx.items():
+                    if r2 == role or not (fv2['fov_x_deg'] < me['fov_x_deg']
+                                          and fv2['fov_y_deg'] < me['fov_y_deg']):
+                        continue
+                    hw = fv2['fov_x_deg'] / me['fov_x_deg'] * v['w'] / 2.0
+                    hh = fv2['fov_y_deg'] / me['fov_y_deg'] * v['h'] / 2.0
+                    ccx, ccy = v['w'] / 2.0, v['h'] / 2.0
+                    col2 = (120, 180, 255, 220)
+                    dpg.draw_rectangle((ccx - hw, ccy - hh), (ccx + hw, ccy + hh),
+                                       color=col2, thickness=max(1.0, ui_scale), parent=v['fov_layer'])
+                    dpg.draw_text((ccx - hw, ccy - hh - S(14)), r2, size=S(13),
+                                  color=col2, parent=v['fov_layer'])
 
         dpg.render_dearpygui_frame()
         if not new_work:
