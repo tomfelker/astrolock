@@ -21,6 +21,7 @@ import argparse
 import glob
 import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -106,10 +107,35 @@ def main(argv=None):
     p.add_argument('--wb-r', type=float, default=1.24, help="display-only WB gain for red")
     p.add_argument('--wb-b', type=float, default=1.98, help="display-only WB gain for blue")
     p.add_argument('--slew-rate', type=float, default=3.0, help="slew rate while a button is held (deg/s)")
+    p.add_argument('--ui-scale', type=float, default=0.0,
+                   help="UI/DPI scale factor (0 = auto-detect from the OS; e.g. 1.5 for a 150%% display)")
     args = p.parse_args(argv)
     wb = (args.wb_r, args.wb_b)
 
     import dearpygui.dearpygui as dpg
+
+    # Declare per-monitor DPI awareness *before* the viewport exists, so Windows gives us a
+    # native-resolution framebuffer instead of bitmap-upscaling a low-res window (which blurs
+    # the text). Then read the monitor scale so we can size the UI up to match -- without that
+    # the text renders crisp but tiny. Must precede create_context.
+    ui_scale = args.ui_scale
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        except Exception:
+            pass  # older Windows, awareness already set via manifest, etc. -- purely cosmetic, never fatal
+        if ui_scale <= 0:
+            try:
+                ui_scale = ctypes.windll.user32.GetDpiForSystem() / 96.0
+            except Exception:
+                ui_scale = 0.0
+    if ui_scale <= 0:
+        ui_scale = 1.0
+
+    def S(v):
+        """Scale a pixel dimension by the display's DPI factor, rounded to an int."""
+        return int(round(v * ui_scale))
 
     fixed_roles = ([r.strip() for r in args.roles.split(',') if r.strip()]
                    if args.roles else None)
@@ -118,6 +144,7 @@ def main(argv=None):
     view_pos = {}   # role -> [x, y], remembered across rebuilds so panes don't jump
 
     dpg.create_context()
+    dpg.set_global_font_scale(ui_scale)   # crisp text at the right size (ImGui 1.92 re-rasterizes)
 
     def ensure_view(role):
         """Create a view lazily, once a frame exists (we need its post-debayer size)."""
@@ -134,10 +161,10 @@ def main(argv=None):
         with dpg.texture_registry():
             dpg.add_raw_texture(w, h, np.zeros(w * h * 4, dtype=np.float32),
                                 format=dpg.mvFormat_Float_rgba, tag=tex_tag)
-        disp_w = args.display_width
+        disp_w = S(args.display_width)
         disp_h = int(round(disp_w * h / w))
         win_kwargs = {'pos': view_pos[role]} if role in view_pos else {}
-        with dpg.window(label=role, tag=f"win_{role}", width=disp_w + 30, height=disp_h + 70,
+        with dpg.window(label=role, tag=f"win_{role}", width=disp_w + S(30), height=disp_h + S(70),
                         **win_kwargs):
             status = dpg.add_text("waiting...")
             # Draw the image and overlay boxes as crisp vector rectangles (Dear PyGui draws
@@ -223,27 +250,27 @@ def main(argv=None):
         _send({'type': 'set_source', 'role': dpg.get_value('cam_combo'), 'source': app_data})
 
     # Control + telemetry panel: camera select / capture / record, a slew pad, and state.
-    with dpg.window(label="Control", tag="win_control", width=320, height=360, pos=(10, 10)):
+    with dpg.window(label="Control", tag="win_control", width=S(320), height=S(360), pos=(10, 10)):
         state_text = dpg.add_text("backend: connecting...")
         dpg.add_separator()
-        dpg.add_combo([], tag='cam_combo', width=150, label="camera")
-        dpg.add_combo(['synthetic', 'zwo', 'sky'], tag='src_combo', width=150,
+        dpg.add_combo([], tag='cam_combo', width=S(150), label="camera")
+        dpg.add_combo(['synthetic', 'zwo', 'sky'], tag='src_combo', width=S(150),
                       label="source", callback=on_source)
         with dpg.group(horizontal=True):
-            dpg.add_button(label="Start", width=64, callback=lambda: on_start())
-            dpg.add_button(label="Stop", width=64, callback=lambda: on_stop_cap())
+            dpg.add_button(label="Start", width=S(64), callback=lambda: on_start())
+            dpg.add_button(label="Stop", width=S(64), callback=lambda: on_stop_cap())
             dpg.add_checkbox(label="Record", tag='rec_chk', callback=on_record)
         dpg.add_separator()
         with dpg.group(horizontal=True):
-            dpg.add_spacer(width=72)
-            btn_alt_up = dpg.add_button(label="Alt +", width=64, height=40)
+            dpg.add_spacer(width=S(72))
+            btn_alt_up = dpg.add_button(label="Alt +", width=S(64), height=S(40))
         with dpg.group(horizontal=True):
-            btn_az_dn = dpg.add_button(label="Az -", width=64, height=40)
-            btn_stop = dpg.add_button(label="Stop", width=64, height=40)
-            btn_az_up = dpg.add_button(label="Az +", width=64, height=40)
+            btn_az_dn = dpg.add_button(label="Az -", width=S(64), height=S(40))
+            btn_stop = dpg.add_button(label="Stop", width=S(64), height=S(40))
+            btn_az_up = dpg.add_button(label="Az +", width=S(64), height=S(40))
         with dpg.group(horizontal=True):
-            dpg.add_spacer(width=72)
-            btn_alt_dn = dpg.add_button(label="Alt -", width=64, height=40)
+            dpg.add_spacer(width=S(72))
+            btn_alt_dn = dpg.add_button(label="Alt -", width=S(64), height=S(40))
         dpg.add_text("hold a direction to slew", color=(150, 150, 150))
         dpg.add_text("click image to track, right-click to stop", color=(150, 150, 150))
 
@@ -302,7 +329,7 @@ def main(argv=None):
             ctrl['client'].send({'type': 'set_rate', 'az': az, 'alt': alt})
             ctrl['last_rate'] = (az, alt)
 
-    dpg.create_viewport(title="AstroLock Seeker", width=1400, height=900)
+    dpg.create_viewport(title="AstroLock Seeker", width=S(1400), height=S(900))
     dpg.setup_dearpygui()
     dpg.show_viewport()
 
@@ -355,11 +382,11 @@ def main(argv=None):
             a = 255 if v['det_idx'] >= v['last_idx'] else 70
             for b in v['blobs']:
                 cx, cy = b['px']
-                half = max(4.0, b.get('size_px', 4) * v['ox']) + 3.0
+                half = max(4.0 * ui_scale, b.get('size_px', 4) * v['ox']) + 3.0 * ui_scale
                 x, y = cx * v['ox'], cy * v['oy']
                 color = (60, 255, 60, a) if b.get('moving') else (255, 200, 40, a)
                 dpg.draw_rectangle((x - half, y - half), (x + half, y + half),
-                                   color=color, thickness=1, parent=v['box_layer'])
+                                   color=color, thickness=max(1.0, ui_scale), parent=v['box_layer'])
             dpg.set_value(v['status'],
                           f"frame {v['last_idx']}  {_color_name(f.header.color_id)}  "
                           f"peak {v.get('peak', 0)}  blobs {len(v['blobs'])}")
@@ -372,11 +399,12 @@ def main(argv=None):
                 tx, ty = stt['target_px']
                 X, Y = tx * v['ox'], ty * v['oy']
                 col = (255, 60, 220, 255)
-                r = 14
-                dpg.draw_circle((X, Y), r, color=col, thickness=2, parent=v['track_layer'])
+                r = S(14)
+                th = max(1.0, 2.0 * ui_scale)
+                dpg.draw_circle((X, Y), r, color=col, thickness=th, parent=v['track_layer'])
                 for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    dpg.draw_line((X + ex * (r + 6), Y + ey * (r + 6)),
-                                  (X + ex * 4, Y + ey * 4), color=col, thickness=2,
+                    dpg.draw_line((X + ex * (r + S(6)), Y + ey * (r + S(6))),
+                                  (X + ex * S(4), Y + ey * S(4)), color=col, thickness=th,
                                   parent=v['track_layer'])
 
         dpg.render_dearpygui_frame()

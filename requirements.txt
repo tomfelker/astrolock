@@ -1,7 +1,7 @@
 astropy >= 5.2
 numpy
 # tkinter ships with Python as stdlib; it is NOT installable via pip (used by the legacy GUI)
-pygame
+pygame-ce
 requests
 pyserial
 skyfield

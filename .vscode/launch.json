@@ -2,17 +2,24 @@
     "configurations": [
         {
             "name": "AstroLock",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "module": "astrolock",
             "justMyCode": true
         },
         {
             "name": "Focus",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "focus.py",
             "justMyCode": true
+        },
+        {
+            "name": "Seeker",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "astrolock.seeker.backend",
+            "subProcess": false
         }
     ]
 }
