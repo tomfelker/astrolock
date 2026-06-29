@@ -22,6 +22,7 @@ import math
 import os
 import time
 
+import numpy as np
 import torch
 
 from astrolock.seeker import bayer, ser as ser_mod, sidecar
@@ -70,18 +71,86 @@ def band_pass(work, bg_radius):
     return work - box_blur(work, bg_radius)
 
 
-def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_radius,
-                 min_blob_px, max_size_px, psf_px, snr=0.0, min_roundness=0.0, moving_frac, scale):
-    """
-    Greedy peak detection on the band-passed image ``bp`` (pointlike features), with non-max
-    suppression. ``work`` is the original grayscale (for the absolute brightness score) and
-    ``prev_bp`` is the previous band-passed frame (for the "moving" flag).
+def gaussian_deriv_kernels(sigma, radius):
+    """1-D Gaussian and its 1st/2nd derivatives, sampled on [-radius, radius] (torch)."""
+    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    g = torch.exp(-0.5 * (x / sigma) ** 2)
+    g = g / g.sum()
+    g1 = -(x / sigma ** 2) * g                           # d/dx of the (normalized) Gaussian
+    g2 = ((x ** 2 - sigma ** 2) / sigma ** 4) * g         # d^2/dx^2
+    return g, g1, g2
 
-    Each blob gets a sub-pixel center, a size, a brightness ``score``, a ``pointlike`` score
-    (1 = PSF-sized, →0 = extended), and a ``roundness`` (1 = circular, →0 = a line/edge, from
-    the ratio of the second-moment eigenvalues). Peaks must clear ``snr`` sigma above the
-    band-passed background (robust MAD); an optional ``threshold_rel`` relative floor and the
-    ``max_size_px`` / ``min_roundness`` cuts reject extended clutter and edges/streaks.
+
+def _conv1d_axis(img, k, axis):
+    """Convolve 2-D ``img`` with 1-D kernel ``k`` along ``axis`` (0=y, 1=x), reflect-padded."""
+    pad = k.numel() // 2
+    x = img[None, None]
+    if axis == 1:
+        x = torch.nn.functional.pad(x, (pad, pad, 0, 0), mode='reflect')
+        return torch.nn.functional.conv2d(x, k.view(1, 1, 1, -1))[0, 0]
+    x = torch.nn.functional.pad(x, (0, 0, pad, pad), mode='reflect')
+    return torch.nn.functional.conv2d(x, k.view(1, 1, -1, 1))[0, 0]
+
+
+def det_of_hessian(work, sigma):
+    """
+    Scale-normalized determinant of the Hessian at scale ``sigma`` (px), as the detection
+    surface (an alternative to band_pass). Computed via separable Gaussian-derivative
+    convolutions: Lxx = g'' * g, Lyy = g * g'', Lxy = g' * g', then DoH = Lxx*Lyy - Lxy^2.
+
+    Peaks on round blobs ~sigma in size; an edge/line gives ~0 (one principal curvature
+    vanishes, so the determinant collapses regardless of orientation -- the -Lxy^2 term cancels
+    Lxx*Lyy for a diagonal edge) and a saddle goes negative. So it discriminates star/target
+    blobs from the door-frame and wire edges that fool a plain band-pass.
+
+    We return sqrt(max(DoH, 0)) -- the geometric mean of the two principal curvatures,
+    sqrt(lambda1*lambda2). The raw determinant scales as contrast^2 (each Hessian term is linear
+    in amplitude), which crushes faint stars toward the noise floor; the square root is *linear*
+    in contrast, restoring faint-source sensitivity comparable to a matched filter, while still
+    vanishing on edges (one curvature ~0 -> product ~0) so the edge rejection survives. It also
+    broadens the otherwise razor-sharp peaks, which helps the min-blob-px size cut. Saddles
+    (negative determinant) clamp to 0. The Gaussian's sigma is both the blob scale and the noise
+    low-pass. See astrolock_seeker.md.
+    """
+    work = torch.as_tensor(work, dtype=torch.float32)
+    h, w = work.shape
+    radius = max(1, min(int(4.0 * sigma + 0.5), (min(h, w) - 1) // 2))
+    g, g1, g2 = gaussian_deriv_kernels(sigma, radius)
+    lxx = _conv1d_axis(_conv1d_axis(work, g2, 1), g, 0)
+    lyy = _conv1d_axis(_conv1d_axis(work, g, 1), g2, 0)
+    lxy = _conv1d_axis(_conv1d_axis(work, g1, 1), g1, 0)
+    doh = (lxx * lyy - lxy * lxy) * (sigma ** 4)          # gamma-normalized, comparable across scales
+    return torch.sqrt(torch.clamp(doh, min=0.0))          # linearize in contrast; keeps edge rejection
+
+
+def detection_surface(work, *, detector, bg_radius, psf_px, doh_sigma):
+    """The 2-D map detect_blobs picks peaks from: band-pass (default) or determinant-of-Hessian."""
+    if detector == 'doh':
+        sigma = doh_sigma if doh_sigma > 0 else psf_px
+        return det_of_hessian(work, sigma)
+    return band_pass(work, bg_radius)
+
+
+def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_radius,
+                 min_blob_px, max_size_px, psf_px, snr=0.0, min_roundness=0.0, moving_frac, scale,
+                 tile_grid=0, per_tile=0):
+    """
+    Peak detection on the detection surface ``bp`` (band-pass or determinant-of-Hessian), with
+    non-max suppression. ``work`` is the original grayscale (absolute brightness score) and
+    ``prev_bp`` the previous surface (the "moving" flag).
+
+    NMS: local maxima (>= every neighbor within ``suppress_radius``) are found in one max-pool
+    pass, then taken strongest-first while suppressing a radius-r neighborhood around each (so a
+    flat ridge yields one peak per r, as before). Each blob gets a sub-pixel center, size,
+    brightness ``score``, ``pointlike`` (1 = PSF-sized, →0 = extended), and ``roundness`` (1 =
+    circular, →0 = line/edge). Peaks must clear ``snr`` sigma above the surface background (robust
+    MAD) and/or a ``threshold_rel`` floor; ``max_size_px`` / ``min_roundness`` reject extended
+    clutter and edges/streaks.
+
+    Density cap: with ``tile_grid`` > 0 the frame is split into a grid ~``tile_grid`` tiles across
+    and at most ``per_tile`` blobs are kept per tile. This stops a dense bright region (a foliage
+    blob-field) from eating the whole ``max_candidates`` budget and starving real targets
+    elsewhere -- we limit target *density*, not just the total.
     """
     bp = torch.as_tensor(bp, dtype=torch.float32)
     work = torch.as_tensor(work, dtype=torch.float32)
@@ -89,6 +158,7 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
     m = float(bp.max())
     if m <= 0:
         return blobs
+    h, w = bp.shape
 
     # Absolute SNR threshold from a robust background sigma (MAD), with optional relative floor.
     flat = bp.reshape(-1)
@@ -102,35 +172,58 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
         if prev_bp.shape == bp.shape:
             diff = bp - prev_bp
 
-    scratch = bp.clone()
-    h, w = bp.shape
-    r = suppress_radius
+    # Candidate peaks: one max per (2r+1) tile via a *strided* max-pool -- O(N) single pass, far
+    # cheaper than a stride-1 NMS, and the tile already enforces ~suppress_radius spacing.
+    # return_indices gives each tile-max's location directly. A peak straddling a tile boundary can
+    # be the max of both neighbours; the taken-mask in the loop merges that duplicate (it's within
+    # r). The candidate count is now bounded by the tile count, so the Python loop stays cheap.
+    r = max(1, suppress_radius)
+    t = 2 * r + 1
+    F = torch.nn.functional
+    vals, idx = F.max_pool2d(bp[None, None], kernel_size=t, stride=t, ceil_mode=True, return_indices=True)
+    vals, idx = vals.reshape(-1), idx.reshape(-1)
+    keep = vals >= thresh
+    if not bool(keep.any()):
+        return blobs
+    order = torch.argsort(vals[keep], descending=True)
+    kidx = idx[keep][order]                                # flat tile-max indices, value-descending
+    oys = (kidx // w).tolist()                             # -> (y, x) in the image
+    oxs = (kidx % w).tolist()
+
+    bp_np = bp.detach().numpy()                            # zero-copy CPU views for fast window reads
+    work_np = work.detach().numpy()
+    diff_np = diff.detach().numpy() if diff is not None else None
+
+    tile_px = math.ceil(w / tile_grid) if (tile_grid > 0 and per_tile > 0) else 0
+    tile_counts = {}
+    taken = np.zeros((h, w), dtype=bool)                   # merges boundary dups + density NMS
     found = 0
-    for _ in range(max_candidates * 4):     # allow extra tries since some get rejected
+    for y, x in zip(oys, oxs):
         if found >= max_candidates:
             break
-        flat_idx = int(torch.argmax(scratch))
-        y, x = divmod(flat_idx, w)
-        peak = float(scratch[y, x])
-        if peak < thresh:
-            break
+        if taken[y, x]:                                    # within an already-claimed neighborhood
+            continue
         y0, y1 = max(0, y - r), min(h, y + r + 1)
         x0, x1 = max(0, x - r), min(w, x + r + 1)
-        win = bp[y0:y1, x0:x1]
+        tk = (y // tile_px, x // tile_px) if tile_px else None
+        if tk is not None and tile_counts.get(tk, 0) >= per_tile:
+            taken[y0:y1, x0:x1] = True                     # tile full: suppress + skip metrics (fast)
+            continue
+        peak = float(bp_np[y, x])
+        win = bp_np[y0:y1, x0:x1]
         n_above = int((win >= 0.5 * peak).sum())
-        scratch[y0:y1, x0:x1] = 0.0          # suppress this neighborhood regardless
+        taken[y0:y1, x0:x1] = True                         # suppress this neighborhood regardless
         if n_above < min_blob_px:
             continue
 
-        ys, xs = torch.meshgrid(torch.arange(y0, y1, dtype=torch.float32),
-                                torch.arange(x0, x1, dtype=torch.float32), indexing='ij')
-        wsub = torch.clamp(win - 0.5 * peak, min=0.0)
+        ys_w, xs_w = np.mgrid[y0:y1, x0:x1]
+        wsub = np.clip(win - 0.5 * peak, 0.0, None)
         tot = float(wsub.sum()) or 1.0
-        cx = float((xs * wsub).sum()) / tot
-        cy = float((ys * wsub).sum()) / tot
+        cx = float((xs_w * wsub).sum()) / tot
+        cy = float((ys_w * wsub).sum()) / tot
 
         # Second-moment eigenvalues -> roundness (minor/major axis variance ratio).
-        dx, dy = xs - cx, ys - cy
+        dx, dy = xs_w - cx, ys_w - cy
         ixx = float((wsub * dx * dx).sum()) / tot
         iyy = float((wsub * dy * dy).sum()) / tot
         ixy = float((wsub * dx * dy).sum()) / tot
@@ -146,11 +239,14 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
         if min_roundness and roundness < min_roundness:
             continue                          # too elongated (edge / streak / wire)
 
-        moving = bool(diff[y, x] > moving_frac * peak) if diff is not None else None
+        if tk is not None:                    # density cap: count this accepted blob in its tile
+            tile_counts[tk] = tile_counts.get(tk, 0) + 1
+
+        moving = bool(diff_np[y, x] > moving_frac * peak) if diff_np is not None else None
         blobs.append({
             'id': found,
             'px': [round(cx, 2), round(cy, 2)],      # [x, y] in the work image
-            'score': round(float(work[y, x]) / scale, 4),  # absolute brightness 0..1
+            'score': round(float(work_np[y, x]) / scale, 4),  # absolute brightness 0..1
             'size_px': round(size_px, 1),
             'pointlike': round(pointlike, 3),
             'roundness': round(roundness, 3),
@@ -186,9 +282,20 @@ def main(argv=None):
                    help="detect peaks this many sigma above the band-passed background")
     p.add_argument('--threshold', type=float, default=0.0,
                    help="optional relative floor: fraction of the brightest band-passed pixel (0 = off)")
+    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh'],
+                   help="detection surface: 'doh' (default) = determinant of the Hessian "
+                        "(Gaussian-derivative blob detector; rejects edges/lines by construction), "
+                        "or 'bandpass' (the older local-background subtraction)")
     p.add_argument('--bg-radius', type=int, default=12,
-                   help="local-background blur radius (px); larger = pass bigger features")
+                   help="bandpass: local-background blur radius (px); larger = pass bigger features")
+    p.add_argument('--doh-sigma', type=float, default=0.0,
+                   help="doh: Gaussian scale in px (0 = use --psf-px); the blob size it responds to")
     p.add_argument('--max-candidates', type=int, default=16)
+    p.add_argument('--tile-grid', type=int, default=8,
+                   help="density cap: split the frame into ~this many tiles across and keep at most "
+                        "--per-tile blobs per tile, so a dense bright region can't eat the whole "
+                        "budget (0 = off, report globally strongest only)")
+    p.add_argument('--per-tile', type=int, default=2, help="density cap: max blobs kept per tile")
     p.add_argument('--suppress-radius', type=int, default=6, help="non-max-suppression radius (px)")
     p.add_argument('--min-blob-px', type=int, default=2, help="ignore peaks smaller than this")
     p.add_argument('--max-size-px', type=float, default=0.0,
@@ -231,14 +338,16 @@ def main(argv=None):
         if scale is None:
             scale = full_scale(cid, reader.header.pixel_depth_per_plane)
         work = work_image(frame, cid)
-        bp = band_pass(work, args.bg_radius)
+        bp = detection_surface(work, detector=args.detector, bg_radius=args.bg_radius,
+                               psf_px=args.psf_px, doh_sigma=args.doh_sigma)
         blobs = detect_blobs(
             bp, work, prev,
             threshold_rel=args.threshold, max_candidates=args.max_candidates,
             suppress_radius=args.suppress_radius, min_blob_px=args.min_blob_px,
             max_size_px=args.max_size_px, psf_px=args.psf_px,
             snr=args.snr, min_roundness=args.min_roundness,
-            moving_frac=args.moving_frac, scale=scale)
+            moving_frac=args.moving_frac, scale=scale,
+            tile_grid=args.tile_grid, per_tile=args.per_tile)
         # Report blobs in the frame's image space. We may analyse a downsampled grid (Bayer ->
         # half-res mono sum), so scale coords back up; consumers then need no idea how we work.
         coord_scale = reader.header.image_width / work.shape[1]

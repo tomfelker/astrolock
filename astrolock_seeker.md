@@ -748,6 +748,14 @@ Captured ideas, not yet scheduled. Grouped by area.
   the median at its current spot so it pops without self-cancellation (the standard technique).
   Then run the determinant-of-Hessian blob test on the result. (We already frame-diff for the `moving` flag — this
   is about using it to *find*, with the right baseline.)
+  - **Update — treated as a dead end.** The whole moving-target / temporal angle is a red herring:
+    (i) the goal is to *track*, which holds the target ~fixed, so **fixed-source detection is the
+    job**; and (ii) background subtraction doesn't even null bright *static* clutter — shot-noise
+    variance ∝ √brightness, so |Δ| stays large wherever the scene is bright (the IR-blown tree
+    lights up a difference image despite being static). So: lean on fixed-source detection
+    (determinant of the Hessian) and clear static clutter via the backend's **prediction /
+    proximity gating once locked**, not temporal subtraction. (`framediff --ema` stays only as a
+    standalone exploration tool; it is *not* in the detect path.)
 - **False positives are OK for tracking** (so masking isn't worth it): as long as detection also
   gets the *real* targets, the backend's gated selection picks the right one near the prediction.
   FP-cleanliness matters mainly for **plate-solving**. And when the mount is **not slewing**,
@@ -763,11 +771,22 @@ Captured ideas, not yet scheduled. Grouped by area.
   PSF-matched filter — relatives are the *Laplacian of Gaussian* and *Difference of Gaussians*;
   the optics practice is **defocused photometry** and keeping the PSF **Nyquist / critically
   sampled** for centroiding.)
-- **Determinant-of-Hessian blob detector**: convolve with Gaussian 2nd-derivative filters
-  (Lxx, Lyy, Lxy) and take the determinant Lxx·Lyy − Lxy². Peaks are round blobs (stars, a laser dot);
-  edges/lines (telephone wires) score ~0 because one principal curvature vanishes. Replaces /
-  augments the current pointlike + roundness heuristics. [open: single scale at the known guide
-  PSF, or a small scale-space?]
+- **Determinant-of-Hessian blob detector** — *built and the default*: `--detector doh` on both
+  `detect` and `backend` (band-pass kept via `--detector bandpass`), single scale via `--doh-sigma`
+  (0 ⇒ `--psf-px`), in `detect.det_of_hessian`. Convolve with Gaussian 2nd-derivative filters
+  (Lxx, Lyy, Lxy) and take the determinant Lxx·Lyy − Lxy². Peaks are round blobs (stars, a laser
+  dot); edges/lines (telephone wires) score ~0 because one principal curvature vanishes. Three
+  refinements made it actually work on the real shed-door capture:
+  - **sqrt-linearized**: return `sqrt(max(DoH, 0))` (geometric mean of the principal curvatures).
+    The raw determinant scales as contrast², which crushed faint stars to 1–2 detections; the root
+    is linear in contrast (faint-star sensitivity) and still vanishes on edges.
+  - **density cap** (`--tile-grid`, `--per-tile`): keep ≤ per_tile blobs per grid tile so a dense
+    bright region (the IR-blown tree) can't eat the whole `--max-candidates` budget and starve real
+    targets elsewhere. Limits target *density*, not just the total.
+  - **fast peak-finding**: a *strided* max-pool with `return_indices` (one max + location per
+    `2·suppress_radius+1` tile, O(N) single pass) replaced a stride-1 NMS + a Python loop over
+    ~25k local maxima that cost ~3 s/frame. Boundary-straddling duplicates merge in the per-peak
+    `taken` mask. detect went ~3100 ms → ~80 ms/frame (~12 fps). [open: small scale-space?]
 - **Candidate pipeline: PSF-scale band-pass → determinant of the Hessian.** Band-pass matched to
   the PSF (low-pass to cut the highest frequency = 1px noise; high-pass to cut frequencies below
   the PSF = background / large structure), then the determinant of the Hessian to keep round blobs

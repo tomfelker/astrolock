@@ -326,9 +326,11 @@ def main(argv=None):
                 v['det_tailer'].close()
                 v['det_tailer'] = JsonlTailer(f.ser_path[:-len('.ser')] + '.detections.jsonl')
                 v['ser_path'] = f.ser_path
-                v['blobs'] = []
                 v['last_idx'] = -1
                 v['det_idx'] = -1
+                # Keep the last blobs rather than blanking: they just become "not current" and the
+                # alpha-fade below dims them until fresh detections arrive. (General behaviour --
+                # the rollover/loop case falls out of it for free.)
 
             # Detections are cheap to poll every loop.
             for rec in v['det_tailer'].poll():

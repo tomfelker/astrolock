@@ -97,8 +97,79 @@ def test_roundness_rejects_streak():
     assert not any(near_streak(b) for b in cut), "streak should be rejected by roundness"
 
 
+def test_doh_detects_blobs_rejects_edge():
+    # Determinant-of-Hessian surface: peaks on round blobs, ~0 along an edge (one curvature
+    # vanishes), so a long thin ridge must not register the way it would in a band-pass.
+    work = np.zeros((200, 200), np.float32)
+    _add_gaussian(work, 60, 60, 60000.0, 2.0)          # round blob A
+    _add_gaussian(work, 140, 120, 50000.0, 2.5)        # round blob B
+    work[150:152, 30:170] = 60000.0                    # a long thin horizontal edge/ridge
+
+    doh = detect.det_of_hessian(work, sigma=3.0)
+    # Direct property: the middle of the edge is ~flat in DoH compared to a blob center.
+    assert float(doh[60, 60]) > 0.0
+    assert abs(float(doh[150, 100])) < 0.1 * float(doh[60, 60]), \
+        f"edge middle DoH {float(doh[150, 100]):.3g} not << blob {float(doh[60, 60]):.3g}"
+
+    scale = ser.container_max(16)
+    # A relative floor (the synthetic background is perfectly flat, so the MAD-sigma SNR cut would
+    # collapse; real data has noise). The edge middle is ~3 orders below a blob, so it's rejected.
+    blobs = detect.detect_blobs(
+        doh, work, None, threshold_rel=0.05, max_candidates=16, suppress_radius=6,
+        min_blob_px=1, max_size_px=0.0, psf_px=4.0, snr=8.0, moving_frac=0.5, scale=scale)
+
+    def near(b, x, y):
+        return abs(b['px'][0] - x) <= 3 and abs(b['px'][1] - y) <= 3
+
+    assert any(near(b, 60, 60) for b in blobs), f"missed blob A: {[b['px'] for b in blobs]}"
+    assert any(near(b, 140, 120) for b in blobs), f"missed blob B: {[b['px'] for b in blobs]}"
+    # No detection along the middle stretch of the edge (its ends/corners may legitimately respond).
+    for b in blobs:
+        assert not (50 <= b['px'][0] <= 150 and 148 <= b['px'][1] <= 154), \
+            f"DoH picked the edge middle at {b['px']}"
+
+
+def test_doh_surface_selectable():
+    # The detection_surface dispatcher returns the DoH map for detector='doh'.
+    work = np.zeros((64, 64), np.float32)
+    _add_gaussian(work, 32, 32, 50000.0, 2.0)
+    bp = detect.detection_surface(work, detector='bandpass', bg_radius=12, psf_px=4.0, doh_sigma=0.0)
+    dh = detect.detection_surface(work, detector='doh', bg_radius=12, psf_px=4.0, doh_sigma=0.0)
+    import torch
+    assert torch.is_tensor(bp) and torch.is_tensor(dh)
+    assert int(dh.reshape(-1).argmax()) == 32 * 64 + 32     # DoH peaks at the blob center
+
+
+def test_tile_density_keeps_distant_target():
+    # A dense cluster of bright blobs (a "tree") in one corner plus one dimmer lone star far away.
+    # With a small global budget and no tiling the cluster eats it and the star is missed; the
+    # per-tile density cap leaves room and the star survives.
+    work = np.zeros((200, 200), np.float32)
+    for i in range(5):
+        for j in range(5):
+            _add_gaussian(work, 15 + i * 12, 15 + j * 12, 60000.0, 2.0)  # cluster in the top-left
+    _add_gaussian(work, 175, 175, 30000.0, 2.0)                          # lone (dimmer) star
+
+    surf = detect.detection_surface(work, detector='doh', bg_radius=12, psf_px=3.0, doh_sigma=2.0)
+    scale = ser.container_max(16)
+    common = dict(threshold_rel=0.02, suppress_radius=4, min_blob_px=1, max_size_px=0.0,
+                  psf_px=3.0, snr=6.0, moving_frac=0.5, scale=scale)
+
+    def near_star(b):
+        return abs(b['px'][0] - 175) <= 4 and abs(b['px'][1] - 175) <= 4
+
+    no_tile = detect.detect_blobs(surf, work, None, max_candidates=8, **common)
+    assert not any(near_star(b) for b in no_tile), "without tiling the cluster should starve the star"
+
+    tiled = detect.detect_blobs(surf, work, None, max_candidates=8, tile_grid=4, per_tile=1, **common)
+    assert any(near_star(b) for b in tiled), "the density cap should preserve the distant star"
+
+
 if __name__ == '__main__':
     test_detect_tracks_moving_blob()
     test_detect_rejects_extended_clutter()
     test_roundness_rejects_streak()
+    test_doh_detects_blobs_rejects_edge()
+    test_doh_surface_selectable()
+    test_tile_density_keeps_distant_target()
     print("test_detect: OK")

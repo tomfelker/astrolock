@@ -48,6 +48,16 @@ def main(argv=None):
     p.add_argument('--playback-ser', default=None, help="playback source: the .ser file to replay")
     p.add_argument('--playback-speed', type=float, default=1.0, help="playback source: speed multiplier")
     p.add_argument('--playback-loop', action='store_true', help="playback source: loop instead of stopping")
+    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh'],
+                   help="detection surface: 'doh' (default) = determinant of the Hessian, or 'bandpass'")
+    p.add_argument('--doh-sigma', type=float, default=0.0, help="doh detector: Gaussian scale px (0 = psf default)")
+    p.add_argument('--snr', type=float, default=6.0, help="detect: report peaks this many sigma above background")
+    p.add_argument('--max-candidates', type=int, default=16, help="detect: max blobs reported per frame")
+    p.add_argument('--min-blob-px', type=int, default=2, help="detect: ignore peaks smaller than this")
+    p.add_argument('--tile-grid', type=int, default=8,
+                   help="detect density cap: tiles across the frame (0 = off); keeps targets from "
+                        "a dense bright region from starving the rest of the frame")
+    p.add_argument('--per-tile', type=int, default=2, help="detect density cap: max blobs per tile")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=30.0)
@@ -183,7 +193,11 @@ def main(argv=None):
     def launch_detect(role):
         detect_procs[role] = _spawn('astrolock.seeker.detect',
                                     ['--session', session_dir, '--role', role, '--follow',
-                                     '--stop-file', stop_file])
+                                     '--stop-file', stop_file,
+                                     '--detector', args.detector, '--doh-sigma', str(args.doh_sigma),
+                                     '--snr', str(args.snr), '--max-candidates', str(args.max_candidates),
+                                     '--min-blob-px', str(args.min_blob_px),
+                                     '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile)])
 
     for role in roles:
         launch_cam(role)
