@@ -704,11 +704,13 @@ Captured ideas, not yet scheduled. Grouped by area.
   backend replacing the current "`set_rate` cancels tracking" behavior.
 
 ### Sim camera
-- **Optics + sensor presets**: rather than maintain our own library, **vendor a snapshot of
-  Stellarium's Oculars data** (`ocular.ini`: `[ccd]` chip size/resolution/pixel size,
-  `[telescope]` focal length/aperture — read with `configparser`), deriving pixel pitch + FOV.
-  The contents are bare facts (no copyright concern); refresh the snapshot occasionally. Doubles
-  as real-camera config later.
+- **Optics + sensor presets** — *built*: vendored a snapshot of Stellarium's Oculars data
+  (17 CCDs, 22 telescopes/photo-lenses, 3 reducers) as `data/optics_db.json`, parsed by
+  `astrolock/seeker/optics.py` with FoV / plate-scale helpers (`arcsec_per_px`, `rad_per_px`,
+  `fov_deg`, `configuration`) and a CLI (`python -m astrolock.seeker.optics ...`). Bare facts;
+  Stellarium is GPL. `rad_per_px` feeds the tracker's pixel-scale tunable directly. *Note:*
+  Stellarium's list is all DSLRs + scopes — no ZWO ASI sensors; add the actual cameras (or read
+  pixel size from the ZWO driver) for our own rigs. Refresh the snapshot occasionally.
 - **(stretch) Physically accurate star brightness**: electrons from aperture × QE × bandpass ×
   exposure × a zero-point, so sim ADU matches what a real sensor would record.
 - **Render the ISS as a crude multi-point sketch** (~tens of points: truss/backbone + solar

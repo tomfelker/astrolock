@@ -1,0 +1,51 @@
+{
+  "_source": "Vendored from Stellarium's Oculars plugin default_ocular.ini (https://github.com/Stellarium/stellarium/blob/master/plugins/Oculars/resources/default_ocular.ini). These are bare facts (sensor resolution / pixel pitch, optic focal length / aperture); Stellarium itself is GPL. CCDs -> sensors, telescopes + photo lenses -> optics, lenses (barlow/reducer) -> reducers.",
+  "sensors": [
+    {"name": "EOS 450D (APS-C)", "res_x": 4272, "res_y": 2848, "pixel_um": 5.2},
+    {"name": "EOS 60Da (APS-C)", "res_x": 5184, "res_y": 3456, "pixel_um": 4.3},
+    {"name": "EOS 70D (APS-C)", "res_x": 5472, "res_y": 3648, "pixel_um": 4.1},
+    {"name": "EOS 80D (APS-C)", "res_x": 6000, "res_y": 4000, "pixel_um": 3.7},
+    {"name": "EOS 5D (Full Frame)", "res_x": 4368, "res_y": 2912, "pixel_um": 8.2},
+    {"name": "EOS 5D II (Full Frame)", "res_x": 5616, "res_y": 3744, "pixel_um": 6.4},
+    {"name": "EOS 5D III (Full Frame)", "res_x": 5760, "res_y": 3840, "pixel_um": 6.25},
+    {"name": "EOS 5D IV (Full Frame)", "res_x": 6720, "res_y": 4480, "pixel_um": 5.36},
+    {"name": "EOS 6D (Full Frame)", "res_x": 5472, "res_y": 3648, "pixel_um": 6.55},
+    {"name": "EOS 6D II (Full Frame)", "res_x": 6240, "res_y": 4160, "pixel_um": 5.77},
+    {"name": "EOS 7D (APS-C)", "res_x": 5184, "res_y": 3456, "pixel_um": 4.1},
+    {"name": "EOS 7D II (APS-C)", "res_x": 5472, "res_y": 3648, "pixel_um": 4.1},
+    {"name": "Nikon D3/D700 (Full Frame)", "res_x": 4256, "res_y": 2832, "pixel_um": 8.44},
+    {"name": "Nikon D7000 (DX)", "res_x": 4928, "res_y": 3264, "pixel_um": 4.78},
+    {"name": "Nikon D7100/D7200 (DX)", "res_x": 6000, "res_y": 4000, "pixel_um": 3.9},
+    {"name": "Nikon D500/D7500 (DX)", "res_x": 5568, "res_y": 3712, "pixel_um": 4.2},
+    {"name": "Classic SLR (Full Frame)", "res_x": 6000, "res_y": 4000, "pixel_um": 6.0}
+  ],
+  "optics": [
+    {"name": "Generic 60x700", "focal_length_mm": 700, "aperture_mm": 60},
+    {"name": "Generic 60x1000", "focal_length_mm": 1000, "aperture_mm": 60},
+    {"name": "Celestron Onyx 80EDF", "focal_length_mm": 500, "aperture_mm": 80},
+    {"name": "Celestron C5 f/10", "focal_length_mm": 1250, "aperture_mm": 125},
+    {"name": "Celestron C8 f/10", "focal_length_mm": 2032, "aperture_mm": 203},
+    {"name": "Celestron C11 f/10", "focal_length_mm": 2800, "aperture_mm": 280},
+    {"name": "Celestron C14 f/11", "focal_length_mm": 3910, "aperture_mm": 355.6},
+    {"name": "Meade ETX 80mm f/5", "focal_length_mm": 400, "aperture_mm": 80},
+    {"name": "Meade ETX 90 f/13.8", "focal_length_mm": 1242, "aperture_mm": 90},
+    {"name": "Meade ETX 125 f/15", "focal_length_mm": 1900, "aperture_mm": 127},
+    {"name": "Meade LX200 8in f/10", "focal_length_mm": 2000, "aperture_mm": 200},
+    {"name": "Meade  LX200 10in f/10", "focal_length_mm": 2500, "aperture_mm": 250},
+    {"name": "Meade  LX200 12in f/10", "focal_length_mm": 3048, "aperture_mm": 305},
+    {"name": "Meade  LX200 14in f/10", "focal_length_mm": 3556, "aperture_mm": 355},
+    {"name": "Meade  LX200 16in f/10", "focal_length_mm": 4064, "aperture_mm": 406},
+    {"name": "Photo Lens 14mm f/2.8", "focal_length_mm": 14, "aperture_mm": 5},
+    {"name": "Photo Lens 24mm f/2.0", "focal_length_mm": 24, "aperture_mm": 12},
+    {"name": "Photo Lens 35mm f/2.8", "focal_length_mm": 35, "aperture_mm": 12.5},
+    {"name": "Photo Lens 50mm f/1.4", "focal_length_mm": 50, "aperture_mm": 35.7},
+    {"name": "Photo Lens 85mm f/1.4", "focal_length_mm": 85, "aperture_mm": 60.7},
+    {"name": "Photo Lens 100mm f/3.3", "focal_length_mm": 100, "aperture_mm": 30.3},
+    {"name": "Photo Lens 135mm f/2.8", "focal_length_mm": 135, "aperture_mm": 48.2}
+  ],
+  "reducers": [
+    {"name": "Barlow 2x", "multiplier": 2.0},
+    {"name": "Barlow 3x", "multiplier": 3.0},
+    {"name": "F/6.3 Reducer", "multiplier": 0.63}
+  ]
+}
