@@ -9,12 +9,15 @@ from astrolock.seeker import optics
 
 def test_db_loads():
     sensors, opts, reducers = optics.load_db()
-    assert len(sensors) == 17 and len(opts) == 22 and len(reducers) == 3
+    assert len(sensors) >= 17 and len(opts) >= 22 and len(reducers) == 3   # Stellarium baseline + ours
     s = sensors["EOS 5D (Full Frame)"]
     assert (s.res_x, s.res_y, s.pixel_um) == (4368, 2912, 8.2)
     assert abs(s.chip_w_mm - 4368 * 8.2 / 1000.0) < 1e-9
     assert opts["Celestron C8 f/10"].focal_length_mm == 2032
     assert reducers["F/6.3 Reducer"] == 0.63
+    # our added rig
+    assert sensors["ZWO ASI678MC"].res_x == 3840 and sensors["ZWO ASI678MC"].pixel_um == 2.0
+    assert opts["8mm CS f/1.4"].focal_length_mm == 8 and opts["Celestron C11 f/10"].focal_length_mm == 2800
 
 
 def test_plate_scale_and_fov():

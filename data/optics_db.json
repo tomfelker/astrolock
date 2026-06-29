@@ -17,7 +17,8 @@
     {"name": "Nikon D7000 (DX)", "res_x": 4928, "res_y": 3264, "pixel_um": 4.78},
     {"name": "Nikon D7100/D7200 (DX)", "res_x": 6000, "res_y": 4000, "pixel_um": 3.9},
     {"name": "Nikon D500/D7500 (DX)", "res_x": 5568, "res_y": 3712, "pixel_um": 4.2},
-    {"name": "Classic SLR (Full Frame)", "res_x": 6000, "res_y": 4000, "pixel_um": 6.0}
+    {"name": "Classic SLR (Full Frame)", "res_x": 6000, "res_y": 4000, "pixel_um": 6.0},
+    {"name": "ZWO ASI678MC", "res_x": 3840, "res_y": 2160, "pixel_um": 2.0, "bayer": "RGGB", "source": "ZWO / Sony IMX678, 1/1.8\" color"}
   ],
   "optics": [
     {"name": "Generic 60x700", "focal_length_mm": 700, "aperture_mm": 60},
@@ -41,7 +42,8 @@
     {"name": "Photo Lens 50mm f/1.4", "focal_length_mm": 50, "aperture_mm": 35.7},
     {"name": "Photo Lens 85mm f/1.4", "focal_length_mm": 85, "aperture_mm": 60.7},
     {"name": "Photo Lens 100mm f/3.3", "focal_length_mm": 100, "aperture_mm": 30.3},
-    {"name": "Photo Lens 135mm f/2.8", "focal_length_mm": 135, "aperture_mm": 48.2}
+    {"name": "Photo Lens 135mm f/2.8", "focal_length_mm": 135, "aperture_mm": 48.2},
+    {"name": "8mm CS f/1.4", "focal_length_mm": 8, "aperture_mm": 5.7, "source": "typical cheap 1/1.8\" 8mm f/1.4 CS-mount lens (guide); FoV set by focal length, not aperture"}
   ],
   "reducers": [
     {"name": "Barlow 2x", "multiplier": 2.0},
