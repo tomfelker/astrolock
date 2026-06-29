@@ -289,7 +289,8 @@ def _open_playback(args):
         st['i'] = i + 1
         return frame
 
-    return capture, h.image_width, h.image_height, h.color_id, h.pixel_depth_per_plane, None, meta
+    return (capture, h.image_width, h.image_height, ser_mod.ColorId(h.color_id),
+            h.pixel_depth_per_plane, None, meta)
 
 
 def main(argv=None):

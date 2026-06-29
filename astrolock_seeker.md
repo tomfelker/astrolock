@@ -831,6 +831,88 @@ Captured ideas, not yet scheduled. Grouped by area.
   guide cam); and is the natural **bridge to the main AstroLock world model**, which already
   computes these positions and could emit the same track file.
 
+### Pipeline / I/O
+- **mmap the SER path for zero-copy into torch.** *Reader: built* — `SerReader(use_mmap=True)` (the
+  default) returns a per-frame `np.memmap` view, with automatic seek+read fallback on any mmap error
+  (`use_mmap=False` forces it off). Reader (simplest — **map per frame**):
+  `torch.from_numpy(np.memmap(path, np.uint16, 'r', offset=178 + i*frame_bytes, shape=(h, w)))`.
+  `np.memmap` handles the offset-alignment rule for you (raw `mmap`'s `offset=` must be a multiple of
+  `ALLOCATIONGRANULARITY` = 64 KB on Windows / 4 KB on Linux — it maps from the page boundary below
+  and views at your offset). **Lifetime is automatic**: `torch.from_numpy` retains the memmap as the
+  tensor's base, so the mapping unmaps when the sole tensor is GC'd — no bookkeeping (wrap it if you
+  want a deterministic `close()`). Cost is one map/unmap per frame — negligible below hundreds of fps.
+  Read-only is fine — detection makes new tensors anyway. For our large frames this also beats
+  `read()`, which memcpys the whole page-cache frame into a user buffer; mmap hands the pages straight
+  to torch. (Alternatives: `torch.frombuffer` on a stdlib `mmap` opened `access=ACCESS_READ`, no
+  numpy; or map the whole file once and index, if per-frame syscalls ever bite.) Writer (ZWO→SER): pre-size fixed segments (we already roll at 300
+  frames → known size), mmap `'r+'`, and let the SDK DMA straight into the frame slot, dropping a copy
+  on capture too.
+- **Growing file** — *moot for the per-frame reader* (each frame is an already-complete range, never
+  past EOF); this only matters for the whole-file-map variant and the **writer pre-sizing slots to
+  DMA into**. There: **pre-sized segments, remap only at rollover.** We already roll at 300-frame
+  segments, so on open `truncate()` each segment to its full final size — a **sparse** file (zeros,
+  no disk until written, on NTFS/ext4) — and map the *whole* segment up front. Growth *within* a
+  segment then needs **no remap**: the writer fills pre-mapped slots, the sidecar gates readable
+  frames. Remap only when opening the next segment (once per 300 frames). Don't "map huge" past EOF:
+  on POSIX touching unbacked pages is **SIGBUS**; on Windows a larger map *extends the file* to that
+  size instead (read-only maps are capped at the file size). Either way **pre-sizing is what makes a
+  big map legal**. And there's no portable *in-place* grow — `mremap` is Linux-only, and
+  `mmap.resize()` can move the base pointer and **invalidate exported numpy/torch views** — so
+  **remap, don't resize**: create a fresh mapping, keep the old one alive until its tensors retire,
+  then drop it (only at rollover).
+- **Writer with rolling *disabled* (one unbounded file).** No known final size, so pre-sizing a
+  segment doesn't apply. Two options: (a) **simplest — keep the writer on plain append-`write()`**
+  (extends naturally, no max size, one DMA→cache copy; reserve mmap for the readers, where zero-copy
+  across consumers is the big win — *this is the default*); (b) **mmap-write via chunked pre-grow** —
+  `truncate` forward by a chunk (~1 GB, sparse), map it, write frames in, remap when crossing a chunk,
+  and `truncate` back to the true size (`header + n·frame_bytes`) on close to trim the zero tail. The
+  writer may `resize()`/remap freely (it exports no views; readers map independently). Or (c)
+  **per-frame grow — the mirror of the per-frame reader, and the cleanest:** each frame
+  `os.ftruncate(fd, header + (N+1)*frame_bytes)` (sparse-extend by one slot), map that frame's
+  page-aligned region `ACCESS_WRITE`, have the SDK DMA into it, then **release the map before the next
+  frame's truncate**. No rolling, no chunk bookkeeping, no zero tail to trim. **Windows gotcha:** you
+  can't resize a file that has a *live* mapping (`ftruncate` fails) — the release-before-truncate order
+  dodges it (POSIX is lenient but the same code works). Net rule: **mmap the readers always; mmap the
+  writer only if the capture-side copy profiles hot.**
+- **ZWO buffer path (for the writer DMA-into-slot).** `zwoasi`'s `capture_video_frame` →
+  `_get_video_data` has the SDK write *in place* via `cbuf = (c_char*n).from_buffer(buf)` +
+  `ASIGetVideoData(id, cbuf, sz, timeout)`, then returns a zero-copy `np.frombuffer` view. It
+  **hard-gates `buf` on `isinstance(bytearray)`**, so to DMA straight into the SER map, bypass the
+  method and call the SDK directly: `cbuf = (ctypes.c_char*frame_bytes).from_buffer(mm_slot, off)`
+  (`from_buffer` accepts an mmap/memoryview) then `zwolib.ASIGetVideoData(id, cbuf, frame_bytes,
+  timeout)` — the frame lands in the page-cache-backed `.ser`, no `write()`. Free win regardless:
+  pass a *persistent* `buffer_` so it stops allocating a fresh `bytearray` per frame.
+- **What this actually saves (don't oversell it).** `ASIGetVideoData(id, unsigned char* buf, size,
+  waitms)` takes a fresh pointer each call → it's a **copy-out**: the SDK `memcpy`s from its own
+  internal USB-transfer buffers into your pointer (a true DMA-into-user-buffer API would make you
+  *register* buffers up front; ASI has none). So (a) **your buffer needs no DMA alignment** — it's a
+  memcpy target, alignment-agnostic; the real DMA-alignment lives in the kernel USB stack / SDK
+  internal buffers you never touch; and (b) the mmap trick removes the **second userspace copy** (the
+  `write()` to disk), not the hardware DMA — modest (one ~16 MB/frame copy), not "zero-copy."
+- **Demand-zeroing makes the writer-mmap ~a wash (the real verdict).** Extending a file gives
+  **demand-zeroed** pages (a security guarantee — sparse hole → kernel faults in a zero-filled page;
+  no disk until real data is written). But for a slot you then fully overwrite, the kernel zeroes the
+  page *and* the SDK copies over it, so the copy you "saved" is paid back as a zero-fill. The
+  asymmetry is *full-page vs partial*, not write-vs-mmap per se: a **full-page `write()`** hands the
+  kernel the whole page's bytes at once, so `write_begin` fills it directly and **skips the zero**
+  (ext4/iomap: full-folio write over a hole isn't zeroed — a *partial* write still is, so a 1-byte
+  write zero-fills too); an **mmap store can't skip it** — the page is materialized at *fault time*,
+  before the kernel knows you'll overwrite it, so it's zeroed then copied over. Our ~16 MB frames are
+  thousands of full pages (only a trailing partial page pays), so `write()` = 2 copies + ~no
+  zero-fill vs mmap = 1 copy + per-page zero-fill ≈ same bandwidth. Same whether you grow per-frame or
+  pre-size (pre-sized slots are still sparse → still zeroed on first touch). No portable escape — `MAP_UNINITIALIZED` is
+  anonymous-only/kernel-flagged, `fallocate` still reads as zero. **Verdict: mmap is the clear win on
+  reads (faults in real data, no zero-fill); on writes it's marginal — keep `write()` unless it
+  profiles hot.**
+- **The page cache becomes the IPC, almost free.** With cam/detect/gui as separate processes on one
+  machine, cam `write()`s a frame and detect/gui memmap the *same* pages — no re-read from disk; the
+  `.ser` effectively acts as shared memory (the sidecar already gates "frame complete" for
+  coherence). This is the cheaper cousin of the shared-memory ring buffer parked below.
+- **Caveat — CPU-only.** Zero-copy helps CPU-side detection and cross-process sharing; GPU upload
+  still copies and mmap'd pages can't be pinned, so if the goal is feeding the GPU hard, pinned
+  staging buffers matter more than mmap. [open: is the target CPU detection throughput, or GPU
+  feeding?]
+
 ## Out of scope (for now)
 
 Parked until the MVP works, but worth keeping in view:

@@ -187,11 +187,19 @@ class SerReader:
     Read frames from a .ser file (live/growing or finalized). Always derives the available
     frame count from the file size via frames_on_disk(); the header count is ignored.
 
-    Uses positioned seek+read (not mmap) so it follows a growing file with no remapping.
+    By default each ``read_frame`` returns a **zero-copy** view onto the OS page cache via a
+    per-frame ``np.memmap`` -- for our large frames this skips the page-cache->buffer copy that
+    seek+read does and hands the bytes straight to torch. Mapping per frame keeps it trivial for a
+    growing file (each frame is an already-complete byte range, never past EOF) and ties the
+    mapping's lifetime to the returned array (it unmaps when the array is GC'd). The returned array
+    is **read-only** -- which matches the old ``np.frombuffer`` behaviour, so callers already copy
+    before mutating. ``use_mmap=False`` (or an automatic fallback on any mmap error) reverts to
+    positioned seek+read for portability.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, use_mmap=True):
         self.path = str(path)
+        self.use_mmap = use_mmap
         self._file = open(self.path, 'rb')
         raw = self._file.read(HEADER_SIZE)
         if len(raw) < HEADER_SIZE:
@@ -209,23 +217,39 @@ class SerReader:
             return 0
         return max(0, (size - HEADER_SIZE) // self.bytes_per_frame)
 
+    def _frame_shape(self):
+        if self.num_channels == 1:
+            return (self.header.image_height, self.header.image_width)
+        return (self.header.image_height, self.header.image_width, self.num_channels)
+
     def read_frame(self, index, to_float=False):
         """
-        Return the frame at ``index`` shaped (height, width[, channels]).
+        Return the frame at ``index`` shaped (height, width[, channels]), read-only.
         Raises IndexError if that frame isn't fully on disk yet.
         """
         available = self.frames_on_disk()
         if index < 0 or index >= available:
             raise IndexError(f"frame {index} not available (have {available})")
-        self._file.seek(HEADER_SIZE + index * self.bytes_per_frame)
-        buf = self._file.read(self.bytes_per_frame)
-        if len(buf) < self.bytes_per_frame:
-            raise IndexError(f"frame {index} truncated on disk")
-        arr = np.frombuffer(buf, dtype=self._dtype)
-        if self.num_channels == 1:
-            arr = arr.reshape((self.header.image_height, self.header.image_width))
-        else:
-            arr = arr.reshape((self.header.image_height, self.header.image_width, self.num_channels))
+        offset = HEADER_SIZE + index * self.bytes_per_frame
+
+        arr = None
+        if self.use_mmap:
+            try:
+                # np.memmap handles the page-aligned-offset rule internally and keeps the mapping
+                # alive as the array's base; it unmaps when the returned array is dropped.
+                arr = np.memmap(self.path, dtype=self._dtype, mode='r',
+                                offset=offset, shape=self._frame_shape())
+            except (OSError, ValueError):
+                self.use_mmap = False            # portability fallback for this reader's lifetime
+                arr = None
+
+        if arr is None:
+            self._file.seek(offset)
+            buf = self._file.read(self.bytes_per_frame)
+            if len(buf) < self.bytes_per_frame:
+                raise IndexError(f"frame {index} truncated on disk")
+            arr = np.frombuffer(buf, dtype=self._dtype).reshape(self._frame_shape())
+
         if to_float:
             arr = arr.astype(np.float32) / container_max(self.header.pixel_depth_per_plane)
         return arr
