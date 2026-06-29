@@ -710,7 +710,11 @@ Captured ideas, not yet scheduled. Grouped by area.
   `fov_deg`, `configuration`) and a CLI (`python -m astrolock.seeker.optics ...`). Bare facts;
   Stellarium is GPL. `rad_per_px` feeds the tracker's pixel-scale tunable directly. *Note:*
   Stellarium's list is all DSLRs + scopes — no ZWO ASI sensors; add the actual cameras (or read
-  pixel size from the ZWO driver) for our own rigs. Refresh the snapshot occasionally.
+  pixel size from the ZWO driver) for our own rigs (our ASI678MC + 8mm CS guide + CPC1100/C11 main
+  are in there). The **backend resolves per-role plate scale from this DB** via
+  `--guide-sensor/--guide-optic` (and `--main-*`, optional `--*-reducer`), printing each rig's FoV
+  at startup and feeding the controller's `rad_per_px`; falls back to the sky-derived value. Refresh
+  the snapshot occasionally.
 - **(stretch) Physically accurate star brightness**: electrons from aperture × QE × bandpass ×
   exposure × a zero-point, so sim ADU matches what a real sensor would record.
 - **Render the ISS as a crude multi-point sketch** (~tens of points: truss/backbone + solar

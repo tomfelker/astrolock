@@ -30,6 +30,7 @@ from astrolock.seeker import mount as mount_mod
 from astrolock.seeker import session as session_mod
 from astrolock.seeker import sidecar
 from astrolock.seeker.controller import PixelTracker
+from astrolock.seeker import optics
 from astrolock.seeker.follower import SerFollower
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
@@ -89,6 +90,13 @@ def main(argv=None):
     p.add_argument('--sky-pixel-um', type=float, default=2.0, help="guide sensor pixel pitch (um)")
     p.add_argument('--arcsec-per-px', type=float, default=0.0,
                    help="guide plate scale override (0 = derive from --sky-pixel-um / --sky-focal-mm)")
+    # Per-role plate scale from the vendored optics DB (names from `python -m astrolock.seeker.optics`).
+    p.add_argument('--guide-sensor', default=None, help="guide camera sensor name in the optics DB")
+    p.add_argument('--guide-optic', default=None, help="guide optic name in the optics DB")
+    p.add_argument('--guide-reducer', default=None, help="guide reducer/barlow name (optional)")
+    p.add_argument('--main-sensor', default=None, help="main camera sensor name in the optics DB")
+    p.add_argument('--main-optic', default=None, help="main optic name in the optics DB")
+    p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
     p.add_argument('--track-ki', type=float, default=0.3,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
     p.add_argument('--track-damping', type=float, default=1.3,
@@ -165,6 +173,27 @@ def main(argv=None):
     track_seen_index = -1
     rad_per_px = (math.radians(args.arcsec_per_px / 3600.0) if args.arcsec_per_px > 0
                   else args.sky_pixel_um * 1e-3 / args.sky_focal_mm)
+    # Per-role plate scale from the optics DB if a sensor+optic is named for that role; else the
+    # sky-derived/override rad_per_px above. Print the resolved FoV so it's easy to sanity-check.
+    _sensors, _optics, _reducers = optics.load_db()
+    rad_per_px_by_role = {}
+    for role in roles:
+        sname, oname = getattr(args, f'{role}_sensor', None), getattr(args, f'{role}_optic', None)
+        rname = getattr(args, f'{role}_reducer', None)
+        try:
+            if sname and oname:
+                s, o = _sensors[sname], _optics[oname]
+                mult = _reducers[rname] if rname else 1.0
+                feff = o.focal_length_mm * mult
+                rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um, feff)
+                fx, fy = optics.fov_deg(s, feff)
+                print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
+                      f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(s.pixel_um, feff):.3f} arcsec/px", flush=True)
+            else:
+                rad_per_px_by_role[role] = rad_per_px
+        except KeyError as e:
+            print(f"[backend] {role}: unknown optics {e}; using fallback plate scale", flush=True)
+            rad_per_px_by_role[role] = rad_per_px
     zenith_zone_cos = math.sin(math.radians(args.track_zenith_zone_deg))   # |cos(alt)| below this = zone
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
@@ -303,8 +332,8 @@ def main(argv=None):
             if role in roles and px and followers[role].header is not None:
                 hdr = followers[role].header
                 # Blobs are in frame image space; hold the target at the frame centre. rad_per_px
-                # is per *sensor* pixel, so scale by the cam's binning to get rad per frame pixel.
-                rpp = rad_per_px * frame_binning(role)
+                # is per *sensor* pixel (from this role's optics), so scale by the cam's binning.
+                rpp = rad_per_px_by_role.get(role, rad_per_px) * frame_binning(role)
                 ft = frame_time_s(role, latest_det_index[role])    # clock off the frame, not wall time
                 if ft is not None:
                     tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
