@@ -25,6 +25,8 @@ import random
 import numpy as np
 import torch
 
+from astrolock.seeker import bodies
+
 
 @dataclasses.dataclass
 class SkySimConfig:
@@ -94,24 +96,6 @@ def _next_fast_len(n):
         n += 1
 
 
-def iss_body_points():
-    """A coarse point-cloud of the ISS in its body frame (metres), enough to read as a shape in a
-    long-focal-length cam. Axes follow the LVLH attitude the station holds: x = ram (velocity /
-    forward), y = port (along the main truss), z = nadir (toward Earth). Just a backbone, the module
-    stack, and four big solar wings spanning the ~109 x 73 m plan rectangle -- tweak freely."""
-    pts = []
-    for y in np.linspace(-54, 54, 13):        # main truss (~109 m), along the port axis
-        pts.append((0.0, y, 0.0))
-    for x in np.linspace(-22, 30, 7):         # pressurised module stack, along flight, just nadir-side
-        pts.append((x, 0.0, 6.0))
-    for ysign in (-1, 1):                      # four large solar wings at the truss ends, fore & aft
-        for xsign in (-1, 1):
-            for xx in np.linspace(6, 38, 4):
-                for yy in np.linspace(-9, 9, 3):
-                    pts.append((xsign * xx, ysign * 46.0 + yy, 0.0))
-    return np.array(pts, dtype=np.float32)
-
-
 def ensure_cache(cache_dir='data/skyfield_cache'):
     """Download the skyfield ephemeris + Hipparcos catalog into the cache if missing, serially.
     Call this once (e.g. from the orchestrator) before launching multiple SkySim processes: they
@@ -177,9 +161,10 @@ class SkySim:
 
         # Precompute the satellite ephemeris once (one vectorised SGP4 pass) and interpolate it
         # at render time -- no per-frame propagation. The satellite is drawn as an extended body
-        # (iss_body_points) in its LVLH attitude, so it resolves into a shape in a long cam.
+        # (a point-cloud model chosen by TLE name) in its LVLH attitude, so it resolves into a shape.
         self._sat_table = None
-        self._iss_pts = self._t(iss_body_points()) if self.satellite is not None else None
+        self._body_pts = (self._t(bodies.points_for_name(c.target_tle[2]))
+                          if self.satellite is not None else None)
         self._earth_r = 6371000.0 + c.elev_m       # observer geocentric radius ~ for the nadir dir
         if self.satellite is not None:
             self._sat_table = self._precompute_satellite(c.sat_window_s, c.sat_sample_s)
@@ -374,15 +359,15 @@ class SkySim:
             ram = ram / ram.norm(dim=-1, keepdim=True)
             port = torch.cross(nadir, ram, dim=-1)           # (S,3); right-handed [ram, port, nadir]
             rot = torch.stack([ram, port, nadir], dim=-1)    # (S,3,3) columns = body axes in ENU
-            world = pos[:, None, :] + torch.einsum('sij,pj->spi', rot, self._iss_pts)   # (S,P,3)
+            world = pos[:, None, :] + torch.einsum('sij,pj->spi', rot, self._body_pts)  # (S,P,3)
             d = world / world.norm(dim=-1, keepdim=True)     # (S,P,3) unit directions
             dpt = torch.einsum('spj,sj->sp', d, b)           # (S,P) each point . its substep basis
             X = torch.cat([X, torch.einsum('spj,sj->sp', d, A) / dpt], dim=1)   # (S, N+P)
             Y = torch.cat([Y, torch.einsum('spj,sj->sp', d, L) / dpt], dim=1)
             denom = torch.cat([denom, dpt], dim=1)
-            npts = self._iss_pts.shape[0]                    # split the target flux over the points
-            iss_mag = c.target_mag + 2.5 * math.log10(npts)  # so the integrated brightness matches
-            mag = torch.cat([c_mag, torch.full((npts,), iss_mag, device=self.device)])
+            npts = self._body_pts.shape[0]                   # split the target flux over the points
+            body_mag = c.target_mag + 2.5 * math.log10(npts)  # so the integrated brightness matches
+            mag = torch.cat([c_mag, torch.full((npts,), body_mag, device=self.device)])
 
         phi = math.radians(c.roll_deg)
         cphi, sphi = math.cos(phi), math.sin(phi)
