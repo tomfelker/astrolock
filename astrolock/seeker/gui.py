@@ -20,6 +20,7 @@ Requires `dearpygui` (pip install dearpygui).
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -455,6 +456,10 @@ def main(argv=None):
 
             # Nested camera-FoV rectangles: each *narrower* camera's footprint inside this view
             # (e.g. the main cam inside the wide guide). Centred -- assumes co-aligned boresights.
+            # Sized through this view's gnomonic projection (same as the render): a ray at half-angle
+            # th lands at f_px*tan(th) px, and f_px = (w/2)/tan(half_fov), so the inner edge sits at
+            # (w/2)*tan(inner_half)/tan(my_half). So the rectangle marks the *exact* boundary at which
+            # a star crosses into the narrower cam -- not the small-angle (degree-ratio) approximation.
             dpg.delete_item(v['fov_layer'], children_only=True)
             optx = (ctrl['state'] or {}).get('optics', {})
             me = optx.get(role)
@@ -463,8 +468,10 @@ def main(argv=None):
                     if r2 == role or not (fv2['fov_x_deg'] < me['fov_x_deg']
                                           and fv2['fov_y_deg'] < me['fov_y_deg']):
                         continue
-                    hw = fv2['fov_x_deg'] / me['fov_x_deg'] * v['w'] / 2.0
-                    hh = fv2['fov_y_deg'] / me['fov_y_deg'] * v['h'] / 2.0
+                    hw = math.tan(math.radians(fv2['fov_x_deg'] / 2)) / \
+                        math.tan(math.radians(me['fov_x_deg'] / 2)) * v['w'] / 2.0
+                    hh = math.tan(math.radians(fv2['fov_y_deg'] / 2)) / \
+                        math.tan(math.radians(me['fov_y_deg'] / 2)) * v['h'] / 2.0
                     ccx, ccy = v['w'] / 2.0, v['h'] / 2.0
                     col2 = (120, 180, 255, 220)
                     dpg.draw_rectangle((ccx - hw, ccy - hh), (ccx + hw, ccy + hh),
