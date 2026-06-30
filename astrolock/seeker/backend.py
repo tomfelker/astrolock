@@ -114,12 +114,15 @@ def main(argv=None):
                         "format, and it saves USB/SSD/memory bandwidth. Sim renders mono at 1/N res.")
     p.add_argument('--main-bin', type=int, default=1,
                    help="main camera NxN binning (default 1 = native full resolution)")
-    p.add_argument('--track-ki', type=float, default=0.5,
+    # PID defaults below take dev-seeker's "nerf for better tracking at low framerate"
+    # (ki 0.5->0.1, damping 1.3->1.5, kd 0->2.0). NB: at ki=0.1 the kii stability guideline
+    # (kii < kp*ki ~ 0.095) is now tighter than the kii default -- revisit --track-kii.
+    p.add_argument('--track-ki', type=float, default=0.1,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
     p.add_argument('--track-kii', type=float, default=0.1,
                    help="tracker second-integral gain (0 = off): removes the residual lag against a "
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
-                        "kii < kp*ki for stability (kp*ki ~ 0.43 at the default ki/damping)")
+                        "kii < kp*ki for stability (~0.095 at the merged ki/damping)")
     p.add_argument('--track-nominal-rate', type=float, default=10.0,
                    help="framerate (Hz) the track gains are characterized at: used for the lock-time "
                         "stability self-check (and, later, optional gain derate below / buff above it)")
@@ -127,9 +130,9 @@ def main(argv=None):
                    help="while tracking, publish a square ROI (this many frame px, power of 2) around "
                         "the predicted target so detect can work just that window instead of the whole "
                         "frame (much higher framerate). 0 = always full-frame.")
-    p.add_argument('--track-damping', type=float, default=1.3,
+    p.add_argument('--track-damping', type=float, default=1.5,
                    help="P is derived for critical damping (kp=2*sqrt(ki)); >1 over-damps for lag margin")
-    p.add_argument('--track-kd', type=float, default=0.0,
+    p.add_argument('--track-kd', type=float, default=2.0,
                    help="tracker derivative braking gain (on image speed above --track-max-px-s)")
     p.add_argument('--track-max-px-s', type=float, default=120.0,
                    help="image-speed dead zone (px/s): brake the slew above this during acquisition")
