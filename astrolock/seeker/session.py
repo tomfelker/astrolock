@@ -58,3 +58,9 @@ def detections_name(ts, role):
 
 def state_name(ts):
     return f"{ts}_state.jsonl"
+
+
+def sim_mount_name(ts):
+    """Ground-truth trajectory of the sim mount (piecewise-linear anchors), for the sim camera to
+    read -- distinct from <ts>_state.jsonl, which is the backend's *estimate* of the mount."""
+    return f"{ts}_sim_mount.jsonl"

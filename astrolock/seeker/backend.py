@@ -110,7 +110,7 @@ def main(argv=None):
     p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
     p.add_argument('--track-ki', type=float, default=0.3,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
-    p.add_argument('--track-kii', type=float, default=0.0,
+    p.add_argument('--track-kii', type=float, default=0.25,
                    help="tracker second-integral gain (0 = off): removes the residual lag against a "
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
                         "kii < kp*ki for stability (kp*ki ~ 0.43 at the default ki/damping)")
@@ -162,19 +162,25 @@ def main(argv=None):
 
     max_rate = math.radians(args.max_rate_deg_s)
     site = {'lat_deg': args.lat, 'lon_deg': args.lon, 'elev_m': args.elev, 'epoch_utc': args.epoch}
+    # The sim mount writes its ground-truth trajectory here for the sim camera to follow (truth, not
+    # the backend's estimate). Harmless/ignored for the real mount.
+    sim_mount_path = os.path.join(session_dir, session_mod.sim_mount_name(ts))
     mount = mount_mod.make_mount(
         args.mount, az0_rad=math.radians(args.start_az_deg), alt0_rad=math.radians(args.start_alt_deg),
         site=site, max_rate_rad_s=max_rate, accel_rad_s2=math.radians(args.mount_accel_deg_s2),
-        update_hz=args.mount_update_hz, url=args.mount_url)
+        update_hz=args.mount_update_hz, url=args.mount_url, sidecar_path=sim_mount_path)
     msite = mount.get_site()        # GPS/site comes from the mount; it drives the sky-sim camera
 
     sky_args = []
     if args.source == 'sky':
+        # Sim cams follow the mount's true trajectory; with a real mount (no sidecar) fall back to
+        # the backend's published estimate.
+        follow = '--sky-follow-mount' if args.mount == 'sim' else '--sky-follow-state'
         sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                     '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
                     '--sky-lat', str(msite['lat_deg']), '--sky-lon', str(msite['lon_deg']),
                     '--sky-elev', str(msite['elev_m']), '--sky-epoch', str(msite['epoch_utc']),
-                    '--sky-follow-state']
+                    follow]
         if args.sky_tle_file:
             sky_args += ['--sky-tle-file', args.sky_tle_file, '--sky-target-mag', str(args.sky_target_mag)]
     playback_args = (['--playback-ser', args.playback_ser, '--playback-speed', str(args.playback_speed)]
@@ -401,6 +407,8 @@ def main(argv=None):
                     tracking = True
                     track_role = role
                     estop = False
+                    print(f"[backend] acquired target on {role} at "
+                          f"({float(px[0]):.0f},{float(px[1]):.0f})px", flush=True)
                     # Stability/bandwidth self-check at lock time, characterized at the nominal rate.
                     info, warns = tracker.diagnostics()
                     for ln in info:
@@ -412,6 +420,7 @@ def main(argv=None):
             mount.set_rates(0.0, 0.0)
         elif t == 'record':
             recording = bool(cmd.get('on', False))
+            print(f"[backend] recording {'ON' if recording else 'off'}", flush=True)
             # Record: whole pass in one important file (stop rolling). Stop: resume rolling,
             # which finalizes the (now over-length) pass file and starts a fresh throwaway.
             for role in roles:
@@ -423,14 +432,17 @@ def main(argv=None):
                 if cmd.get('on', True):                 # (re)start a stopped camera + its detector
                     if role not in cam_procs or cam_procs[role].poll() is not None:
                         restart_cam(role, stop_first=False)
+                        print(f"[backend] capture started on {role}", flush=True)
                 else:
                     control_write(role, {'stop': True})  # cam finalizes its file and exits
+                    print(f"[backend] capture stopped on {role}", flush=True)
         elif t == 'set_source':
             role = cmd.get('role')
             src = cmd.get('source')
             if role in roles and src in ('synthetic', 'zwo', 'sky'):
                 sources[role] = src
                 restart_cam(role, stop_first=True)       # swap sim <-> real live
+                print(f"[backend] {role} source -> {src}", flush=True)
 
     start = time.perf_counter()
     last_health = start
@@ -466,6 +478,7 @@ def main(argv=None):
                         track_target = list(tpx) if track_status == 'track' else None
                         if track_status == 'lost':
                             tracking = False
+                            print(f"[backend] lost target on {role}", flush=True)
 
             moving = abs(st['rate_az_rad_s']) > 1e-9 or abs(st['rate_alt_rad_s']) > 1e-9
             if tracking:
@@ -500,12 +513,14 @@ def main(argv=None):
                            for r, fv in fov_by_role.items()},
             })
 
-            if now - last_health >= 1.0:
-                last_health = now
-                health = ', '.join(f"{role}={followers[role].committed_count()}f" for role in roles)
-                print(f"[backend] {mode}{' REC' if recording else ''} "
-                      f"az={math.degrees(st['az_rad']):.2f} alt={math.degrees(st['alt_rad']):.2f} | {health}",
-                      flush=True)
+            # Per-second health line -- commented out so stdout carries only rare events. Uncomment
+            # for live debugging.
+            # if now - last_health >= 1.0:
+            #     last_health = now
+            #     health = ', '.join(f"{role}={followers[role].committed_count()}f" for role in roles)
+            #     print(f"[backend] {mode}{' REC' if recording else ''} "
+            #           f"az={math.degrees(st['az_rad']):.2f} alt={math.degrees(st['alt_rad']):.2f} | {health}",
+            #           flush=True)
 
             if now - last_cleanup >= 2.0:
                 last_cleanup = now

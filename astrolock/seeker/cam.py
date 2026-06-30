@@ -173,7 +173,7 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
     return capture, width, height, color_id, bit_depth, get_settings, meta
 
 
-def _open_sky(args, state_path=None):
+def _open_sky(args, state_path=None, mount_path=None):
     """
     Open the sky simulator as a frame source. Returns (capture, width, height, color_id,
     pixel_depth, None). capture() renders the next frame, advancing sim time at the configured
@@ -219,8 +219,17 @@ def _open_sky(args, state_path=None):
           f"point=({_math.degrees(az0):.2f},{_math.degrees(alt0):.2f})deg "
           f"slew=({args.sky_rate_az},{args.sky_rate_alt})deg/s exp={args.sky_exposure_s}s{tgt}", flush=True)
 
-    follow = args.sky_follow_state and state_path is not None
-    tailer = JsonlTailer(state_path) if follow else None
+    # Prefer the sim mount's ground-truth trajectory (piecewise-linear, exact) over the backend's
+    # reconstructed estimate. The mount sidecar uses 'az_deg'/'t_mono_ns'; the legacy state file
+    # uses 'enc_az_deg'/'enc_t_mono_ns'. With ground truth each anchor holds until the next, so we
+    # extrapolate with no upper cap (a constant-rate segment can be long with no new anchor); the
+    # estimate path keeps the old 0.2 s cap as a guard against a stalled backend.
+    follow_mount = getattr(args, 'sky_follow_mount', False) and mount_path is not None
+    follow_state = args.sky_follow_state and state_path is not None
+    tailer = JsonlTailer(mount_path if follow_mount else state_path) if (follow_mount or follow_state) else None
+    ka, kl = ('az_deg', 'alt_deg') if follow_mount else ('enc_az_deg', 'enc_alt_deg')
+    kt = 't_mono_ns' if follow_mount else 'enc_t_mono_ns'
+    ahead_cap = 5.0 if follow_mount else 0.2
     pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt, 'enc_t': None}
     t0 = time.perf_counter()
 
@@ -229,18 +238,18 @@ def _open_sky(args, state_path=None):
         # framerate (we render the latest mount state), exactly like a slow real camera.
         t = time.perf_counter() - t0
         if tailer is not None:
-            for rec in tailer.poll():            # latest backend encoder estimate wins
-                pose['az'] = _math.radians(rec.get('enc_az_deg', _math.degrees(pose['az'])))
-                pose['alt'] = _math.radians(rec.get('enc_alt_deg', _math.degrees(pose['alt'])))
+            for rec in tailer.poll():            # latest trajectory anchor wins
+                pose['az'] = _math.radians(rec.get(ka, _math.degrees(pose['az'])))
+                pose['alt'] = _math.radians(rec.get(kl, _math.degrees(pose['alt'])))
                 pose['raz'] = _math.radians(rec.get('rate_az_deg_s', 0.0))
                 pose['ralt'] = _math.radians(rec.get('rate_alt_deg_s', 0.0))
-                pose['enc_t'] = rec.get('enc_t_mono_ns')
-            # The state's angle is from when the mount measured it; extrapolate to *now* (the
-            # exposure) using the reported rate, so the rendered pose isn't stale by the
-            # mount->backend->cam latency.
+                pose['enc_t'] = rec.get(kt)
+            # The anchor's angle is valid at its timestamp; extrapolate linearly to *now* (the
+            # exposure) at the anchor's rate, so the rendered pose isn't stale by the
+            # mount->cam latency. Same monotonic clock (QPC) both ends.
             ahead = 0.0
             if pose['enc_t']:
-                ahead = min(0.2, max(0.0, time.perf_counter() - pose['enc_t'] * 1e-9))
+                ahead = min(ahead_cap, max(0.0, time.perf_counter() - pose['enc_t'] * 1e-9))
             az = pose['az'] + pose['raz'] * ahead
             alt = pose['alt'] + pose['ralt'] * ahead
         else:
@@ -344,6 +353,9 @@ def main(argv=None):
     p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky: satellite target magnitude")
     p.add_argument('--sky-follow-state', action='store_true',
                    help="sky: render from the backend's encoder estimate in <ts>_state.jsonl")
+    p.add_argument('--sky-follow-mount', action='store_true',
+                   help="sky: render from the sim mount's ground-truth trajectory in <ts>_sim_mount.jsonl "
+                        "(piecewise-linear; preferred over --sky-follow-state for the sim mount)")
     p.add_argument('--camera-index', type=int, default=0, help="zwo camera index")
     p.add_argument('--camera-wb', action='store_true',
                    help="zwo: keep the camera's white balance (default: neutral WB for pristine raw)")
@@ -381,7 +393,8 @@ def main(argv=None):
             neutral_wb=not args.camera_wb)
     elif args.source == 'sky':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_sky(
-            args, state_path=os.path.join(out_dir, session_mod.state_name(ts)))
+            args, state_path=os.path.join(out_dir, session_mod.state_name(ts)),
+            mount_path=os.path.join(out_dir, session_mod.sim_mount_name(ts)))
     elif args.source == 'playback':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_playback(args)
     if frame_meta is None:                                  # synthetic: full frame, no binning
@@ -446,12 +459,14 @@ def main(argv=None):
                     frames_in_file += 1
                     total += 1
 
-                    if loop_start - last_status >= 1.0:
-                        fps = (total - last_status_n) / (loop_start - last_status)
-                        extra = f"  {get_settings()}" if get_settings else ""
-                        print(f"[cam:{args.role}] {total} frames, {fps:.1f} fps, "
-                              f"peak {int(frame.max())}, important={cfg['important']}{extra}", flush=True)
-                        last_status, last_status_n = loop_start, total
+                    # Per-second status -- commented out to keep stdout for rare events. Uncomment
+                    # for live debugging (fps / peak / exposure-gain).
+                    # if loop_start - last_status >= 1.0:
+                    #     fps = (total - last_status_n) / (loop_start - last_status)
+                    #     extra = f"  {get_settings()}" if get_settings else ""
+                    #     print(f"[cam:{args.role}] {total} frames, {fps:.1f} fps, "
+                    #           f"peak {int(frame.max())}, important={cfg['important']}{extra}", flush=True)
+                    #     last_status, last_status_n = loop_start, total
 
                     if cfg['frame_limit'] != -1 and frames_in_file >= cfg['frame_limit']:
                         rolled = True

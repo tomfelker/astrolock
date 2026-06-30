@@ -26,6 +26,8 @@ import math
 import threading
 import time
 
+from astrolock.seeker.sidecar import JsonlWriter
+
 
 def _wrap_pi(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
@@ -59,7 +61,7 @@ class SimMount(Mount):
     """
 
     def __init__(self, az0_rad, alt0_rad, site, max_rate_rad_s=math.radians(8.0),
-                 accel_rad_s2=math.radians(20.0), update_hz=10.0):
+                 accel_rad_s2=math.radians(20.0), update_hz=10.0, sidecar_path=None):
         self._site = dict(site)
         self._az, self._alt = az0_rad, alt0_rad
         self._cmd = [0.0, 0.0]                    # commanded axis rates (rad/s)
@@ -73,8 +75,24 @@ class SimMount(Mount):
         self._last = time.perf_counter()
         self._wall0 = self._last
         self._angle_t_ns = time.perf_counter_ns()   # when the reported angles were valid
+        # Ground-truth trajectory sidecar for the sim camera: piecewise-linear anchors
+        # {t, angle, rate}, one whenever the actual rate changes. This is the mount's *real* plan
+        # (continuous by construction), as opposed to the backend's reconstructed estimate -- so the
+        # sim camera observes truth, not belief, and never sees a reconstruction discontinuity.
+        self._writer = JsonlWriter(sidecar_path) if sidecar_path else None
+        self._write_anchor_locked()                 # initial anchor (start pose, zero rate)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+
+    def _write_anchor_locked(self):
+        """Append one trajectory anchor: the pose now and the rate that holds forward from it.
+        Caller holds the lock (or is __init__, before the thread starts)."""
+        if self._writer is None:
+            return
+        self._writer.append({'t_mono_ns': self._angle_t_ns,
+                             'az_deg': math.degrees(self._az), 'alt_deg': math.degrees(self._alt),
+                             'rate_az_deg_s': math.degrees(self._rate[0]),
+                             'rate_alt_deg_s': math.degrees(self._rate[1])})
 
     def _loop(self):
         while not self._stop:
@@ -82,15 +100,25 @@ class SimMount(Mount):
             dt = now - self._last
             self._last = now
             with self._lock:
-                for ax in (0, 1):
-                    dv = _clamp(self._cmd[ax] - self._rate[ax], -self._accel * dt, self._accel * dt)
-                    self._rate[ax] = _clamp(self._rate[ax] + dv, -self._max, self._max)
+                # Advance the pose with the rate in effect over [last, now] FIRST, then stamp, then
+                # ramp the rate for the next interval. This ordering makes each emitted anchor a
+                # clean *forward* anchor: angle + rate*(future - t) reproduces the next integration
+                # step exactly, so the camera's linear extrapolation is continuous across every rate
+                # change (no accel*dt^2 step from pairing an angle with the rate that just changed).
                 # Both axes rotate freely (no limits, clutches): altitude can tip past the zenith
-                # and keep going, so a near-zenith meridian crossing is tracked by tipping over
-                # rather than a 180-deg azimuth whip.
+                # and keep going, so a near-zenith meridian crossing tips over rather than whipping az.
                 self._az = (self._az + self._rate[0] * dt) % (2 * math.pi)
                 self._alt = (self._alt + self._rate[1] * dt) % (2 * math.pi)
                 self._angle_t_ns = time.perf_counter_ns()
+                changed = False
+                for ax in (0, 1):
+                    dv = _clamp(self._cmd[ax] - self._rate[ax], -self._accel * dt, self._accel * dt)
+                    nr = _clamp(self._rate[ax] + dv, -self._max, self._max)
+                    if nr != self._rate[ax]:
+                        self._rate[ax] = nr
+                        changed = True
+                if changed:                          # new constant-rate segment -> new anchor
+                    self._write_anchor_locked()
             time.sleep(self._period)
 
     def set_rates(self, az_rad_s, alt_rad_s):
@@ -115,6 +143,8 @@ class SimMount(Mount):
     def close(self):
         self._stop = True
         self._thread.join(timeout=2.0)
+        if self._writer is not None:
+            self._writer.close()
 
 
 class CelestronMount(Mount):
@@ -182,9 +212,10 @@ class CelestronMount(Mount):
 
 
 def make_mount(kind, az0_rad, alt0_rad, site, max_rate_rad_s=math.radians(8.0),
-               accel_rad_s2=math.radians(20.0), update_hz=10.0, url=None):
+               accel_rad_s2=math.radians(20.0), update_hz=10.0, url=None, sidecar_path=None):
     if kind == 'celestron':
         if not url:
             raise SystemExit("--mount celestron requires --mount-url celestron_nexstar_hc:COMx")
         return CelestronMount(url, az0_rad, alt0_rad, site, max_rate_rad_s)
-    return SimMount(az0_rad, alt0_rad, site, max_rate_rad_s, accel_rad_s2, update_hz)
+    return SimMount(az0_rad, alt0_rad, site, max_rate_rad_s, accel_rad_s2, update_hz,
+                    sidecar_path=sidecar_path)
