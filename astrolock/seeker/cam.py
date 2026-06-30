@@ -105,16 +105,29 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
 
     cam = z.Camera(camera_index)
     info = cam.get_camera_property()
-    # NxN hardware binning (default 1). UNTESTED against hardware. On a color ASI, binning combines
-    # the Bayer cell, so the readout is mono -- we force MONO below when bin > 1.
-    cam.set_roi(bins=bin, image_type=z.ASI_IMG_RAW16)   # full frame, 16-bit raw, NxN binned
-    width, height, bins, img_type = cam.get_roi_format()
+    is_color = bool(info.get('IsColorCam', False))
 
     def _set(ctrl, value, is_auto=False):
         try:
             cam.set_control_value(ctrl, value, auto=is_auto)
         except Exception as e:
             print(f"[cam] could not set control {ctrl}: {e}", flush=True)
+
+    # NxN binning. A color ASI keeps the Bayer mosaic when it bins (it only sums same-color wells),
+    # so to get a true gray frame we ask the SDK to merge across the Bayer cell -- ASI_MONO_BIN. That
+    # eats the first power-of-two of the requested bin (one Bayer cell -> one mono pixel). It only
+    # works in *software* bin mode (ASI_HARDWARE_BIN=0; confirmed host-side by a short-exposure fps
+    # test -- mono bin doesn't save USB, hardware Bayer bin does). We still use the API, not a
+    # hand-rolled sum, so we'd get the win for free if ZWO ever moves it pre-USB. Falls back to
+    # half-res Bayer if the camera lacks MonoBin.
+    ctrls = cam.get_controls()
+    mono_ok = is_color and not force_mono and bin >= 2 and 'MonoBin' in ctrls
+    if mono_ok:
+        if 'HardwareBin' in ctrls:
+            _set(z.ASI_HARDWARE_BIN, 0)        # software bin: required for the cross-color merge
+        _set(z.ASI_MONO_BIN, 1)                # merge the Bayer cell -> mono
+    cam.set_roi(bins=bin, image_type=z.ASI_IMG_RAW16)   # full frame, 16-bit raw, NxN binned
+    width, height, bins, img_type = cam.get_roi_format()
 
     if auto:
         _set(z.ASI_EXPOSURE, exposure_us, is_auto=True)
@@ -130,17 +143,16 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
     # G is the unity reference). WB=50 is unity on the [1,99] range, so neutral WB gives
     # pristine raw -- all planes clean 12-bit-left-shifted, no WB in the data. We want this
     # for real captures (the main cam feeds tensorez, which expects genuine raw Bayer).
-    is_color = bool(info.get('IsColorCam', False))
     if neutral_wb and is_color:
         _set(z.ASI_WB_R, 50)
         _set(z.ASI_WB_B, 50)
 
     cam.start_video_capture()
 
-    if is_color and not force_mono and bins <= 1:        # binning a color cam yields mono
+    if is_color and not force_mono and not mono_ok:      # Bayer: full res, or half-res if binned w/o MonoBin
         color_id = _ASI_BAYER_TO_COLOR_ID.get(int(info.get('BayerPattern', 0)), ser_mod.ColorId.BAYER_RGGB)
     else:
-        color_id = ser_mod.ColorId.MONO
+        color_id = ser_mod.ColorId.MONO                  # mono cam, force_mono, or MonoBin merged to gray
     # Record the camera's true ADC precision in the SER; pixels are still stored in a
     # 16-bit container (RAW16, 12-bit value left-shifted by 4; see ser.container_max).
     bit_depth = int(info.get('BitDepth', 16))
