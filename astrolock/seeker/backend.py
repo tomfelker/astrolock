@@ -116,7 +116,7 @@ def main(argv=None):
                    help="main camera NxN binning (default 1 = native full resolution)")
     p.add_argument('--track-ki', type=float, default=0.5,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
-    p.add_argument('--track-kii', type=float, default=0.05,
+    p.add_argument('--track-kii', type=float, default=0.1,
                    help="tracker second-integral gain (0 = off): removes the residual lag against a "
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
                         "kii < kp*ki for stability (kp*ki ~ 0.43 at the default ki/damping)")
