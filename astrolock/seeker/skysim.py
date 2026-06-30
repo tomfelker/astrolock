@@ -165,11 +165,15 @@ class SkySim:
         c = self.cfg
         az_m = self._t(enc_az_rad - math.radians(c.az_offset_deg))
         alt_m = self._t(enc_alt_rad - math.radians(c.alt_offset_deg))
-        z = torch.zeros((), device=self.device)
-        b = self._R_tilt @ _enu(az_m, alt_m)
-        A = self._R_tilt @ torch.stack([torch.cos(az_m), -torch.sin(az_m), z])
-        L = self._R_tilt @ torch.stack([-torch.sin(alt_m) * torch.sin(az_m),
-                                        -torch.sin(alt_m) * torch.cos(az_m), torch.cos(alt_m)])
+        z = torch.zeros_like(az_m)
+        # Shape-generic: scalar enc_* -> (3,) vectors; an (S,) batch of poses -> (S, 3). Rotating
+        # each row vector by the tilt is `v @ R^T` (== R @ v for a single vector), so one call
+        # builds every substep's basis at once.
+        rt = self._R_tilt.T
+        b = _enu(az_m, alt_m) @ rt
+        A = torch.stack([torch.cos(az_m), -torch.sin(az_m), z], dim=-1) @ rt
+        L = torch.stack([-torch.sin(alt_m) * torch.sin(az_m),
+                         -torch.sin(alt_m) * torch.cos(az_m), torch.cos(alt_m)], dim=-1) @ rt
         return b, A, L
 
     def project(self, alt, az, b, A, L):
@@ -229,10 +233,11 @@ class SkySim:
         az_unwrapped = np.unwrap(az.radians)        # continuous so linear interp can't jump at 0/2pi
         return dt_s, n, self._t(alt.radians), self._t(az_unwrapped)
 
-    def _sat_altaz_at(self, seconds_list):
-        """Interpolate the cached satellite ephemeris (radians) at the given sim-times."""
+    def _sat_altaz_at(self, seconds):
+        """Interpolate the cached satellite ephemeris (radians) at the given sim-times (a tensor or
+        list of seconds-from-epoch) -> (alt, az) tensors of the same length."""
         dt_s, n, alt_tab, az_tab = self._sat_table
-        idx = torch.tensor([s / dt_s for s in seconds_list], dtype=torch.float32).clamp(0, n - 1 - 1e-3)
+        idx = (self._t(seconds) / dt_s).clamp(0, n - 1 - 1e-3)
         i0 = idx.floor().long()
         f = idx - i0
         return alt_tab[i0] * (1 - f) + alt_tab[i0 + 1] * f, az_tab[i0] * (1 - f) + az_tab[i0 + 1] * f
@@ -280,28 +285,42 @@ class SkySim:
         b0, _, _ = self.boresight_basis(enc_az_rad + rate_az_rad_s * 0.5 * exposure_s,
                                         enc_alt_rad + rate_alt_rad_s * 0.5 * exposure_s)
         keep = (star_s @ b0) > self._cull_cos
-        c_alt, c_az, c_mag = star_alt[keep], star_az[keep], self.star_mag[keep]
+        c_s, c_mag = star_s[keep], self.star_mag[keep]       # culled star ENU dirs (N,3) + mags (N,)
 
-        fracs = [(i + 0.5) / substeps for i in range(substeps)]
-        if self.satellite is not None:                       # interpolate the precomputed ephemeris
-            sat_alt_all, sat_az_all = self._sat_altaz_at(
-                [seconds_from_epoch + f * exposure_s for f in fracs])
-            sat_mag = self._t([c.target_mag])
+        # All substeps at once -- no Python loop. Build the (S,3) camera bases for every substep,
+        # project the static (within-exposure) culled stars against all of them in one matmul
+        # (S,N), append the satellite (one interpolated dir per substep, paired with that substep's
+        # basis), then drizzle every (substep, source) point in a single splat. The exposure streak
+        # is the boresight sweeping across substeps; stars don't move appreciably within a frame.
+        s = torch.arange(substeps, dtype=torch.float32, device=self.device)
+        fr = (s + 0.5) / substeps                            # (S,) substep mid-fractions
+        az_s = self._t(enc_az_rad) + self._t(rate_az_rad_s) * fr * exposure_s
+        alt_s = self._t(enc_alt_rad) + self._t(rate_alt_rad_s) * fr * exposure_s
+        b, A, L = self.boresight_basis(az_s, alt_s)          # each (S,3)
+
+        denom = b @ c_s.T                                    # (S,N): each substep basis . each star
+        X = (A @ c_s.T) / denom
+        Y = (L @ c_s.T) / denom
+        mag = c_mag
+        if self.satellite is not None:                       # satellite: one dir per substep
+            sat_alt, sat_az = self._sat_altaz_at(seconds_from_epoch + fr * exposure_s)
+            sat_s = _enu(sat_az, sat_alt)                    # (S,3)
+            dsat = (sat_s * b).sum(-1)                        # (S,) substep i dir . substep i basis
+            X = torch.cat([X, ((sat_s * A).sum(-1) / dsat)[:, None]], dim=1)   # (S, N+1)
+            Y = torch.cat([Y, ((sat_s * L).sum(-1) / dsat)[:, None]], dim=1)
+            denom = torch.cat([denom, dsat[:, None]], dim=1)
+            mag = torch.cat([c_mag, self._t([c.target_mag])])
+
+        phi = math.radians(c.roll_deg)
+        cphi, sphi = math.cos(phi), math.sin(phi)
+        px = self.cx + self.f_px * (X * cphi + Y * sphi)     # (S, M)
+        py = self.cy - self.f_px * (-X * sphi + Y * cphi)
+        vis = denom > 0
+        flux = c.mag_flux_scale * (10.0 ** (-0.4 * mag)) * exposure_s / substeps   # (M,)
+        flux = flux[None, :].expand(px.shape[0], -1)         # (S, M), same per substep
 
         fb = torch.zeros((c.height, c.width), dtype=torch.float32, device=self.device)
-        for i, frac in enumerate(fracs):
-            az = enc_az_rad + rate_az_rad_s * frac * exposure_s
-            alt = enc_alt_rad + rate_alt_rad_s * frac * exposure_s
-            b, A, L = self.boresight_basis(az, alt)
-            if self.satellite is not None:                   # stars cached+culled; satellite batched
-                s_alt = torch.cat([c_alt, sat_alt_all[i:i + 1]])
-                s_az = torch.cat([c_az, sat_az_all[i:i + 1]])
-                mag = torch.cat([c_mag, sat_mag])
-            else:
-                s_alt, s_az, mag = c_alt, c_az, c_mag
-            px, py, vis = self.project(s_alt, s_az, b, A, L)
-            flux_e = c.mag_flux_scale * (10.0 ** (-0.4 * mag)) * exposure_s / substeps
-            self._splat(fb, px[vis], py[vis], flux_e[vis])
+        self._splat(fb, px[vis], py[vis], flux[vis])         # one drizzle over all substeps
 
         fb = self._psf(fb)
         fb = torch.clamp(fb + c.sky_bg_rate_e * exposure_s, min=0.0)   # signal + sky bg (electrons)
