@@ -94,6 +94,24 @@ def _next_fast_len(n):
         n += 1
 
 
+def iss_body_points():
+    """A coarse point-cloud of the ISS in its body frame (metres), enough to read as a shape in a
+    long-focal-length cam. Axes follow the LVLH attitude the station holds: x = ram (velocity /
+    forward), y = port (along the main truss), z = nadir (toward Earth). Just a backbone, the module
+    stack, and four big solar wings spanning the ~109 x 73 m plan rectangle -- tweak freely."""
+    pts = []
+    for y in np.linspace(-54, 54, 13):        # main truss (~109 m), along the port axis
+        pts.append((0.0, y, 0.0))
+    for x in np.linspace(-22, 30, 7):         # pressurised module stack, along flight, just nadir-side
+        pts.append((x, 0.0, 6.0))
+    for ysign in (-1, 1):                      # four large solar wings at the truss ends, fore & aft
+        for xsign in (-1, 1):
+            for xx in np.linspace(6, 38, 4):
+                for yy in np.linspace(-9, 9, 3):
+                    pts.append((xsign * xx, ysign * 46.0 + yy, 0.0))
+    return np.array(pts, dtype=np.float32)
+
+
 def ensure_cache(cache_dir='data/skyfield_cache'):
     """Download the skyfield ephemeris + Hipparcos catalog into the cache if missing, serially.
     Call this once (e.g. from the orchestrator) before launching multiple SkySim processes: they
@@ -158,8 +176,11 @@ class SkySim:
         self._cull_cos = math.cos(math.hypot(half_x, half_y) + math.radians(3.0))
 
         # Precompute the satellite ephemeris once (one vectorised SGP4 pass) and interpolate it
-        # at render time -- no per-frame propagation.
+        # at render time -- no per-frame propagation. The satellite is drawn as an extended body
+        # (iss_body_points) in its LVLH attitude, so it resolves into a shape in a long cam.
         self._sat_table = None
+        self._iss_pts = self._t(iss_body_points()) if self.satellite is not None else None
+        self._earth_r = 6371000.0 + c.elev_m       # observer geocentric radius ~ for the nadir dir
         if self.satellite is not None:
             self._sat_table = self._precompute_satellite(c.sat_window_s, c.sat_sample_s)
 
@@ -237,24 +258,31 @@ class SkySim:
         return self._star_cache
 
     def _precompute_satellite(self, window_s, dt_s):
-        """One vectorised SGP4 pass over [epoch, epoch+window] at dt_s -> (dt_s, n, alt, az_unwrapped)."""
+        """One vectorised SGP4 pass over [epoch, epoch+window] at dt_s. Stores the topocentric ENU
+        *position* (metres) of the satellite per sample -> (dt_s, n, enu[n,3]). Cartesian ENU
+        interpolates cleanly (no az wrap) and carries range, so we can recover the velocity (for the
+        flight axis) by differencing and place the body points around it."""
         n = int(round(window_s / dt_s)) + 1
         secs = np.arange(n) * dt_s
         t0 = self._t0
         sec0 = t0.second + t0.microsecond * 1e-6
         times = self.ts.utc(t0.year, t0.month, t0.day, t0.hour, t0.minute, sec0 + secs)
-        alt, az, _ = (self.satellite - self._topos).at(times).altaz()
-        az_unwrapped = np.unwrap(az.radians)        # continuous so linear interp can't jump at 0/2pi
-        return dt_s, n, self._t(alt.radians), self._t(az_unwrapped)
+        alt, az, dist = (self.satellite - self._topos).at(times).altaz()
+        altr, azr, dm = alt.radians, az.radians, dist.m
+        ca = np.cos(altr)
+        enu = np.stack([dm * ca * np.sin(azr), dm * ca * np.cos(azr), dm * np.sin(altr)], axis=-1)
+        return dt_s, n, self._t(enu)
 
-    def _sat_altaz_at(self, seconds):
-        """Interpolate the cached satellite ephemeris (radians) at the given sim-times (a tensor or
-        list of seconds-from-epoch) -> (alt, az) tensors of the same length."""
-        dt_s, n, alt_tab, az_tab = self._sat_table
+    def _sat_state_at(self, seconds):
+        """Interpolate the satellite track at the given sim-times -> (pos_enu, vel_enu), each (S,3)
+        metres / (m/s), from which the LVLH body frame and the body-point directions are built."""
+        dt_s, n, enu = self._sat_table
         idx = (self._t(seconds) / dt_s).clamp(0, n - 1 - 1e-3)
         i0 = idx.floor().long()
-        f = idx - i0
-        return alt_tab[i0] * (1 - f) + alt_tab[i0 + 1] * f, az_tab[i0] * (1 - f) + az_tab[i0 + 1] * f
+        f = (idx - i0).unsqueeze(-1)
+        pos = enu[i0] * (1 - f) + enu[i0 + 1] * f
+        vel = (enu[i0 + 1] - enu[i0]) / dt_s        # segment velocity (the flight direction)
+        return pos, vel
 
     # --- rendering ----------------------------------------------------------
 
@@ -333,14 +361,28 @@ class SkySim:
         X = (A @ c_s.T) / denom
         Y = (L @ c_s.T) / denom
         mag = c_mag
-        if self.satellite is not None:                       # satellite: one dir per substep
-            sat_alt, sat_az = self._sat_altaz_at(seconds_from_epoch + fr * exposure_s)
-            sat_s = _enu(sat_az, sat_alt)                    # (S,3)
-            dsat = (sat_s * b).sum(-1)                        # (S,) substep i dir . substep i basis
-            X = torch.cat([X, ((sat_s * A).sum(-1) / dsat)[:, None]], dim=1)   # (S, N+1)
-            Y = torch.cat([Y, ((sat_s * L).sum(-1) / dsat)[:, None]], dim=1)
-            denom = torch.cat([denom, dsat[:, None]], dim=1)
-            mag = torch.cat([c_mag, self._t([c.target_mag])])
+        if self.satellite is not None:
+            # Satellite as an extended body: place iss_body_points in its LVLH attitude per substep
+            # (nadir toward Earth, ram along velocity, port = nadir x ram = the truss), offset from
+            # the interpolated centre, then project each point's direction. So it resolves into the
+            # ISS shape in a long cam, sums back to a point in the wide guide, and streaks with motion.
+            pos, vel = self._sat_state_at(seconds_from_epoch + fr * exposure_s)   # (S,3),(S,3) ENU m
+            earth_c = self._t([0.0, 0.0, -self._earth_r])    # observer at the ENU origin; Earth below
+            nadir = earth_c - pos
+            nadir = nadir / nadir.norm(dim=-1, keepdim=True)
+            ram = vel - (vel * nadir).sum(-1, keepdim=True) * nadir
+            ram = ram / ram.norm(dim=-1, keepdim=True)
+            port = torch.cross(nadir, ram, dim=-1)           # (S,3); right-handed [ram, port, nadir]
+            rot = torch.stack([ram, port, nadir], dim=-1)    # (S,3,3) columns = body axes in ENU
+            world = pos[:, None, :] + torch.einsum('sij,pj->spi', rot, self._iss_pts)   # (S,P,3)
+            d = world / world.norm(dim=-1, keepdim=True)     # (S,P,3) unit directions
+            dpt = torch.einsum('spj,sj->sp', d, b)           # (S,P) each point . its substep basis
+            X = torch.cat([X, torch.einsum('spj,sj->sp', d, A) / dpt], dim=1)   # (S, N+P)
+            Y = torch.cat([Y, torch.einsum('spj,sj->sp', d, L) / dpt], dim=1)
+            denom = torch.cat([denom, dpt], dim=1)
+            npts = self._iss_pts.shape[0]                    # split the target flux over the points
+            iss_mag = c.target_mag + 2.5 * math.log10(npts)  # so the integrated brightness matches
+            mag = torch.cat([c_mag, torch.full((npts,), iss_mag, device=self.device)])
 
         phi = math.radians(c.roll_deg)
         cphi, sphi = math.cos(phi), math.sin(phi)
