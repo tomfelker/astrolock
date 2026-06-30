@@ -114,15 +114,14 @@ def main(argv=None):
                         "format, and it saves USB/SSD/memory bandwidth. Sim renders mono at 1/N res.")
     p.add_argument('--main-bin', type=int, default=1,
                    help="main camera NxN binning (default 1 = native full resolution)")
-    # PID defaults below take dev-seeker's "nerf for better tracking at low framerate"
-    # (ki 0.5->0.1, damping 1.3->1.5, kd 0->2.0). NB: at ki=0.1 the kii stability guideline
-    # (kii < kp*ki ~ 0.095) is now tighter than the kii default -- revisit --track-kii.
-    p.add_argument('--track-ki', type=float, default=0.1,
+    # Track PID constants, hand-picked reconciling the two branches: ki=0.5, kii=0.05, damping=1.5,
+    # kd=2.0 (kii < kp*ki ~ 1.06 here, so the second integral stays stable).
+    p.add_argument('--track-ki', type=float, default=0.5,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
-    p.add_argument('--track-kii', type=float, default=0.1,
+    p.add_argument('--track-kii', type=float, default=0.05,
                    help="tracker second-integral gain (0 = off): removes the residual lag against a "
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
-                        "kii < kp*ki for stability (~0.095 at the merged ki/damping)")
+                        "kii < kp*ki for stability")
     p.add_argument('--track-nominal-rate', type=float, default=10.0,
                    help="framerate (Hz) the track gains are characterized at: used for the lock-time "
                         "stability self-check (and, later, optional gain derate below / buff above it)")
