@@ -433,7 +433,7 @@ def main(argv=None):
                 x, y = cx * v['ox'], cy * v['oy']
                 color = (60, 255, 60, a) if b.get('moving') else (255, 200, 40, a)
                 dpg.draw_rectangle((x - half, y - half), (x + half, y + half),
-                                   color=color, thickness=max(1.0, ui_scale), parent=v['box_layer'])
+                                   color=color, thickness=1.0, parent=v['box_layer'])   # hairline
             dpg.set_value(v['status'],
                           f"frame {v['last_idx']}  {_color_name(f.header.color_id)}  "
                           f"peak {v.get('peak', 0)}  blobs {len(v['blobs'])}")
@@ -447,7 +447,7 @@ def main(argv=None):
                 X, Y = tx * v['ox'], ty * v['oy']
                 col = (255, 60, 220, 255)
                 r = S(14)
-                th = max(1.0, 2.0 * ui_scale)
+                th = 1.0                                 # hairline (1 px, not DPI-scaled)
                 dpg.draw_circle((X, Y), r, color=col, thickness=th, parent=v['track_layer'])
                 for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                     dpg.draw_line((X + ex * (r + S(6)), Y + ey * (r + S(6))),
@@ -474,8 +474,11 @@ def main(argv=None):
                         math.tan(math.radians(me['fov_y_deg'] / 2)) * v['h'] / 2.0
                     ccx, ccy = v['w'] / 2.0, v['h'] / 2.0
                     col2 = (120, 180, 255, 220)
+                    # Hairline (1 px, not DPI-scaled): the stroke is centred on the FoV boundary, so a
+                    # thicker line would smear the exact edge by its width. With 1 px the drawn pixels
+                    # are the boundary -- "star touches the line" reads true to the pixel.
                     dpg.draw_rectangle((ccx - hw, ccy - hh), (ccx + hw, ccy + hh),
-                                       color=col2, thickness=max(1.0, ui_scale), parent=v['fov_layer'])
+                                       color=col2, thickness=1.0, parent=v['fov_layer'])
                     dpg.draw_text((ccx - hw, ccy - hh - S(14)), r2, size=S(13),
                                   color=col2, parent=v['fov_layer'])
 
