@@ -305,7 +305,7 @@ def main(argv=None):
             dpg.add_checkbox(label="Record", tag='rec_chk')   # pure manual intent; loop reconciles
         # Auto-record: while tracking, record automatically -- only for a real (non-sim) main cam,
         # so we never miss a live pass and never waste disk on sim runs. Disabled otherwise.
-        dpg.add_checkbox(label="Auto record", tag='autorec_chk', enabled=False)
+        dpg.add_checkbox(label="Auto record", tag='autorec_chk')   # default set once from main source
         dpg.add_separator()
         with dpg.group(horizontal=True):
             dpg.add_spacer(width=S(72))
@@ -351,16 +351,17 @@ def main(argv=None):
             cur = st.get('sources', {}).get(active)
             if cur:
                 dpg.set_value('src_combo', cur)
-        # Recording = the manual Record checkbox OR (auto-record AND tracking), the latter only for a
-        # real (non-sim), connected main cam. The Record checkbox is left untouched (pure manual
-        # intent), so a manual record stays on through tracking start/stop; auto only *adds* recording
-        # during a track. The control loop reconciles the backend to this effective state.
-        main_real = bool(st and st.get('sources', {}).get('main') == 'zwo'
-                         and st.get('capturing', {}).get('main'))
-        dpg.configure_item('autorec_chk', enabled=main_real)
+        # Auto-record default: ON for a real main cam, OFF for the sim (testing, would just waste
+        # disk). Set ONCE when we first learn the main's source, then it's the user's to toggle.
+        if st is not None and not ctrl.get('autorec_init') and st.get('sources', {}).get('main'):
+            dpg.set_value('autorec_chk', st['sources']['main'] == 'zwo')
+            ctrl['autorec_init'] = True
+        # Recording = the manual Record checkbox OR (auto-record AND tracking). The Record checkbox is
+        # left untouched (pure manual intent), so a manual record stays on through tracking start/stop;
+        # auto only *adds* recording during a track. The control loop reconciles the backend to this.
         if st is not None:
-            want = bool(dpg.get_value('rec_chk')) or (
-                main_real and dpg.get_value('autorec_chk') and bool(st.get('tracking')))
+            want = bool(dpg.get_value('rec_chk')) or (dpg.get_value('autorec_chk')
+                                                      and bool(st.get('tracking')))
             if want != bool(st.get('recording')) and want != ctrl.get('rec_sent'):
                 _send({'type': 'record', 'on': want})
                 ctrl['rec_sent'] = want
