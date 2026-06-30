@@ -86,7 +86,7 @@ _ASI_BAYER_TO_COLOR_ID = {
 
 def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
               auto=False, auto_max_exp_ms=200, auto_max_gain=400, auto_target=100,
-              neutral_wb=True):
+              neutral_wb=True, bin=1):
     """
     Open a ZWO camera for RAW16 full-frame video capture.
     Returns (capture, width, height, color_id, get_settings).
@@ -105,7 +105,9 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
 
     cam = z.Camera(camera_index)
     info = cam.get_camera_property()
-    cam.set_roi(image_type=z.ASI_IMG_RAW16)          # full frame, 16-bit raw
+    # NxN hardware binning (default 1). UNTESTED against hardware. On a color ASI, binning combines
+    # the Bayer cell, so the readout is mono -- we force MONO below when bin > 1.
+    cam.set_roi(bins=bin, image_type=z.ASI_IMG_RAW16)   # full frame, 16-bit raw, NxN binned
     width, height, bins, img_type = cam.get_roi_format()
 
     def _set(ctrl, value, is_auto=False):
@@ -135,7 +137,7 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
 
     cam.start_video_capture()
 
-    if is_color and not force_mono:
+    if is_color and not force_mono and bins <= 1:        # binning a color cam yields mono
         color_id = _ASI_BAYER_TO_COLOR_ID.get(int(info.get('BayerPattern', 0)), ser_mod.ColorId.BAYER_RGGB)
     else:
         color_id = ser_mod.ColorId.MONO
@@ -257,7 +259,7 @@ def _open_sky(args, state_path=None, mount_path=None):
         return sim.render(t, az, alt, pose['raz'], pose['ralt'],
                           exposure_s=args.sky_exposure_s, substeps=args.sky_substeps)
 
-    meta = {'bin': [1, 1], 'roi': [0, 0, cfg.width, cfg.height]}
+    meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
     return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta
 
 
@@ -316,6 +318,10 @@ def main(argv=None):
     p.add_argument('--playback-loop', action='store_true', help="playback: loop instead of stopping at the end")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
+    p.add_argument('--bin', type=int, default=1,
+                   help="NxN binning. sim/synthetic: --width/--height are already the binned size; this "
+                        "just records bin=[N,N] in the frame metadata. zwo: sets hardware binning "
+                        "(a color cam binned >1 reads out mono).")
     p.add_argument('--fps', type=float, default=15.0)
     p.add_argument('--frame-limit', type=int, default=-1,
                    help="frames for the current file before rolling over (-1 = unlimited)")
@@ -390,15 +396,15 @@ def main(argv=None):
             args.camera_index, args.exposure_us, args.gain, force_mono=args.mono,
             auto=args.auto, auto_max_exp_ms=args.auto_max_exp_ms,
             auto_max_gain=args.auto_max_gain, auto_target=args.auto_target,
-            neutral_wb=not args.camera_wb)
+            neutral_wb=not args.camera_wb, bin=args.bin)
     elif args.source == 'sky':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_sky(
             args, state_path=os.path.join(out_dir, session_mod.state_name(ts)),
             mount_path=os.path.join(out_dir, session_mod.sim_mount_name(ts)))
     elif args.source == 'playback':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_playback(args)
-    if frame_meta is None:                                  # synthetic: full frame, no binning
-        frame_meta = {'bin': [1, 1], 'roi': [0, 0, width, height]}
+    if frame_meta is None:                                  # synthetic: rendered at the binned size
+        frame_meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, width, height]}
 
     control = control_mod.ControlReader(args.control_file) if args.control_file else None
     cfg = {'frame_limit': args.frame_limit, 'file_limit': args.file_limit,

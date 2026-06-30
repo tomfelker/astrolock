@@ -108,9 +108,15 @@ def main(argv=None):
     p.add_argument('--main-sensor', default='ZWO ASI678MC', help="main camera sensor name in the optics DB")
     p.add_argument('--main-optic', default='Celestron C11 f/10', help="main optic name in the optics DB")
     p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
-    p.add_argument('--track-ki', type=float, default=0.3,
+    p.add_argument('--guide-bin', type=int, default=2,
+                   help="guide camera NxN binning (default 2x2): combine NxN pixels. A color cam "
+                        "binned 2x2 reads out mono at ~the debayered resolution -- the natural guide "
+                        "format, and it saves USB/SSD/memory bandwidth. Sim renders mono at 1/N res.")
+    p.add_argument('--main-bin', type=int, default=1,
+                   help="main camera NxN binning (default 1 = native full resolution)")
+    p.add_argument('--track-ki', type=float, default=0.5,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
-    p.add_argument('--track-kii', type=float, default=0.25,
+    p.add_argument('--track-kii', type=float, default=0.05,
                    help="tracker second-integral gain (0 = off): removes the residual lag against a "
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
                         "kii < kp*ki for stability (kp*ki ~ 0.43 at the default ki/damping)")
@@ -119,7 +125,7 @@ def main(argv=None):
                         "stability self-check (and, later, optional gain derate below / buff above it)")
     p.add_argument('--track-damping', type=float, default=1.3,
                    help="P is derived for critical damping (kp=2*sqrt(ki)); >1 over-damps for lag margin")
-    p.add_argument('--track-kd', type=float, default=1.0,
+    p.add_argument('--track-kd', type=float, default=0.0,
                    help="tracker derivative braking gain (on image speed above --track-max-px-s)")
     p.add_argument('--track-max-px-s', type=float, default=120.0,
                    help="image-speed dead zone (px/s): brake the slew above this during acquisition")
@@ -205,9 +211,13 @@ def main(argv=None):
     rad_per_px_by_role = {}
     render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
+    bin_by_role = {}           # role -> physical NxN bin (recorded in frame metadata; scales plate scale)
     for role in roles:
+        b = max(1, getattr(args, f'{role}_bin', 1))
+        bin_by_role[role] = b
         rad_per_px_by_role[role] = rad_per_px
-        render_by_role[role] = (args.width, args.height, args.sky_pixel_um, args.sky_focal_mm)
+        render_by_role[role] = (max(1, args.width // b), max(1, args.height // b),
+                                args.sky_pixel_um * b, args.sky_focal_mm)
         sname, oname = getattr(args, f'{role}_sensor', None), getattr(args, f'{role}_optic', None)
         rname = getattr(args, f'{role}_reducer', None)
         try:
@@ -215,18 +225,29 @@ def main(argv=None):
                 s, o = _sensors[sname], _optics[oname]
                 mult = _reducers[rname] if rname else 1.0
                 feff = o.focal_length_mm * mult
-                # Downscale: 1/ds the pixels per axis, ds x the effective pixel pitch -> the FoV is
-                # unchanged (chip size constant) but each rendered pixel spans ds x the sky. The
-                # plate scale the tracker uses is per *rendered* pixel, so it scales by ds too.
-                rx, ry = max(1, s.res_x // ds), max(1, s.res_y // ds)
-                pum = s.pixel_um * ds
-                rad_per_px_by_role[role] = optics.rad_per_px(pum, feff)
+                # Render reduction = physical bin (b) x sim downscale (ds). Both shrink the rendered
+                # frame 1/N per axis with N x the pixel pitch, so the FoV is unchanged. The physical
+                # bin is reported in the frame metadata and applied by detect/tracker (frame_binning),
+                # exactly like a real binned camera; only the sim-only downscale is folded into the
+                # plate scale here. So rad_per_px stays per *native* pixel x ds, and the tracker's
+                # rad_per_px * frame_binning(=b) recovers the true rendered scale -- real/sim consistent.
+                total = ds * b
+                rx, ry = max(1, s.res_x // total), max(1, s.res_y // total)
+                pum = s.pixel_um * total
+                rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um * ds, feff)
                 render_by_role[role] = (rx, ry, pum, feff)
-                fx, fy = optics.fov_deg(s, feff)      # physical FoV (full sensor; ds-invariant)
+                fx, fy = optics.fov_deg(s, feff)      # physical FoV (full sensor; bin/ds-invariant)
                 fov_by_role[role] = (fx, fy)
+                extra = (f" (bin {b}x{b})" if b > 1 else "") + (f" (downscale {ds}x)" if ds > 1 else "")
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
-                      f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(pum, feff):.3f} arcsec/px, "
-                      f"render {rx}x{ry}{f' (downscale {ds}x)' if ds > 1 else ''}", flush=True)
+                      f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(s.pixel_um * b, feff):.3f} arcsec/px, "
+                      f"render {rx}x{ry}{extra}", flush=True)
+                # Bandwidth note (only where we have positive sensor data): a color cam left unbinned
+                # while it feeds detection is wasteful -- detection bins it to mono anyway.
+                if s.is_color and b == 1 and role in detect_roles:
+                    print(f"[backend] note: {role} is color ({s.bayer}) and unbinned but feeds detection; "
+                          f"it'll be binned to mono for detection anyway -- --{role}-bin 2 halves bandwidth",
+                          flush=True)
         except KeyError as e:
             print(f"[backend] {role}: unknown optics {e}; using fallback plate scale", flush=True)
     zenith_zone_cos = math.sin(math.radians(args.track_zenith_zone_deg))   # |cos(alt)| below this = zone
@@ -253,6 +274,7 @@ def main(argv=None):
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
             '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
+            '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
             '--important', '1' if recording else '0', '--control-file', cf,
             *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
