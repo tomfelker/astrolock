@@ -121,8 +121,20 @@ def main(argv=None):
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
                         "kii < kp*ki for stability (kp*ki ~ 0.43 at the default ki/damping)")
     p.add_argument('--track-nominal-rate', type=float, default=10.0,
-                   help="framerate (Hz) the track gains are characterized at: used for the lock-time "
-                        "stability self-check (and, later, optional gain derate below / buff above it)")
+                   help="framerate (Hz) the track gains are characterized at: the gains are tuned here, "
+                        "the lock-time self-check runs here, and --track-derate backs them off below it")
+    p.add_argument('--track-derate', dest='track_derate', action='store_true', default=True,
+                   help="below --track-nominal-rate, scale the gains down (kp~r, ki~r^2, kii~r^3) to "
+                        "hold phase margin as the framerate falls; never buffed above nominal. (default on)")
+    p.add_argument('--no-track-derate', dest='track_derate', action='store_false',
+                   help="use the full tuned gains at any framerate (disable the low-framerate derate)")
+    p.add_argument('--track-lock-max-drift-rate', type=float, default=0.5,
+                   help="coast-on-loss: a lock is 'settled' when the target's image drift stays below "
+                        "this (deg/s -- camera/binning independent) for --track-lock-min-time. Losing a "
+                        "settled lock COASTS the mount at its last rate (it already matches the target's "
+                        "sky rate, so keep going to re-acquire); losing an unsettled one STOPS. 0 = always stop.")
+    p.add_argument('--track-lock-min-time', type=float, default=1.0,
+                   help="coast-on-loss: how long (s) the drift must stay settled to qualify for coasting")
     p.add_argument('--track-roi-size', type=int, default=256,
                    help="while tracking, publish a square ROI (this many frame px, power of 2) around "
                         "the predicted target so detect can work just that window instead of the whole "
@@ -210,6 +222,7 @@ def main(argv=None):
     # Auto-tracking state (pixel-space closed loop).
     tracker = None
     tracking = False
+    coasting = False          # lost a settled lock -> holding the last rate, still re-acquiring
     track_role = None
     track_target = None
     track_seen_index = -1
@@ -408,20 +421,20 @@ def main(argv=None):
                             pass
 
     def apply_command(cmd):
-        nonlocal estop, recording, tracking, track_role, tracker, track_seen_index, gui_quit
+        nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
             return
         if t == 'set_rate':
-            tracking = False                          # manual slew overrides auto-track
+            tracking = coasting = False               # manual slew overrides auto-track (and coast)
             mount.set_rates(math.radians(cmd.get('az', 0.0)), math.radians(cmd.get('alt', 0.0)))
             estop = False
         elif t == 'stop':
-            tracking = False
+            tracking = coasting = False
             mount.set_rates(0.0, 0.0)
         elif t == 'estop':
-            tracking = False
+            tracking = coasting = False               # e-stop halts a coast too
             mount.set_rates(0.0, 0.0)
             estop = True
         elif t == 'track':                            # lock the pixel-space loop onto a target
@@ -439,6 +452,9 @@ def main(argv=None):
                     tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
                                            ki=args.track_ki, damping=args.track_damping, kd=args.track_kd,
                                            kii=args.track_kii, nominal_rate_hz=args.track_nominal_rate,
+                                           derate=args.track_derate,
+                                           lock_max_drift_rate=args.track_lock_max_drift_rate,
+                                           lock_min_time=args.track_lock_min_time,
                                            gate_px=args.track_gate_px, lost_s=args.track_lost_s,
                                            vel_smoothing=args.track_vel_smoothing,
                                            max_track_px_s=args.track_max_px_s, max_rate_rad_s=max_rate,
@@ -446,6 +462,7 @@ def main(argv=None):
                     tracker.start(float(px[0]), float(px[1]), ft)
                     track_seen_index = latest_det_index[role]
                     tracking = True
+                    coasting = False
                     track_role = role
                     estop = False
                     print(f"[backend] acquired target on {role} at "
@@ -457,7 +474,7 @@ def main(argv=None):
                     for w in warns:
                         print(f"[backend] WARNING (track {role}): {w}", flush=True)
         elif t == 'untrack':
-            tracking = False
+            tracking = coasting = False
             mount.set_rates(0.0, 0.0)
         elif t == 'record':
             recording = bool(cmd.get('on', False))
@@ -516,14 +533,22 @@ def main(argv=None):
                         ca = math.cos(st['alt_rad'])
                         raz = 0.0 if abs(ca) < zenith_zone_cos else raz / ca
                         mount.set_rates(raz, ralt)
-                        track_target = list(tpx) if track_status == 'track' else None
+                        # On 'track' and 'coast' the target estimate keeps moving, so keep publishing it
+                        # (the ROI follows, so detect keeps searching and can re-acquire during coast).
+                        track_target = list(tpx) if track_status in ('track', 'coast') else None
                         if track_status == 'lost':
-                            tracking = False
+                            tracking, coasting = False, False
                             print(f"[backend] lost target on {role}", flush=True)
+                        elif track_status == 'coast' and not coasting:
+                            coasting = True
+                            print(f"[backend] coasting on {role} (settled lock lost; holding last rate "
+                                  f"to re-acquire -- e-stop to halt)", flush=True)
+                        elif track_status == 'track':
+                            coasting = False
 
             moving = abs(st['rate_az_rad_s']) > 1e-9 or abs(st['rate_alt_rad_s']) > 1e-9
             if tracking:
-                mode = 'track'
+                mode = 'coast' if coasting else 'track'
             elif track_status == 'lost':
                 mode = 'lost'
             elif estop:

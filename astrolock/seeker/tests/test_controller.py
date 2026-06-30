@@ -93,6 +93,52 @@ def run():
     assert status == 'lost' and raz == 0.0 and ralt == 0.0, status
     print("test_controller: lost fallback: OK")
 
+    # 5. Coast vs stop on loss: lock a constant-velocity target until settled, then stop feeding.
+    #    Settled lock -> 'coast' at the last (nonzero) rate; with coast disabled -> 'lost' at zero.
+    def run_then_lose(lock_drift):
+        trk = PixelTracker(CX, CY, RADPP, ki=0.5, damping=1.3, gate_px=120.0, lost_s=0.5,
+                           lock_max_drift_rate=lock_drift, lock_min_time=0.3, max_rate_rad_s=math.radians(20))
+        px, py, t, raz = CX, CY, 0.0, 0.0
+        trk.start(px, py, t)
+        for _ in range(60):                       # lock + settle on a steady sky-rate target
+            t += 0.05
+            px += (0.02 - raz) / RADPP * 0.05     # plant: image moves by (sky_rate - mount)/scale
+            raz, ralt, status, _ = trk.update([{'px': [px, py]}], True, t)
+        coast_rates = []
+        for _ in range(15):                       # stop feeding -> lose the target
+            t += 0.05
+            raz, ralt, status, _ = trk.update([], True, t)
+            if status == 'coast':
+                coast_rates.append(raz)
+        return status, raz, coast_rates
+    status, raz, coast = run_then_lose(0.5)       # coast enabled
+    assert status == 'coast' and len(coast) >= 2, (status, len(coast))
+    assert abs(coast[0]) > 1e-4 and max(coast) - min(coast) < 1e-9, coast   # nonzero, held constant
+    status, raz, coast = run_then_lose(0.0)       # coast disabled -> stop
+    assert status == 'lost' and raz == 0.0 and coast == [], (status, raz)
+    print("test_controller: coast holds a constant nonzero rate on settled loss, stops when disabled: OK")
+
+    # 6. Low-framerate gain derate: below nominal the proportional rate for a fixed error is scaled
+    #    down; disabling derate restores the full gain.
+    def p_rate(dt, derate):
+        trk = PixelTracker(CX, CY, RADPP, ki=0.5, damping=1.3, kd=0.0, nominal_rate_hz=10.0,
+                           derate=derate, lock_max_drift_rate=0.0, gate_px=200.0,
+                           max_rate_rad_s=math.radians(60))
+        trk.start(CX, CY, 0.0)
+        t = 0.0
+        for _ in range(20):                       # warm dt_ema to dt, on target (no error, no integral)
+            t += dt
+            trk.update([{'px': [CX, CY]}], True, t)
+        t += dt
+        raz, _, _, _ = trk.update([{'px': [CX + 60, CY]}], True, t)   # one off-target frame
+        return abs(raz)
+    fast = p_rate(0.1, True)                       # 10 fps = nominal -> full gain
+    slow = p_rate(0.5, True)                       # 2 fps -> derated (~1/5)
+    nod = p_rate(0.5, False)                       # 2 fps, derate off -> full gain
+    assert slow < 0.5 * fast, (slow, fast)
+    assert nod > 1.8 * slow, (nod, slow)
+    print(f"test_controller: low-framerate derate (rate {fast:.4f}->{slow:.4f}, off={nod:.4f}): OK")
+
 
 if __name__ == '__main__':
     run()

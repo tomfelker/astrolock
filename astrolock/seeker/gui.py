@@ -463,7 +463,7 @@ def main(argv=None):
                     and stt.get('target_px')):
                 tx, ty = stt['target_px']
                 X, Y = tx * v['ox'], ty * v['oy']
-                col = (255, 60, 220, 255)
+                col = (255, 180, 40, 255) if stt.get('mode') == 'coast' else (255, 60, 220, 255)  # amber=coast
                 r = S(14)
                 th = 1.0                                 # hairline (1 px, not DPI-scaled)
                 dpg.draw_circle((X, Y), r, color=col, thickness=th, parent=v['track_layer'])

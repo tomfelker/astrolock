@@ -53,15 +53,23 @@ def _excess(v, thr):
 
 class PixelTracker:
     def __init__(self, cx, cy, rad_per_px, ki=0.3, damping=1.3, kd=1.0, kii=0.0,
-                 nominal_rate_hz=10.0, gate_px=80.0,
+                 nominal_rate_hz=10.0, derate=True, lock_max_drift_rate=0.5, lock_min_time=1.0,
+                 gate_px=80.0,
                  lost_s=1.5, vel_smoothing=0.1, max_track_px_s=120.0, max_rate_rad_s=math.radians(8.0),
                  sign_az=1.0, sign_alt=-1.0):
         self.cx, self.cy = cx, cy
         self.rad_per_px = rad_per_px
         self.ki, self.kd, self.kii = ki, kd, kii
         # The framerate the gains are characterized at: the diagnostics check the tune at this rate,
-        # and (later, optionally) the effective gains derate below it / buff above it.
+        # and (with derate) the effective gains back off below it (never buffed above -- unmodeled lags
+        # don't improve with framerate, so a faster cam shouldn't be allowed to push us less stable).
         self.nominal_rate_hz = nominal_rate_hz
+        self.derate = derate
+        # Coast-on-loss: if the lock was "settled" (image drift below lock_max_drift_rate deg/s for at
+        # least lock_min_time s) when we lose it, keep slewing at the last rate (the mount rate already
+        # matches the target's sky rate) rather than stopping; if it wasn't settled, stop (RTLS). 0 = off.
+        self.lock_max_drift = math.radians(lock_max_drift_rate)    # rad/s
+        self.lock_min_time = lock_min_time
         # For the loop (mount = integrator, PI control) the position error obeys
         # e'' + kp e' + ki e = 0, so kp = 2*sqrt(ki) is critically damped. `damping` >= 1 pushes
         # it slightly over-damped for margin against the real system's lags (mount update rate,
@@ -135,6 +143,10 @@ class PixelTracker:
         self.meas_t = now
         self.good_t = now                        # last successful association
         self.last_t = now
+        self.dt_ema = (1.0 / self.nominal_rate_hz) if self.nominal_rate_hz > 0 else 0.1  # frame interval
+        self.settled_since = None                # when the image drift first dropped below threshold
+        self.settled = False                     # drift below threshold for >= lock_min_time
+        self.last_rate = (0.0, 0.0)              # last commanded (raw) rate -- held during coast
 
     def stop(self):
         self.active = False
@@ -149,7 +161,8 @@ class PixelTracker:
         Advance the tracker and return (rate_az, rate_alt, status, target_px).
           blobs:    current detection blobs (each with 'px':[x,y]); used only if new_data
           new_data: True when these blobs are from a frame not seen before
-          status:   'track' (associated/coasting) or 'lost'
+          status:   'track' (associated / coasting within lost_s), 'coast' (lost a *settled* lock --
+                    holding the last rate, still trying to re-acquire), or 'lost' (stopped)
         """
         ex_px, ey_px = self.estimate(now)        # predicted position
 
@@ -174,15 +187,32 @@ class PixelTracker:
                 self.meas_t = now
                 self.good_t = now
                 ex_px, ey_px = mx, my
+                # Settled-lock timer (only updated while actually associating, so a target that never
+                # locked can't masquerade as "settled at zero drift"): image drift low for long enough.
+                drift = math.hypot(self.vel[0], self.vel[1]) * self.rad_per_px      # rad/s
+                if self.lock_max_drift > 0 and drift < self.lock_max_drift:
+                    if self.settled_since is None:
+                        self.settled_since = now
+                    self.settled = (now - self.settled_since) >= self.lock_min_time
+                else:
+                    self.settled_since, self.settled = None, False
 
         dt = now - self.last_t
         self.last_t = now
-        status = 'lost' if (now - self.good_t) > self.lost_s else 'track'
+        if dt > 1e-6:
+            self.dt_ema += 0.2 * (dt - self.dt_ema)       # smoothed inter-frame interval
 
-        ex = ex_px - self.cx
-        ey = ey_px - self.cy
-        if status == 'lost':                     # freeze the integrator; stop the mount
-            return 0.0, 0.0, status, (ex_px, ey_px)
+        if (now - self.good_t) > self.lost_s:             # lost the target
+            if self.lock_max_drift > 0 and self.settled:  # PTO: settled lock -> coast at last rate
+                return self.last_rate[0], self.last_rate[1], 'coast', (ex_px, ey_px)
+            return 0.0, 0.0, 'lost', (ex_px, ey_px)        # RTLS: not settled -> stop
+
+        # One-sided gain derate: at/above nominal, d=1 (no change); slower, d<1 scales bandwidth so the
+        # loop keeps its damping ratio (kp~d, ki~d^2, kii~d^3) but backs off as the sample rate falls.
+        d = 1.0
+        if self.derate and self.dt_ema > 0 and self.nominal_rate_hz > 0:
+            d = min(1.0, 1.0 / (self.dt_ema * self.nominal_rate_hz))
+        kp_e, ki_e, kd_e, kstep_e = self.kp * d, self.ki * d * d, self.kd * d, self.kii_step * d
 
         # Derivative braking with a dead zone: oppose only the image speed *above* v_thresh.
         # During acquisition the target races across the frame (image speed >> v_thresh) so
@@ -194,16 +224,19 @@ class PixelTracker:
 
         # Integrate, clamped so the integral term alone commands at most the max motor rate.
         c = self.i_clamp
-        self.integ[0] = max(-c, min(c, self.integ[0] + self.ki * ex * dt))
-        self.integ[1] = max(-c, min(c, self.integ[1] + self.ki * ey * dt))
-        # Second integral (kii): integrate the first integral again, same clamp. kii_step is 0
+        ex = ex_px - self.cx
+        ey = ey_px - self.cy
+        self.integ[0] = max(-c, min(c, self.integ[0] + ki_e * ex * dt))
+        self.integ[1] = max(-c, min(c, self.integ[1] + ki_e * ey * dt))
+        # Second integral (kii): integrate the first integral again, same clamp. kstep_e is 0
         # unless kii > 0, so integ2 stays 0 and this is a no-op for the default PI+D loop.
-        self.integ2[0] = max(-c, min(c, self.integ2[0] + self.kii_step * self.integ[0] * dt))
-        self.integ2[1] = max(-c, min(c, self.integ2[1] + self.kii_step * self.integ[1] * dt))
+        self.integ2[0] = max(-c, min(c, self.integ2[0] + kstep_e * self.integ[0] * dt))
+        self.integ2[1] = max(-c, min(c, self.integ2[1] + kstep_e * self.integ[1] * dt))
 
         m = self.max_rate
         rate_az = max(-m, min(m, self.sign_az * self.rad_per_px
-                                 * (self.kp * ex + self.integ[0] + self.integ2[0] + self.kd * evx)))
+                                 * (kp_e * ex + self.integ[0] + self.integ2[0] + kd_e * evx)))
         rate_alt = max(-m, min(m, self.sign_alt * self.rad_per_px
-                                  * (self.kp * ey + self.integ[1] + self.integ2[1] + self.kd * evy)))
-        return rate_az, rate_alt, status, (ex_px, ey_px)
+                                  * (kp_e * ey + self.integ[1] + self.integ2[1] + kd_e * evy)))
+        self.last_rate = (rate_az, rate_alt)              # held if we later coast
+        return rate_az, rate_alt, 'track', (ex_px, ey_px)
