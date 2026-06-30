@@ -196,11 +196,13 @@ def main(argv=None):
                 dpg.draw_image(tex_tag, (0, 0), (disp_w, disp_h))
                 box_layer = dpg.add_draw_layer()
                 fov_layer = dpg.add_draw_layer()        # nested camera-FoV rectangles
-                track_layer = dpg.add_draw_layer()      # the locked-target marker (on top)
+                track_layer = dpg.add_draw_layer()      # the locked-target marker
+                warn_layer = dpg.add_draw_layer()       # "NOT RECORDING" blinker (on top)
         det_path = f.ser_path[:-len('.ser')] + '.detections.jsonl'
         views[role] = dict(tex=tex_tag, status=status, det_tailer=JsonlTailer(det_path),
                            ser_path=f.ser_path, blobs=[], box_layer=box_layer,
-                           fov_layer=fov_layer, track_layer=track_layer, drawlist=drawlist,
+                           fov_layer=fov_layer, track_layer=track_layer, warn_layer=warn_layer,
+                           drawlist=drawlist, rec=None,
                            ox=disp_w / fw, oy=disp_h / fh, w=w, h=h, last_idx=-1, det_idx=-1, peak=0)
 
     def rebuild_view(role):
@@ -286,8 +288,6 @@ def main(argv=None):
     def on_stop_cap():
         _send({'type': 'capture', 'role': dpg.get_value('cam_combo'), 'on': False})
 
-    def on_record(_sender, app_data):
-        _send({'type': 'record', 'on': bool(app_data)})
 
     def on_source(_sender, app_data):
         _send({'type': 'set_source', 'role': dpg.get_value('cam_combo'), 'source': app_data})
@@ -302,7 +302,10 @@ def main(argv=None):
         with dpg.group(horizontal=True):
             dpg.add_button(label="Start", width=S(64), callback=lambda: on_start())
             dpg.add_button(label="Stop", width=S(64), callback=lambda: on_stop_cap())
-            dpg.add_checkbox(label="Record", tag='rec_chk', callback=on_record)
+            dpg.add_checkbox(label="Record", tag='rec_chk')   # pure manual intent; loop reconciles
+        # Auto-record: while tracking, record automatically -- only for a real (non-sim) main cam,
+        # so we never miss a live pass and never waste disk on sim runs. Disabled otherwise.
+        dpg.add_checkbox(label="Auto record", tag='autorec_chk')   # default set once from main source
         dpg.add_separator()
         with dpg.group(horizontal=True):
             dpg.add_spacer(width=S(72))
@@ -348,6 +351,21 @@ def main(argv=None):
             cur = st.get('sources', {}).get(active)
             if cur:
                 dpg.set_value('src_combo', cur)
+        # Auto-record default: ON for a real main cam, OFF for the sim (testing, would just waste
+        # disk). Set ONCE when we first learn the main's source, then it's the user's to toggle.
+        if st is not None and not ctrl.get('autorec_init') and st.get('sources', {}).get('main'):
+            dpg.set_value('autorec_chk', st['sources']['main'] == 'zwo')
+            ctrl['autorec_init'] = True
+        # Recording = the manual Record checkbox OR (auto-record AND tracking). The Record checkbox is
+        # left untouched (pure manual intent), so a manual record stays on through tracking start/stop;
+        # auto only *adds* recording during a track. The control loop reconciles the backend to this.
+        if st is not None:
+            want = bool(dpg.get_value('rec_chk')) or (dpg.get_value('autorec_chk')
+                                                      and bool(st.get('tracking')))
+            if want != bool(st.get('recording')) and want != ctrl.get('rec_sent'):
+                _send({'type': 'record', 'on': want})
+                ctrl['rec_sent'] = want
+
         if st:
             caps = ' '.join(f"{r}:{'on' if v else 'off'}" for r, v in st.get('capturing', {}).items())
             srcs = ' '.join(f"{r}:{s}" for r, s in st.get('sources', {}).items())
@@ -481,6 +499,21 @@ def main(argv=None):
                                        color=col2, thickness=1.0, parent=v['fov_layer'])
                     dpg.draw_text((ccx - hw, ccy - hh - S(14)), r2, size=S(13),
                                   color=col2, parent=v['fov_layer'])
+
+            # Recording state: window title always shows it; and if we're tracking but THIS cam
+            # isn't recording, blink a big "NOT RECORDING" below centre (don't miss capturing a pass).
+            st_now = ctrl['state'] or {}
+            rec = bool(st_now.get('recording')) and bool(st_now.get('capturing', {}).get(role))
+            if rec != v['rec']:                          # retitle only on change
+                v['rec'] = rec
+                if dpg.does_item_exist(f"win_{role}"):
+                    dpg.configure_item(f"win_{role}",
+                                       label=f"{role.capitalize()}  -  {'Recording' if rec else 'Standby'}")
+            dpg.delete_item(v['warn_layer'], children_only=True)
+            if st_now.get('tracking') and not rec and int(time.perf_counter() * 1.5) % 2 == 0:
+                msg, sz = "NOT RECORDING", S(40)
+                dpg.draw_text((v['w'] / 2.0 - len(msg) * sz * 0.30, v['h'] / 2.0 + S(16)),
+                              msg, size=sz, color=(255, 40, 40, 255), parent=v['warn_layer'])
 
         dpg.render_dearpygui_frame()
         if not new_work:

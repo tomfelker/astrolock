@@ -123,6 +123,10 @@ def main(argv=None):
     p.add_argument('--track-nominal-rate', type=float, default=10.0,
                    help="framerate (Hz) the track gains are characterized at: used for the lock-time "
                         "stability self-check (and, later, optional gain derate below / buff above it)")
+    p.add_argument('--track-roi-size', type=int, default=256,
+                   help="while tracking, publish a square ROI (this many frame px, power of 2) around "
+                        "the predicted target so detect can work just that window instead of the whole "
+                        "frame (much higher framerate). 0 = always full-frame.")
     p.add_argument('--track-damping', type=float, default=1.3,
                    help="P is derived for critical damping (kp=2*sqrt(ki)); >1 over-damps for lag margin")
     p.add_argument('--track-kd', type=float, default=0.0,
@@ -542,6 +546,9 @@ def main(argv=None):
                 'tracking': tracking,
                 'track_role': track_role if tracking else None,
                 'target_px': track_target if tracking else None,
+                # ROI (cx, cy, size px) around the predicted target, for detect to clamp its work to.
+                'track_roi': ([round(track_target[0]), round(track_target[1]), args.track_roi_size]
+                              if tracking and track_target and args.track_roi_size > 0 else None),
                 'sources': dict(sources),
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},

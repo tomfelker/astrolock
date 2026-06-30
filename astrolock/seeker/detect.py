@@ -276,6 +276,61 @@ def _frame_count(ser_path):
         return ser_mod.unpack_header(f.read(ser_mod.HEADER_SIZE)).frame_count
 
 
+def detect_roi_peak(work, roi, coord_scale, *, detector, bg_radius, psf_px, doh_sigma, snr):
+    """Track-mode detection: find the single locked target in a small ROI around the predicted
+    position -- far cheaper than a full-frame multi-blob pass, and no merging/gating needed.
+
+    ``roi`` is [cx, cy, size] in *frame* px (from the backend's predicted target); ``work`` is the
+    (possibly half-res) analysis image with ``coord_scale`` frame px per work px. Returns one blob in
+    frame coords -- the centroid of the strongest detection-surface peak, biased toward the predicted
+    centre so a brighter nearby star can't steal the lock -- or [] if nothing target-like is in the
+    window (target lost / drifted out), which the tracker then treats as a miss.
+    """
+    work = torch.as_tensor(work, dtype=torch.float32)
+    H, W = work.shape
+    cx, cy, size = roi
+    half = (size / coord_scale) / 2.0
+    ecx, ecy = cx / coord_scale, cy / coord_scale            # expected centre, work coords
+    x0, x1 = max(0, int(ecx - half)), min(W, int(ecx + half) + 1)
+    y0, y1 = max(0, int(ecy - half)), min(H, int(ecy + half) + 1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return []                                            # ROI off the frame
+    sub = work[y0:y1, x0:x1]
+    bp = detection_surface(sub, detector=detector, bg_radius=bg_radius, psf_px=psf_px, doh_sigma=doh_sigma)
+    m = float(bp.max())
+    if m <= 0:
+        return []
+    h, w = bp.shape
+    dev = bp.device
+    yy, xx = torch.meshgrid(torch.arange(h, dtype=torch.float32, device=dev),
+                            torch.arange(w, dtype=torch.float32, device=dev), indexing='ij')
+    sig_b = max(2.0 * psf_px, half / 2.0)                     # gentle pull toward the predicted centre
+    weight = torch.exp(-(((xx - (ecx - x0)) ** 2 + (yy - (ecy - y0)) ** 2)) / (2.0 * sig_b ** 2))
+    pidx = int(torch.argmax(bp * weight))                    # localize: strongest centre-biased peak
+    py, px = pidx // w, pidx % w
+    # Found-test on *raw brightness*: the target is a genuinely bright source, while a DoH peak on
+    # noise sits at background level (DoH of noise is heavy-tailed, so an SNR cut on DoH itself isn't
+    # reliable). Require the peak's work value to clear snr sigma over the ROI's robust background.
+    wflat = sub.reshape(-1)
+    wmed = torch.median(wflat)
+    wsig = 1.4826 * float(torch.median(torch.abs(wflat - wmed))) + 1e-6
+    if float(sub[py, px]) - float(wmed) < snr * wsig:
+        return []                                            # nothing target-like near the prediction
+    cr = max(1, int(round(psf_px)))                          # sub-pixel centroid in a +/-psf window
+    wy0, wy1 = max(0, py - cr), min(h, py + cr + 1)
+    wx0, wx1 = max(0, px - cr), min(w, px + cr + 1)
+    patch = bp[wy0:wy1, wx0:wx1].clamp(min=0)
+    s = float(patch.sum())
+    if s > 0:
+        pyy, pxx = torch.meshgrid(torch.arange(wy0, wy1, dtype=torch.float32, device=dev),
+                                  torch.arange(wx0, wx1, dtype=torch.float32, device=dev), indexing='ij')
+        cpx, cpy = float((patch * pxx).sum()) / s, float((patch * pyy).sum()) / s
+    else:
+        cpx, cpy = float(px), float(py)
+    return [{'px': [(x0 + cpx) * coord_scale, (y0 + cpy) * coord_scale],
+             'moving': True, 'size_px': psf_px * coord_scale, 'score': float(bp[py, px] / m)}]
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker blob detector")
     p.add_argument('--session', required=True, help="session directory to follow")
@@ -338,6 +393,20 @@ def main(argv=None):
     scale = None
     total = 0
 
+    # Track-mode: tail the backend state for a predicted ROI around the target. When present (this
+    # role is being tracked), detect just that small window with a single-peak/centroid pass instead
+    # of the whole frame -- far higher framerate, which is when we most need it (the catch-up slew).
+    state = {'tailer': None, 'roi': None}
+
+    def poll_state():
+        if state['tailer'] is None:
+            sf = sorted(glob.glob(os.path.join(args.session, '*_state.jsonl')))
+            if sf:
+                state['tailer'] = sidecar.JsonlTailer(sf[-1])
+        if state['tailer'] is not None:
+            for rec in state['tailer'].poll():
+                state['roi'] = rec.get('track_roi') if rec.get('track_role') == args.role else None
+
     def process(i):
         nonlocal prev, scale, total
         frame = reader.read_frame(i)
@@ -345,26 +414,32 @@ def main(argv=None):
         if scale is None:
             scale = full_scale(cid, reader.header.pixel_depth_per_plane)
         work = work_image(frame, cid, device=device)
-        bp = detection_surface(work, detector=args.detector, bg_radius=args.bg_radius,
-                               psf_px=args.psf_px, doh_sigma=args.doh_sigma)
-        blobs = detect_blobs(
-            bp, work, prev,
-            threshold_rel=args.threshold, max_candidates=args.max_candidates,
-            suppress_radius=args.suppress_radius, min_blob_px=args.min_blob_px,
-            max_size_px=args.max_size_px, psf_px=args.psf_px,
-            snr=args.snr, min_roundness=args.min_roundness,
-            moving_frac=args.moving_frac, scale=scale,
-            tile_grid=args.tile_grid, per_tile=args.per_tile)
-        # Report blobs in the frame's image space. We may analyse a downsampled grid (Bayer ->
-        # half-res mono sum), so scale coords back up; consumers then need no idea how we work.
-        coord_scale = reader.header.image_width / work.shape[1]
-        if coord_scale != 1:
-            for b in blobs:
-                b['px'] = [b['px'][0] * coord_scale, b['px'][1] * coord_scale]
-                if 'size_px' in b:
-                    b['size_px'] = b['size_px'] * coord_scale
+        coord_scale = reader.header.image_width / work.shape[1]    # frame px per (maybe half-res) work px
+        if state['roi'] is not None:                               # track mode: single peak in the ROI
+            blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=args.detector,
+                                    bg_radius=args.bg_radius, psf_px=args.psf_px,
+                                    doh_sigma=args.doh_sigma, snr=args.snr)   # already frame coords
+            prev = None                                            # frame-diff not used in ROI mode
+        else:                                                      # acquisition: full-frame multi-blob
+            bp = detection_surface(work, detector=args.detector, bg_radius=args.bg_radius,
+                                   psf_px=args.psf_px, doh_sigma=args.doh_sigma)
+            blobs = detect_blobs(
+                bp, work, prev,
+                threshold_rel=args.threshold, max_candidates=args.max_candidates,
+                suppress_radius=args.suppress_radius, min_blob_px=args.min_blob_px,
+                max_size_px=args.max_size_px, psf_px=args.psf_px,
+                snr=args.snr, min_roundness=args.min_roundness,
+                moving_frac=args.moving_frac, scale=scale,
+                tile_grid=args.tile_grid, per_tile=args.per_tile)
+            # Report blobs in the frame's image space. We may analyse a downsampled grid (Bayer ->
+            # half-res mono sum), so scale coords back up; consumers then need no idea how we work.
+            if coord_scale != 1:
+                for b in blobs:
+                    b['px'] = [b['px'][0] * coord_scale, b['px'][1] * coord_scale]
+                    if 'size_px' in b:
+                        b['size_px'] = b['size_px'] * coord_scale
+            prev = bp
         writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(), 'blobs': blobs})
-        prev = bp
         total += 1
 
     try:
@@ -372,6 +447,7 @@ def main(argv=None):
             if args.stop_file and os.path.exists(args.stop_file):
                 break
 
+            poll_state()                         # refresh the predicted track ROI (if any)
             avail = _committed(reader, cur)
             if args.follow:
                 # Live: never build a backlog -- skip straight to the most recent frame.
