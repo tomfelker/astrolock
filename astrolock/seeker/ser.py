@@ -13,11 +13,16 @@ Seeker-specific conventions (see astrolock_seeker.md):
   growing file readable and survives a crash mid-capture.
 - Byte order: we write native little-endian pixels and set the ``little_endian`` header
   field so our own reader interprets it correctly. (The SER spec's flag is famously
-  inverted; we just stay self-consistent. Interop with third-party SER players is a later
-  concern.)
+  inverted; we just stay self-consistent.)
+- Per-frame timestamps: on close we append the optional SER trailer (``frame_count`` x int64,
+  .NET ticks = 100 ns since 0001-01-01 UTC) after the frame data, and set the header date_time(s)
+  to the first frame -- so third-party SER players can replay at real speed (the SER header has
+  no frame-rate field). Our own tools use the JSONL sidecar instead. Timestamps are UTC, so the
+  inter-frame deltas (hence playback speed) are exact; absolute time reads as UTC.
 """
 
 import collections
+import datetime as dt
 import enum
 import struct
 
@@ -33,11 +38,22 @@ assert HEADER_SIZE == 178, f"unexpected SER header size {HEADER_SIZE}"
 
 # Byte offset of the frame_count field within the header: 14s + 6 longs.
 FRAME_COUNT_OFFSET = 14 + 4 * 6
+# Byte offset of date_time (date_time_utc is +8): 14s + 7 longs + 3*40s.
+DATETIME_OFFSET = 14 + 4 * 7 + 40 * 3
 
 # Sentinel written while a capture is in progress (signed 32-bit max).
 SENTINEL_FRAME_COUNT = 0x7FFFFFFF
 
 FILE_ID = b'LUCAM-RECORDER'  # 14 bytes, the standard SER file id
+
+_SER_EPOCH = dt.datetime(1, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def _ser_ticks(when):
+    """SER timestamp for aware datetime ``when``: 100-ns intervals since 0001-01-01 UTC (the
+    .NET DateTime ticks the SER spec uses)."""
+    d = when - _SER_EPOCH
+    return (d.days * 86400 + d.seconds) * 10_000_000 + d.microseconds * 10
 
 SerHeader = collections.namedtuple(
     'SerHeader',
@@ -132,6 +148,7 @@ class SerWriter:
         self.color_id = ColorId(color_id)
         self.pixel_depth_per_plane = pixel_depth_per_plane
         self.frame_count = 0
+        self._timestamps = []        # SER ticks per frame -> trailer on close
         self._closed = False
 
         self.header = SerHeader(
@@ -148,10 +165,11 @@ class SerWriter:
         self._file.write(pack_header(self.header))
         self._file.flush()
 
-    def write_frame(self, frame):
+    def write_frame(self, frame, t_utc=None):
         """
         frame: ndarray shaped (height, width) for mono or (height, width, channels).
         Converted to the writer's dtype if needed. Bytes are flushed before returning.
+        ``t_utc``: aware UTC datetime for the per-frame timestamp trailer (defaults to now()).
         """
         arr = np.ascontiguousarray(frame, dtype=self._dtype)
         if arr.nbytes != self._bytes_per_frame:
@@ -160,6 +178,7 @@ class SerWriter:
                 f"({self.width}x{self.height}, depth {self.pixel_depth_per_plane})")
         self._file.write(arr.tobytes())
         self._file.flush()
+        self._timestamps.append(_ser_ticks(t_utc or dt.datetime.now(dt.timezone.utc)))
         self.frame_count += 1
         return self.frame_count - 1  # index of the frame just written
 
@@ -168,9 +187,16 @@ class SerWriter:
             return
         self._closed = True
         try:
-            # Patch the real frame count into the header.
-            self._file.seek(FRAME_COUNT_OFFSET)
+            if self._timestamps:
+                # Optional SER trailer: frame_count x int64 .NET ticks, right after the frames, so
+                # third-party players replay at real speed (presence is detected by file size).
+                self._file.seek(HEADER_SIZE + self.frame_count * self._bytes_per_frame)
+                self._file.write(struct.pack(f'<{len(self._timestamps)}q', *self._timestamps))
+            self._file.seek(FRAME_COUNT_OFFSET)         # patch the real frame count
             self._file.write(struct.pack('<l', self.frame_count))
+            if self._timestamps:                        # capture start time (UTC ticks) in the header
+                self._file.seek(DATETIME_OFFSET)
+                self._file.write(struct.pack('<qq', self._timestamps[0], self._timestamps[0]))
             self._file.flush()
         finally:
             self._file.close()
@@ -184,8 +210,10 @@ class SerWriter:
 
 class SerReader:
     """
-    Read frames from a .ser file (live/growing or finalized). Always derives the available
-    frame count from the file size via frames_on_disk(); the header count is ignored.
+    Read frames from a .ser file (live/growing or finalized). A growing file has the sentinel
+    count, so we derive the available frames from the file size; once finalized we trust the
+    patched header count (a timestamp trailer may follow the frames, so size-counting would
+    over-count).
 
     By default each ``read_frame`` returns a **zero-copy** view onto the OS page cache via a
     per-frame ``np.memmap`` -- for our large frames this skips the page-cache->buffer copy that
@@ -208,13 +236,24 @@ class SerReader:
         self.bytes_per_frame = bytes_per_frame(self.header)
         self.num_channels = num_channels_for_color_id(self.header.color_id)
         self._dtype = _numpy_dtype(self.header.pixel_depth_per_plane, self.header.little_endian)
+        self._final_count = (self.header.frame_count
+                             if self.header.frame_count != SENTINEL_FRAME_COUNT else None)
 
     def frames_on_disk(self):
-        """Number of *complete* frames currently present, from the file size."""
+        """Number of *complete* frames currently present (header count once finalized, else size)."""
         import os
-        size = os.fstat(self._file.fileno()).st_size
+        if self._final_count is not None:
+            return self._final_count
+        # Sentinel at open (growing): re-check the count in case the writer just finalized (then a
+        # timestamp trailer follows the frames and size-counting would over-count), else use size.
+        self._file.seek(FRAME_COUNT_OFFSET)
+        raw = self._file.read(4)
+        if len(raw) == 4 and struct.unpack('<l', raw)[0] != SENTINEL_FRAME_COUNT:
+            self._final_count = struct.unpack('<l', raw)[0]
+            return self._final_count
         if self.bytes_per_frame <= 0:
             return 0
+        size = os.fstat(self._file.fileno()).st_size
         return max(0, (size - HEADER_SIZE) // self.bytes_per_frame)
 
     def _frame_shape(self):

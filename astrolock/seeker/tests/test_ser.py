@@ -117,9 +117,38 @@ def test_ser_mmap_color_and_growing():
     r.close()
 
 
+def test_ser_timestamp_trailer():
+    import datetime as dt
+    import struct
+    out = fresh_dir('ser_ts')
+    path = os.path.join(out, 'ts.ser')
+    W, H, N = 16, 12, 4
+    base = dt.datetime(2026, 6, 29, 5, 0, 0, tzinfo=dt.timezone.utc)
+    frames = [np.full((H, W), i * 1000, np.uint16) for i in range(N)]
+    with ser.SerWriter(path, W, H, color_id=ser.ColorId.MONO, pixel_depth_per_plane=16) as w:
+        for i in range(N):
+            w.write_frame(frames[i], t_utc=base + dt.timedelta(seconds=0.2 * i))
+
+    bpf = W * H * 2
+    assert os.path.getsize(path) == ser.HEADER_SIZE + N * bpf + N * 8   # frames + int64 trailer
+    with open(path, 'rb') as f:
+        f.seek(ser.HEADER_SIZE + N * bpf)
+        ticks = struct.unpack(f'<{N}q', f.read(N * 8))
+    assert list(ticks) == sorted(ticks)
+    assert abs((ticks[1] - ticks[0]) - 2_000_000) < 50     # 0.2 s in 100-ns units
+
+    r = ser.SerReader(path)
+    assert r.frames_on_disk() == N                          # trailer not miscounted as frames
+    assert r.header.frame_count == N
+    assert r.header.date_time == ticks[0] and r.header.date_time_utc == ticks[0]
+    np.testing.assert_array_equal(r.read_frame(N - 1), frames[N - 1])
+    r.close()
+
+
 if __name__ == '__main__':
     test_ser_roundtrip()
     test_ser_12bit_depth()
     test_ser_mmap_matches_io()
     test_ser_mmap_color_and_growing()
+    test_ser_timestamp_trailer()
     print("test_ser: OK")

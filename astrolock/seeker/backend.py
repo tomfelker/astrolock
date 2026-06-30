@@ -114,12 +114,15 @@ def main(argv=None):
                         "format, and it saves USB/SSD/memory bandwidth. Sim renders mono at 1/N res.")
     p.add_argument('--main-bin', type=int, default=1,
                    help="main camera NxN binning (default 1 = native full resolution)")
+    # Track PID constants. Kept from the derate branch on merge: the low-framerate gain derate now
+    # handles dynamically what the other branch's manual nerf (stronger kd/damping, smaller kii) was
+    # compensating for statically. ki=0.5, kii=0.1, damping=1.3, kd=0.0; kii stays < kp*ki (~0.92).
     p.add_argument('--track-ki', type=float, default=0.5,
                    help="tracker integral gain (carries the slew rate); kept modest to avoid oscillation")
-    p.add_argument('--track-kii', type=float, default=0.1,
+    p.add_argument('--track-kii', type=float, default=0.35,
                    help="tracker second-integral gain (0 = off): removes the residual lag against a "
                         "constant-acceleration target (satellite overhead). Keep weak -- needs "
-                        "kii < kp*ki for stability (kp*ki ~ 0.43 at the default ki/damping)")
+                        "kii < kp*ki for stability (~0.92 at the default ki=0.5/damping=1.3)")
     p.add_argument('--track-nominal-rate', type=float, default=10.0,
                    help="framerate (Hz) the track gains are characterized at: the gains are tuned here, "
                         "the lock-time self-check runs here, and --track-derate backs them off below it")
@@ -139,7 +142,7 @@ def main(argv=None):
                    help="while tracking, publish a square ROI (this many frame px, power of 2) around "
                         "the predicted target so detect can work just that window instead of the whole "
                         "frame (much higher framerate). 0 = always full-frame.")
-    p.add_argument('--track-damping', type=float, default=1.3,
+    p.add_argument('--track-damping', type=float, default=1.1,
                    help="P is derived for critical damping (kp=2*sqrt(ki)); >1 over-damps for lag margin")
     p.add_argument('--track-kd', type=float, default=0.0,
                    help="tracker derivative braking gain (on image speed above --track-max-px-s)")
