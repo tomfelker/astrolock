@@ -165,6 +165,28 @@ def test_tile_density_keeps_distant_target():
     assert any(near_star(b) for b in tiled), "the density cap should preserve the distant star"
 
 
+def test_roi_peak_track_mode():
+    # Track-mode single-peak: lock the target near the predicted centre, ignore brighter clutter
+    # outside the ROI and dimmer clutter inside it, and report nothing when the target is gone.
+    roi = [200, 150, 128]                                       # [cx, cy, size] frame px, coord_scale 1
+    kw = dict(detector='doh', bg_radius=8, psf_px=3.0, doh_sigma=0.0, snr=6.0)
+    bg = lambda: np.random.default_rng(0).random((300, 400)).astype(np.float32) * 5 + 100
+
+    def found_at(work, x, y, tol=3.0):
+        r = detect.detect_roi_peak(work, roi, 1.0, **kw)
+        return bool(r) and abs(r[0]['px'][0] - x) <= tol and abs(r[0]['px'][1] - y) <= tol
+
+    w = bg(); _add_gaussian(w, 205, 153, 4000, 2.0); _add_gaussian(w, 40, 40, 9000, 2.0)
+    assert found_at(w, 205, 153), "lock the in-ROI target, not the brighter far star"
+    w = bg(); _add_gaussian(w, 200, 150, 4000, 2.0); _add_gaussian(w, 245, 185, 3000, 2.0)
+    assert found_at(w, 200, 150), "centre bias should keep the target over a dimmer in-ROI star"
+    assert detect.detect_roi_peak(bg(), roi, 1.0, **kw) == [], "no target -> [] (lost)"
+    w = bg(); _add_gaussian(w, 205, 153, 4000, 2.0)            # half-res analysis (coord_scale 2)
+    r = detect.detect_roi_peak(w, [400, 300, 128], 2.0, **kw)
+    assert r and abs(r[0]['px'][0] - 410) <= 6 and abs(r[0]['px'][1] - 306) <= 6, "coord_scale mapping"
+    print("test_detect: roi-peak track mode OK")
+
+
 if __name__ == '__main__':
     test_detect_tracks_moving_blob()
     test_detect_rejects_extended_clutter()
@@ -172,4 +194,5 @@ if __name__ == '__main__':
     test_doh_detects_blobs_rejects_edge()
     test_doh_surface_selectable()
     test_tile_density_keeps_distant_target()
+    test_roi_peak_track_mode()
     print("test_detect: OK")
