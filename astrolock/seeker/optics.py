@@ -110,6 +110,22 @@ def configuration(sensor, optic, reducer=1.0):
     }
 
 
+def list_db(path=None):
+    """Print the catalog of sensors / optics / reducers -- the valid names for the per-role
+    --*-sensor / --*-optic / --*-reducer arguments."""
+    sensors, optics, reducers = load_db(path)
+    print("sensors:")
+    for s in sensors.values():
+        kind = s.bayer if s.bayer else ('mono' if s.mono else '?')
+        print(f"  {s.name:28s} {s.res_x}x{s.res_y}  {s.pixel_um} um  {kind}")
+    print("optics:")
+    for o in optics.values():
+        print(f"  {o.name:28s} f={o.focal_length_mm}mm  aperture={o.aperture_mm}mm")
+    print("reducers:")
+    for n, m in reducers.items():
+        print(f"  {n:28s} x{m}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Sensor/optics DB + field-of-view helper")
     p.add_argument('--db', default=None, help="path to optics_db.json (default: vendored)")
@@ -120,15 +136,7 @@ def main(argv=None):
     sensors, optics, reducers = load_db(args.db)
 
     if not (args.sensor and args.optic):
-        print("sensors:")
-        for s in sensors.values():
-            print(f"  {s.name:28s} {s.res_x}x{s.res_y}  {s.pixel_um} um")
-        print("optics:")
-        for o in optics.values():
-            print(f"  {o.name:28s} f={o.focal_length_mm}mm  aperture={o.aperture_mm}mm")
-        print("reducers:")
-        for n, m in reducers.items():
-            print(f"  {n:28s} x{m}")
+        list_db(args.db)
         print("\npass --sensor and --optic (and optionally --reducer) for a field-of-view summary.")
         return
 

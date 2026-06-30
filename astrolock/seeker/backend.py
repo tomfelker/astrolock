@@ -152,7 +152,14 @@ def main(argv=None):
     p.add_argument('--no-gui', dest='gui', action='store_false')
     p.add_argument('--duration', type=float, default=0.0, help="stop after N seconds (0 = until Ctrl-C)")
     p.add_argument('--keep', action='store_true', help="keep all captured files on exit")
+    p.add_argument('--list-optics', action='store_true',
+                   help="list the sensors / optics / reducers in the DB (the valid names for "
+                        "--{role}-sensor / --{role}-optic / --{role}-reducer) and exit")
     args = p.parse_args(argv)
+
+    if args.list_optics:
+        optics.list_db()
+        return
 
     roles = [r.strip() for r in args.roles.split(',') if r.strip()]
     detect_roles = {r.strip() for r in args.detect_roles.split(',') if r.strip()} & set(roles)
