@@ -18,7 +18,8 @@
     {"name": "Nikon D7100/D7200 (DX)", "res_x": 6000, "res_y": 4000, "pixel_um": 3.9},
     {"name": "Nikon D500/D7500 (DX)", "res_x": 5568, "res_y": 3712, "pixel_um": 4.2},
     {"name": "Classic SLR (Full Frame)", "res_x": 6000, "res_y": 4000, "pixel_um": 6.0},
-    {"name": "ZWO ASI678MC", "res_x": 3840, "res_y": 2160, "pixel_um": 2.0, "bayer": "RGGB", "source": "ZWO / Sony IMX678, 1/1.8\" color"}
+    {"name": "ZWO ASI678MC", "res_x": 3840, "res_y": 2160, "pixel_um": 2.0, "bayer": "RGGB", "source": "ZWO / Sony IMX678, 1/1.8\" color"},
+    {"name": "ZWO ASI678MM", "res_x": 3840, "res_y": 2160, "pixel_um": 2.0, "mono": true, "source": "ZWO / Sony IMX678, 1/1.8\" mono (ZWO 'MM'=mono, 'MC'=color)"}
   ],
   "optics": [
     {"name": "Generic 60x700", "focal_length_mm": 700, "aperture_mm": 60},

@@ -36,11 +36,17 @@ class Sensor:
     res_x: int
     res_y: int
     pixel_um: float
-    bayer: str = None        # Bayer mosaic pattern (e.g. 'RGGB') for a color sensor; None = mono
+    bayer: str = None        # Bayer mosaic pattern (e.g. 'RGGB') if a known color sensor
+    mono: bool = False        # explicitly flagged a mono sensor
 
     @property
     def is_color(self):
-        return self.bayer is not None
+        """True (color/Bayer), False (mono), or None when the DB doesn't say (don't guess)."""
+        if self.bayer:
+            return True
+        if self.mono:
+            return False
+        return None
 
     @property
     def chip_w_mm(self):
@@ -62,7 +68,8 @@ def load_db(path=None):
     """-> (sensors, optics, reducers): name-keyed dicts of Sensor, Optic, and float multipliers."""
     with open(path or _DEFAULT_DB) as f:
         raw = json.load(f)
-    sensors = {s['name']: Sensor(s['name'], s['res_x'], s['res_y'], s['pixel_um'], s.get('bayer'))
+    sensors = {s['name']: Sensor(s['name'], s['res_x'], s['res_y'], s['pixel_um'],
+                                 s.get('bayer'), bool(s.get('mono')))
                for s in raw['sensors']}
     optics = {o['name']: Optic(o['name'], o['focal_length_mm'], o['aperture_mm'])
               for o in raw['optics']}

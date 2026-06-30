@@ -242,11 +242,19 @@ def main(argv=None):
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
                       f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(s.pixel_um * b, feff):.3f} arcsec/px, "
                       f"render {rx}x{ry}{extra}", flush=True)
-                # Bandwidth note (only where we have positive sensor data): a color cam left unbinned
-                # while it feeds detection is wasteful -- detection bins it to mono anyway.
-                if s.is_color and b == 1 and role in detect_roles:
+                # Binning notes (only where the DB actually says color vs mono -- no guessing):
+                #  - a color cam feeding detection but left unbinned wastes bandwidth (detection bins
+                #    it to mono anyway);
+                #  - binning a mono cam is a real resolution cut (a color 2x2 ~= its debayered res, but
+                #    mono has no Bayer cell to fold in).
+                color = s.is_color
+                if color is True and b == 1 and role in detect_roles:
                     print(f"[backend] note: {role} is color ({s.bayer}) and unbinned but feeds detection; "
                           f"it'll be binned to mono for detection anyway -- --{role}-bin 2 halves bandwidth",
+                          flush=True)
+                elif color is False and b > 1:
+                    print(f"[backend] note: {role} is mono ({sname}) binned {b}x{b} -- a true 1/{b} "
+                          f"resolution cut (no Bayer cell to fold in); fine if you're not resolution-limited",
                           flush=True)
         except KeyError as e:
             print(f"[backend] {role}: unknown optics {e}; using fallback plate scale", flush=True)
