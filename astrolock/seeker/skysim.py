@@ -81,6 +81,19 @@ def _rot_y(a):
     return torch.tensor([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=torch.float32)
 
 
+def _next_fast_len(n):
+    """Smallest m >= n whose only prime factors are 2,3,5,7 -- a size the FFT is fast at. Padding
+    H+2*rad up to one of these avoids the slow large-prime-factor transforms (e.g. 2168 -> 2187)."""
+    while True:
+        m = n
+        for p in (2, 3, 5, 7):
+            while m % p == 0:
+                m //= p
+        if m == 1:
+            return n
+        n += 1
+
+
 def ensure_cache(cache_dir='data/skyfield_cache'):
     """Download the skyfield ephemeris + Hipparcos catalog into the cache if missing, serially.
     Call this once (e.g. from the orchestrator) before launching multiple SkySim processes: they
@@ -138,6 +151,7 @@ class SkySim:
         self._star_interval = c.star_recompute_s   # cached-star recompute cadence (+ jitter)
         self._star_cache = None
         self._next_star_t = 0.0
+        self._otf = None                           # PSF transfer function, built lazily (see _psf)
         # FoV culling radius: half-diagonal of the frame + a margin for slew during the exposure
         half_x = math.atan(c.width * c.pixel_pitch_um * 1e-3 / (2 * c.focal_length_mm))
         half_y = math.atan(c.height * c.pixel_pitch_um * 1e-3 / (2 * c.focal_length_mm))
@@ -261,19 +275,36 @@ class SkySim:
                 continue
             flat.index_add_(0, (yi[ok] * w + xi[ok]), flux[ok] * wgt[ok])
 
-    def _psf(self, fb):
-        # Gaussian PSF as two 1D convolutions (separable): (2*rad+1) + (2*rad+1) MACs/pixel instead
-        # of (2*rad+1)^2 for the full 2D kernel -- ~4.5x fewer at the default sigma, and the PSF
-        # dominates the render. Numerically identical to the outer-product 2D kernel.
+    def _psf_kernel(self):
+        """The PSF as a small 2D image (sum 1), centred. Gaussian for now; a measured/aberrated
+        (non-separable) PSF drops in right here -- the FFT path below convolves any kernel at the
+        same cost, so a real PSF is a strictly bigger win over spatial convolution."""
         sigma = self.cfg.psf_sigma_px
         rad = max(1, int(round(3 * sigma)))
-        ax = torch.arange(-rad, rad + 1, dtype=torch.float32, device=fb.device)
+        ax = torch.arange(-rad, rad + 1, dtype=torch.float32, device=self.device)
         k1 = torch.exp(-(ax ** 2) / (2 * sigma ** 2))
         k1 /= k1.sum()
-        x = fb[None, None]
-        x = torch.nn.functional.conv2d(x, k1.view(1, 1, 1, -1), padding=(0, rad))   # horizontal
-        x = torch.nn.functional.conv2d(x, k1.view(1, 1, -1, 1), padding=(rad, 0))   # vertical
-        return x[0, 0]
+        return torch.outer(k1, k1), rad
+
+    def _build_otf(self, h, w):
+        """Precompute the PSF transfer function (FFT of the zero-padded kernel) for an (h, w) frame.
+        Constant per camera, so this runs once; render-time PSF is then one rfft2 + multiply + irfft2."""
+        kern, rad = self._psf_kernel()
+        sz = (_next_fast_len(h + 2 * rad), _next_fast_len(w + 2 * rad))   # >= linear-conv length, fast size
+        self._otf = torch.fft.rfft2(kern, s=sz)
+        self._otf_sz, self._otf_rad, self._otf_hw = sz, rad, (h, w)
+
+    def _psf(self, fb):
+        # Convolve via FFT with the precomputed OTF: cost is ~independent of kernel size (unlike
+        # spatial/separable conv), so it's faster even for the small Gaussian and a big win for a
+        # large or non-separable (real) PSF. Zero-pad to a fast size to dodge slow prime-factor FFTs;
+        # crop the centred 'same' region. Output matches the spatial conv to ~1e-6.
+        h, w = fb.shape
+        if self._otf is None or self._otf_hw != (h, w):
+            self._build_otf(h, w)
+        out = torch.fft.irfft2(torch.fft.rfft2(fb, s=self._otf_sz) * self._otf, s=self._otf_sz)
+        r = self._otf_rad
+        return out[r:r + h, r:r + w]
 
     def render(self, seconds_from_epoch, enc_az_rad, enc_alt_rad,
                rate_az_rad_s=0.0, rate_alt_rad_s=0.0, exposure_s=0.05, substeps=6):
