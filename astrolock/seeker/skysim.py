@@ -257,13 +257,18 @@ class SkySim:
             flat.index_add_(0, (yi[ok] * w + xi[ok]), flux[ok] * wgt[ok])
 
     def _psf(self, fb):
+        # Gaussian PSF as two 1D convolutions (separable): (2*rad+1) + (2*rad+1) MACs/pixel instead
+        # of (2*rad+1)^2 for the full 2D kernel -- ~4.5x fewer at the default sigma, and the PSF
+        # dominates the render. Numerically identical to the outer-product 2D kernel.
         sigma = self.cfg.psf_sigma_px
         rad = max(1, int(round(3 * sigma)))
         ax = torch.arange(-rad, rad + 1, dtype=torch.float32, device=fb.device)
         k1 = torch.exp(-(ax ** 2) / (2 * sigma ** 2))
         k1 /= k1.sum()
-        kern = torch.outer(k1, k1)[None, None]
-        return torch.nn.functional.conv2d(fb[None, None], kern, padding=rad)[0, 0]
+        x = fb[None, None]
+        x = torch.nn.functional.conv2d(x, k1.view(1, 1, 1, -1), padding=(0, rad))   # horizontal
+        x = torch.nn.functional.conv2d(x, k1.view(1, 1, -1, 1), padding=(rad, 0))   # vertical
+        return x[0, 0]
 
     def render(self, seconds_from_epoch, enc_az_rad, enc_alt_rad,
                rate_az_rad_s=0.0, rate_alt_rad_s=0.0, exposure_s=0.05, substeps=6):
