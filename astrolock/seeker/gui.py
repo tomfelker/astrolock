@@ -471,6 +471,30 @@ def main(argv=None):
                     dpg.draw_line((X + ex * (r + S(6)), Y + ey * (r + S(6))),
                                   (X + ex * S(4), Y + ey * S(4)), color=col, thickness=th,
                                   parent=v['track_layer'])
+            elif (stt and stt.get('tracking') and stt.get('target_px')
+                  and stt.get('track_role') and stt.get('track_role') != role):
+                # Pipper at the guide cam's reported target *direction*, mapped into THIS view through
+                # the same gnomonic projection as the render (co-aligned boresights assumed, like the
+                # FoV boxes). On a higher-mag main cam this magnifies any reconstruction jitter, so it
+                # reads as a noise gauge: a rock-steady pipper = clean reconstruction, a dancing one = noisy.
+                optx = stt.get('optics') or {}
+                src, sf, mf = views.get(stt['track_role']), optx.get(stt['track_role']), optx.get(role)
+                if src is not None and sf and mf:
+                    tx, ty = stt['target_px']
+                    sfx = (src['w'] / 2.0) / math.tan(math.radians(sf['fov_x_deg'] / 2.0))   # guide focal (px)
+                    sfy = (src['h'] / 2.0) / math.tan(math.radians(sf['fov_y_deg'] / 2.0))
+                    mfx = (v['w'] / 2.0) / math.tan(math.radians(mf['fov_x_deg'] / 2.0))       # this view's focal (px)
+                    mfy = (v['h'] / 2.0) / math.tan(math.radians(mf['fov_y_deg'] / 2.0))
+                    mx = v['w'] / 2.0 + (tx - src['w'] / 2.0) / sfx * mfx    # tan(angle) preserved across cams
+                    my = v['h'] / 2.0 + (ty - src['h'] / 2.0) / sfy * mfy
+                    X, Y = mx * v['ox'], my * v['oy']
+                    col = (60, 220, 255, 255)                                # cyan (vs the guide's magenta)
+                    r = S(10)
+                    dpg.draw_circle((X, Y), S(3), color=col, thickness=1.0, parent=v['track_layer'])
+                    for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        dpg.draw_line((X + ex * (r + S(5)), Y + ey * (r + S(5))),
+                                      (X + ex * S(3), Y + ey * S(3)), color=col, thickness=1.0,
+                                      parent=v['track_layer'])
 
             # Nested camera-FoV rectangles: each *narrower* camera's footprint inside this view
             # (e.g. the main cam inside the wide guide). Centred -- assumes co-aligned boresights.
