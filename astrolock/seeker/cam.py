@@ -196,42 +196,22 @@ def _open_sky(args, state_path=None, mount_path=None):
     a bright star.
     """
     import math as _math
+    import torch
     from astrolock.seeker.skysim import SkySim, SkySimConfig
+    from astrolock.seeker.ephemeris import SkyEphemeris
 
     cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
-                       focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
-                       star_recompute_s=args.sky_star_interval)
-    if args.sky_epoch:
-        cfg.epoch_utc = args.sky_epoch
-    if args.sky_lat is not None:
-        cfg.lat_deg = args.sky_lat
-    if args.sky_lon is not None:
-        cfg.lon_deg = args.sky_lon
-    if args.sky_elev is not None:
-        cfg.elev_m = args.sky_elev
-    if args.sky_tle_file:
-        lines = [ln.strip() for ln in open(args.sky_tle_file) if ln.strip()]
-        name, l1, l2 = (lines[0], lines[1], lines[2]) if len(lines) >= 3 else ('TARGET', lines[0], lines[1])
-        cfg.target_tle = (l1, l2, name)
-        cfg.target_mag = args.sky_target_mag
-    sim = SkySim(cfg)
+                       focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um)
+    sim = SkySim(cfg)                                   # render-only; propagation lives in sky_sim.py
+    ephem = SkyEphemeris(args.sky_ephemeris)            # shared, system-clock-timed source directions
     fov_x = _math.degrees(2 * _math.atan(cfg.width * cfg.pixel_pitch_um * 1e-3 / (2 * cfg.focal_length_mm)))
 
-    if args.sky_az_deg is None or args.sky_alt_deg is None:
-        import torch
-        alt, az, mag = sim.sources_altaz(sim._sf_time(0.0))
-        if sim.satellite is not None:
-            az0, alt0 = float(az[-1]), float(alt[-1])      # point at the satellite target (last source)
-        else:
-            i = int(torch.argmin(mag))                     # just the brightest source (no alt limit)
-            az0, alt0 = float(az[i]), float(alt[i])
-    else:
-        az0, alt0 = _math.radians(args.sky_az_deg), _math.radians(args.sky_alt_deg)
+    # Fallback pose only for scripted (non-follow) runs; the mount drives it in closed loop.
+    az0 = _math.radians(args.sky_az_deg) if args.sky_az_deg is not None else 0.0
+    alt0 = _math.radians(args.sky_alt_deg) if args.sky_alt_deg is not None else _math.radians(45.0)
     rate_az, rate_alt = _math.radians(args.sky_rate_az), _math.radians(args.sky_rate_alt)
-    tgt = f" target={cfg.target_tle[2]}(mag {cfg.target_mag})" if cfg.target_tle else ""
-    print(f"[cam] sky sim {cfg.width}x{cfg.height} FoV {fov_x:.1f}deg epoch {cfg.epoch_utc} "
-          f"point=({_math.degrees(az0):.2f},{_math.degrees(alt0):.2f})deg "
-          f"slew=({args.sky_rate_az},{args.sky_rate_alt})deg/s exp={args.sky_exposure_s}s{tgt}", flush=True)
+    print(f"[cam] sky sim {cfg.width}x{cfg.height} FoV {fov_x:.1f}deg ephemeris={args.sky_ephemeris} "
+          f"exp={args.sky_exposure_s}s substeps={args.sky_substeps}", flush=True)
 
     # Prefer the sim mount's ground-truth trajectory (piecewise-linear, exact) over the backend's
     # reconstructed estimate. The mount sidecar uses 'az_deg'/'t_mono_ns'; the legacy state file
@@ -245,38 +225,37 @@ def _open_sky(args, state_path=None, mount_path=None):
     kt = 't_mono_ns' if follow_mount else 'enc_t_mono_ns'
     ahead_cap = 5.0 if follow_mount else 0.2
     pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt, 'enc_t': None}
-    t0 = time.perf_counter()
+    exp, S = args.sky_exposure_s, args.sky_substeps
+    fr = (torch.arange(S, dtype=torch.float64) + 0.5) / S      # (S,) substep mid-fractions
+    start_ns = time.perf_counter_ns()
 
     def capture():
-        # Sim time is wall-clock from t0: if rendering lags, that's just a lower effective
-        # framerate (we render the latest mount state), exactly like a slow real camera.
-        t = time.perf_counter() - t0
+        # One shared system clock (perf_counter_ns / QPC) times everything -- the exposure substeps,
+        # the mount-pose extrapolation, and the frame stamp -- so both cameras place a fast satellite
+        # at the same world instant (no per-process epoch drift).
+        now_ns = time.perf_counter_ns()
         if tailer is not None:
-            for rec in tailer.poll():            # latest trajectory anchor wins
+            for rec in tailer.poll():            # latest mount trajectory anchor wins
                 pose['az'] = _math.radians(rec.get(ka, _math.degrees(pose['az'])))
                 pose['alt'] = _math.radians(rec.get(kl, _math.degrees(pose['alt'])))
                 pose['raz'] = _math.radians(rec.get('rate_az_deg_s', 0.0))
                 pose['ralt'] = _math.radians(rec.get('rate_alt_deg_s', 0.0))
                 pose['enc_t'] = rec.get(kt)
-            # The anchor's angle is valid at its timestamp; extrapolate linearly to *now* (the
-            # exposure) at the anchor's rate, so the rendered pose isn't stale by the
-            # mount->cam latency. Same monotonic clock (QPC) both ends.
             ahead = 0.0
-            if pose['enc_t']:
-                ahead = min(ahead_cap, max(0.0, time.perf_counter() - pose['enc_t'] * 1e-9))
+            if pose['enc_t']:                    # extrapolate the anchor pose to now (mount->cam latency)
+                ahead = min(ahead_cap, max(0.0, now_ns * 1e-9 - pose['enc_t'] * 1e-9))
             az = pose['az'] + pose['raz'] * ahead
             alt = pose['alt'] + pose['ralt'] * ahead
         else:
-            az, alt = az0 + rate_az * t, alt0 + rate_alt * t
-        frame = sim.render(t, az, alt, pose['raz'], pose['ralt'],
-                           exposure_s=args.sky_exposure_s, substeps=args.sky_substeps)
-        # Stamp at the exposure *midpoint*, not at write-completion: render integrates [t, t+exposure]
-        # with content sampled at t+exposure/2, and (t0 + t) is capture start on the perf_counter clock.
-        # The tracker reconstructs the mount pose at this timestamp, so a stamp that disagrees with the
-        # rendered pose's time biases the reconstructed direction by mount_rate*dt -- a constant
-        # pointing offset while slewing (target sits off-centre though the tracker thinks it's locked).
-        mid_ns = int((t0 + t + 0.5 * args.sky_exposure_s) * 1e9)
-        return frame, mid_ns
+            elapsed = (now_ns - start_ns) * 1e-9
+            az, alt = az0 + rate_az * elapsed, alt0 + rate_alt * elapsed
+        # Source directions at each exposure substep, looked up on the shared clock. Stars are ~static
+        # across the substeps; the satellite points move -- both interpolated from the same ephemeris.
+        sub_t = now_ns + (fr * exp * 1e9).to(torch.int64)    # keep now_ns exact (int64, not float64)
+        ephem.update()
+        dirs, mags = ephem.dirs_at(sub_t)
+        frame = sim.render(az, alt, pose['raz'], pose['ralt'], dirs, mags, exposure_s=exp, substeps=S)
+        return frame, int(now_ns + 0.5 * exp * 1e9)           # stamp at the exposure midpoint
 
     meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
     return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta
@@ -373,6 +352,8 @@ def main(argv=None):
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
     p.add_argument('--sky-star-interval', type=float, default=1.0,
                    help="sky: recompute star positions at most this often (s); speeds up rendering")
+    p.add_argument('--sky-ephemeris', default=None,
+                   help="sky: shared source-direction ephemeris (JSONL) published by sky_sim")
     p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
                    help="sky: TLE file (2 or 3 lines) for a satellite target (default: the ISS)")
     p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky: satellite target magnitude")

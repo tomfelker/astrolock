@@ -1,55 +1,64 @@
 """
-Sky simulator sanity: a star the encoder points at lands at the boresight, and other
-bright in-frame stars land where the projection predicts.
+Sky renderer + ephemeris sanity (no network / no Skyfield -- propagation lives in sky_sim now):
 
-Requires Skyfield + torch, and a one-time network download (de421 ephemeris + Hipparcos
-catalog) cached under data/skyfield_cache. Run directly:
+  - a source direction at the boresight lands at image centre; an off-axis source lands at its
+    gnomonic-projected pixel.
+  - the ephemeris lerps a target's direction between anchors.
 
     python -m astrolock.seeker.tests.test_skysim
 """
 
 import math
+import os
+import tempfile
 
 import numpy as np
 import torch
 
 from astrolock.seeker.skysim import SkySim, SkySimConfig
+from astrolock.seeker.ephemeris import SkyEphemeris, anchor_record
+from astrolock.seeker.sidecar import JsonlWriter
 
 
-def test_star_projects_to_boresight():
-    cfg = SkySimConfig()                       # level tripod, no offsets, image-center boresight
+def test_source_projects_to_boresight():
+    cfg = SkySimConfig(width=512, height=512)      # level tripod, no offsets, image-center boresight
     sim = SkySim(cfg)
-
-    t = sim._sf_time(0.0)
-    alt, az, mag = sim.sources_altaz(t)        # torch tensors
-    up = alt > math.radians(40)
-    assert bool(up.any()), "no stars above 40 deg at the configured epoch/location"
-    masked = torch.where(up, mag, torch.full_like(mag, float('inf')))
-    i = int(torch.argmin(masked))              # brightest star well above the horizon
-
-    frame = sim.render(0.0, float(az[i]), float(alt[i]), exposure_s=0.2, substeps=1)
+    enc_az, enc_alt = math.radians(30.0), math.radians(50.0)
+    b, A, L = sim.boresight_basis(enc_az, enc_alt)     # (3,) each
     cx, cy = cfg.width // 2, cfg.height // 2
 
+    # a source exactly at the boresight -> image centre
+    dirs = b.view(1, 1, 3).contiguous()
+    frame = sim.render(enc_az, enc_alt, 0.0, 0.0, dirs, torch.tensor([2.0]), exposure_s=0.2, substeps=1)
     win = frame[cy - 8:cy + 9, cx - 8:cx + 9]
     assert int(win.max()) > 1000, f"no bright peak at boresight: {int(win.max())}"
     ly, lx = np.unravel_index(int(win.argmax()), win.shape)
-    assert abs(lx - 8) <= 3 and abs(ly - 8) <= 3, f"peak off-center at ({lx},{ly})"
+    assert abs(lx - 8) <= 2 and abs(ly - 8) <= 2, f"boresight peak off-center at ({lx},{ly})"
 
-    # An off-center bright star should appear at its projected pixel.
-    b, A, L = sim.boresight_basis(float(az[i]), float(alt[i]))
-    px, py, vis = sim.project(alt, az, b, A, L)
-    px, py, vis, mag_n = px.numpy(), py.numpy(), vis.numpy(), mag.numpy()
-    inframe = (vis & (px > 30) & (px < cfg.width - 30)
-               & (py > 30) & (py < cfg.height - 30) & (mag_n < 4.0))
-    inframe[i] = False
-    js = np.where(inframe)[0]
-    if len(js):
-        j = int(js[mag_n[js].argmin()])
-        x, y = int(round(px[j])), int(round(py[j]))
-        patch = frame[y - 5:y + 6, x - 5:x + 6]
-        assert int(patch.max()) > 300, f"no flux at projected star: mag {mag_n[j]:.1f}, {int(patch.max())}"
+    # a source 0.5 deg toward image-right (A) -> at cx + f_px*tan(0.5 deg), same row
+    off = math.radians(0.5)
+    d2 = (b * math.cos(off) + A * math.sin(off)).view(1, 1, 3).contiguous()
+    frame2 = sim.render(enc_az, enc_alt, 0.0, 0.0, d2, torch.tensor([2.0]), exposure_s=0.2, substeps=1)
+    py, px = np.unravel_index(int(frame2.argmax()), frame2.shape)
+    exp_x = cx + sim.f_px * math.tan(off)
+    assert abs(px - exp_x) <= 3, f"off-axis peak at x={px}, expected {exp_x:.1f}"
+    assert abs(py - cy) <= 3, f"off-axis peak drifted in y: {py}"
+
+
+def test_ephemeris_lerp():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, 'eph.jsonl')
+    w = JsonlWriter(path)
+    w.append(anchor_record('a', 1.0, [1_000_000_000, 3_000_000_000], [[1, 0, 0], [0, 1, 0]]))
+    w.close()
+    e = SkyEphemeris(path)
+    e.update()
+    dirs, _ = e.dirs_at(torch.tensor([2_000_000_000], dtype=torch.int64))   # midway
+    v = dirs[0, 0].tolist()
+    assert abs(v[0] - 0.70711) < 0.01 and abs(v[1] - 0.70711) < 0.01 and abs(v[2]) < 0.01, v
 
 
 if __name__ == '__main__':
-    test_star_projects_to_boresight()
+    test_source_projects_to_boresight()
+    test_ephemeris_lerp()
     print("test_skysim: OK")

@@ -218,17 +218,15 @@ def main(argv=None):
     msite = mount.get_site()        # GPS/site comes from the mount; it drives the sky-sim camera
 
     sky_args = []
+    ephemeris_path = os.path.join(session_dir, f"{ts}_ephemeris.jsonl")   # sky_sim publishes here
     if args.source == 'sky':
         # Sim cams follow the mount's true trajectory; with a real mount (no sidecar) fall back to
-        # the backend's published estimate.
+        # the backend's published estimate. Sky *positions* come from the shared sky_sim ephemeris
+        # (one propagator, one system clock) -- not from each cam, which used to drift apart.
         follow = '--sky-follow-mount' if args.mount == 'sim' else '--sky-follow-state'
         sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                     '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
-                    '--sky-lat', str(msite['lat_deg']), '--sky-lon', str(msite['lon_deg']),
-                    '--sky-elev', str(msite['elev_m']), '--sky-epoch', str(msite['epoch_utc']),
-                    follow]
-        if args.sky_tle_file:
-            sky_args += ['--sky-tle-file', args.sky_tle_file, '--sky-target-mag', str(args.sky_target_mag)]
+                    '--sky-ephemeris', ephemeris_path, follow]
     playback_args = (['--playback-ser', args.playback_ser, '--playback-speed', str(args.playback_speed)]
                      + (['--playback-loop'] if args.playback_loop else [])
                      if args.source == 'playback' and args.playback_ser else [])
@@ -346,12 +344,22 @@ def main(argv=None):
     # otherwise race to download de421.bsp / hipparcos into the shared cache and one loses the
     # rename (WinError 5) -- which is what crashed both sim cams in a fresh worktree. Best-effort:
     # if it fails, the cams fall back to their own (racy) download exactly as before.
+    sky_sim_proc = None
     if any(s == 'sky' for s in sources.values()):
         try:
             from astrolock.seeker import skysim
             skysim.ensure_cache()
         except Exception as e:
             print(f"[backend] ephemeris pre-warm skipped: {e}", flush=True)
+        # One sky_sim process propagates stars + satellite and publishes their directions on the
+        # shared system clock, so every camera reads identical positions (fixes the two-cam drift).
+        ss_args = ['--out', ephemeris_path, '--lat', str(msite['lat_deg']),
+                   '--lon', str(msite['lon_deg']), '--elev', str(msite['elev_m']),
+                   '--epoch', str(msite['epoch_utc']), '--stop-file', stop_file]
+        if args.sky_tle_file:
+            ss_args += ['--tle-file', args.sky_tle_file, '--target-mag', str(args.sky_target_mag)]
+        sky_sim_proc = _spawn('astrolock.seeker.sky_sim', ss_args)
+        print(f"[backend] sky_sim -> {ephemeris_path}", flush=True)
 
     print(f"[backend] detect roles: {sorted(detect_roles) or 'none'}", flush=True)
     for role in roles:
@@ -672,7 +680,7 @@ def main(argv=None):
         # Make sure every child is fully dead before cleanup: a still-terminating cam/detect holds
         # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow
         # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
-        _reap(list(cam_procs.values()) + list(detect_procs.values()) + [gui_proc])
+        _reap(list(cam_procs.values()) + list(detect_procs.values()) + [gui_proc, sky_sim_proc])
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
         print("[backend] done", flush=True)
