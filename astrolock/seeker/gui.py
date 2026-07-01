@@ -433,6 +433,29 @@ def main(argv=None):
             for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 dpg.draw_line((X + ex * (r + S(6)), Y + ey * (r + S(6))), (X + ex * S(4), Y + ey * S(4)),
                               color=col, thickness=1.0, parent=f"L_trk_{name}")
+        elif (stt and stt.get('tracking') and stt.get('target_px')
+              and stt.get('track_role') and stt.get('track_role') != role):
+            # Pipper at the *other* cam's target direction, mapped into this view through the same
+            # gnomonic projection as the FoV boxes (co-aligned boresights assumed). On the higher-mag
+            # main view it magnifies any reconstruction jitter, so it reads as a noise gauge: steady =
+            # clean reconstruction, dancing = noisy.
+            optx = stt.get('optics') or {}
+            src, sf, mf = cams.get(stt['track_role']), optx.get(stt['track_role']), optx.get(role)
+            if src is not None and sf and mf:
+                gtx = stt['target_px'][0] * src['ox']            # guide target -> its texture space
+                gty = stt['target_px'][1] * src['oy']
+                sfx = (src['w'] / 2.0) / math.tan(math.radians(sf['fov_x_deg'] / 2.0))   # guide focal (px)
+                sfy = (src['h'] / 2.0) / math.tan(math.radians(sf['fov_y_deg'] / 2.0))
+                mfx = (cam['w'] / 2.0) / math.tan(math.radians(mf['fov_x_deg'] / 2.0))   # this view's focal
+                mfy = (cam['h'] / 2.0) / math.tan(math.radians(mf['fov_y_deg'] / 2.0))
+                mtx = cam['w'] / 2.0 + (gtx - src['w'] / 2.0) / sfx * mfx                # tan(angle) preserved
+                mty = cam['h'] / 2.0 + (gty - src['h'] / 2.0) / sfy * mfy
+                X, Y = offx + mtx * scale, offy + mty * scale
+                col, r = (60, 220, 255, 255), S(10)              # cyan (vs the guide's magenta)
+                dpg.draw_circle((X, Y), S(3), color=col, thickness=1.0, parent=f"L_trk_{name}")
+                for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    dpg.draw_line((X + ex * (r + S(5)), Y + ey * (r + S(5))), (X + ex * S(3), Y + ey * S(3)),
+                                  color=col, thickness=1.0, parent=f"L_trk_{name}")
 
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
         if dw > SW + 1:

@@ -152,6 +152,20 @@ def main(argv=None):
                    help="velocity-estimate smoothing per frame (0 = none/trust new; higher = smoother)")
     p.add_argument('--track-gate-px', type=float, default=80.0, help="max px to associate a blob to the target")
     p.add_argument('--track-lost-s', type=float, default=1.5, help="give up tracking after this long unmatched")
+    p.add_argument('--track-mode', default='sky', choices=['pixel', 'sky'],
+                   help="sky: TargetModel + min-time-intercept servo (default); pixel: old PID pixel-space loop")
+    p.add_argument('--track-rate-smoothing-s', type=float, default=0.5,
+                   help="sky: EMA time constant for the target angular-velocity estimate "
+                        "(bigger = smoother but laggier rate; smaller = snappier but noisier)")
+    p.add_argument('--track-min-intercept-s', type=float, default=1.0,
+                   help="sky: min intercept time; also sets the position-correction stiffness (P ~ 1/this)")
+    p.add_argument('--track-command-latency-s', type=float, default=0.0,
+                   help="sky: assumed delay before a rate command takes effect (s). ~0 for a direct "
+                        "mount; only worth setting for a slow serial link (e.g. 9600-baud NexStar)")
+    p.add_argument('--track-max-horizon-s', type=float, default=8.0,
+                   help="sky: declare the target uncatchable if no intercept is reachable within this long")
+    p.add_argument('--track-debug', action='store_true',
+                   help="sky: print per-frame commanded vs measured axis rates and target offset")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
     p.add_argument('--track-zenith-zone-deg', type=float, default=3.0,
@@ -452,17 +466,31 @@ def main(argv=None):
                 rpp = rad_per_px_by_role.get(role, rad_per_px) * frame_binning(role)
                 ft = frame_time_s(role, latest_det_index[role])    # clock off the frame, not wall time
                 if ft is not None:
-                    tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
-                                           ki=args.track_ki, damping=args.track_damping, kd=args.track_kd,
-                                           kii=args.track_kii, nominal_rate_hz=args.track_nominal_rate,
-                                           derate=args.track_derate,
-                                           lock_max_drift_rate=args.track_lock_max_drift_rate,
-                                           lock_min_time=args.track_lock_min_time,
-                                           gate_px=args.track_gate_px, lost_s=args.track_lost_s,
-                                           vel_smoothing=args.track_vel_smoothing,
-                                           max_track_px_s=args.track_max_px_s, max_rate_rad_s=max_rate,
-                                           sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
-                    tracker.start(float(px[0]), float(px[1]), ft)
+                    if args.track_mode == 'sky':
+                        from astrolock.seeker.skytracker import SkyTracker
+                        from astrolock.seeker.target_model import EmaAngularVelModel
+                        tracker = SkyTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
+                                             max_rate_rad_s=max_rate,
+                                             model=EmaAngularVelModel(smoothing_s=args.track_rate_smoothing_s),
+                                             min_intercept_s=args.track_min_intercept_s,
+                                             command_latency_s=args.track_command_latency_s,
+                                             max_horizon_s=args.track_max_horizon_s,
+                                             gate_px=args.track_gate_px, lost_s=args.track_lost_s,
+                                             lock_min_time=args.track_lock_min_time,
+                                             sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
+                        tracker.start(float(px[0]), float(px[1]), ft, mount.get_state())
+                    else:
+                        tracker = PixelTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
+                                               ki=args.track_ki, damping=args.track_damping, kd=args.track_kd,
+                                               kii=args.track_kii, nominal_rate_hz=args.track_nominal_rate,
+                                               derate=args.track_derate,
+                                               lock_max_drift_rate=args.track_lock_max_drift_rate,
+                                               lock_min_time=args.track_lock_min_time,
+                                               gate_px=args.track_gate_px, lost_s=args.track_lost_s,
+                                               vel_smoothing=args.track_vel_smoothing,
+                                               max_track_px_s=args.track_max_px_s, max_rate_rad_s=max_rate,
+                                               sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
+                        tracker.start(float(px[0]), float(px[1]), ft)
                     track_seen_index = latest_det_index[role]
                     tracking = True
                     coasting = False
@@ -522,6 +550,8 @@ def main(argv=None):
             update_detections()
 
             st = mount.get_state()
+            if tracking and tracker is not None and getattr(tracker, 'owns_ik', False):
+                tracker.push_mount(st)        # build the mount-pose history at the full loop rate
             track_status = None
             if tracking and tracker is not None and not estop:
                 role = track_role
@@ -529,15 +559,27 @@ def main(argv=None):
                     ft = frame_time_s(role, latest_det_index[role])
                     if ft is not None:                            # ...clocked by its capture time
                         track_seen_index = latest_det_index[role]
-                        raz, ralt, track_status, tpx = tracker.update(latest_blobs[role], True, ft)
-                        # Gimbal compensation: the image's response to an azimuth slew scales
-                        # with cos(alt) -- it shrinks toward the zenith and reverses past it. So
-                        # divide the az command by cos(alt) to keep the az loop gain constant (and
-                        # correctly signed above 90 deg). Inside the zenith zone, just zero az:
-                        # chasing the singularity is futile and would fling the mount around;
-                        # altitude tips over and we re-acquire once the target leaves the zone.
-                        ca = math.cos(st['alt_rad'])
-                        raz = 0.0 if abs(ca) < zenith_zone_cos else raz / ca
+                        if getattr(tracker, 'owns_ik', False):
+                            # SkyTracker returns final axis rates (it owns the alt-az IK and its own
+                            # pole handling), so no external cos(alt) compensation here.
+                            raz, ralt, track_status, tpx = tracker.update(
+                                st, latest_blobs[role], True, ft, now)
+                            if args.track_debug:
+                                print(f"[track] cmd az {math.degrees(raz):+6.2f} alt {math.degrees(ralt):+6.2f} | "
+                                      f"meas az {math.degrees(st['rate_az_rad_s']):+6.2f} "
+                                      f"alt {math.degrees(st['rate_alt_rad_s']):+6.2f} deg/s | "
+                                      f"off ({tpx[0] - tracker.cx:+5.0f},{tpx[1] - tracker.cy:+5.0f})px | "
+                                      f"alt {math.degrees(st['alt_rad']):5.1f} | {track_status}", flush=True)
+                        else:
+                            raz, ralt, track_status, tpx = tracker.update(latest_blobs[role], True, ft)
+                            # Gimbal compensation: the image's response to an azimuth slew scales
+                            # with cos(alt) -- it shrinks toward the zenith and reverses past it. So
+                            # divide the az command by cos(alt) to keep the az loop gain constant (and
+                            # correctly signed above 90 deg). Inside the zenith zone, just zero az:
+                            # chasing the singularity is futile and would fling the mount around;
+                            # altitude tips over and we re-acquire once the target leaves the zone.
+                            ca = math.cos(st['alt_rad'])
+                            raz = 0.0 if abs(ca) < zenith_zone_cos else raz / ca
                         mount.set_rates(raz, ralt)
                         # On 'track' and 'coast' the target estimate keeps moving, so keep publishing it
                         # (the ROI follows, so detect keeps searching and can re-acquire during coast).

@@ -268,8 +268,15 @@ def _open_sky(args, state_path=None, mount_path=None):
             alt = pose['alt'] + pose['ralt'] * ahead
         else:
             az, alt = az0 + rate_az * t, alt0 + rate_alt * t
-        return sim.render(t, az, alt, pose['raz'], pose['ralt'],
-                          exposure_s=args.sky_exposure_s, substeps=args.sky_substeps)
+        frame = sim.render(t, az, alt, pose['raz'], pose['ralt'],
+                           exposure_s=args.sky_exposure_s, substeps=args.sky_substeps)
+        # Stamp at the exposure *midpoint*, not at write-completion: render integrates [t, t+exposure]
+        # with content sampled at t+exposure/2, and (t0 + t) is capture start on the perf_counter clock.
+        # The tracker reconstructs the mount pose at this timestamp, so a stamp that disagrees with the
+        # rendered pose's time biases the reconstructed direction by mount_rate*dt -- a constant
+        # pointing offset while slewing (target sits off-centre though the tracker thinks it's locked).
+        mid_ns = int((t0 + t + 0.5 * args.sky_exposure_s) * 1e9)
+        return frame, mid_ns
 
     meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
     return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta
@@ -455,8 +462,11 @@ def main(argv=None):
                         break
 
                     loop_start = time.perf_counter()
+                    cap_t_ns = None                            # a source may supply the true frame time
                     if capture is not None:
                         frame = capture()
+                        if isinstance(frame, tuple):           # (frame, t_mono_ns) -- e.g. sim exposure midpoint
+                            frame, cap_t_ns = frame
                         if frame is None:
                             if args.source == 'playback' and not args.playback_loop:
                                 print(f"[cam:{args.role}] playback complete", flush=True)
@@ -469,7 +479,7 @@ def main(argv=None):
 
                     writer.write_frame(frame)                 # pixels flushed
                     sidecar.append({                           # then commit-point line
-                        't_mono_ns': time.perf_counter_ns(),
+                        't_mono_ns': cap_t_ns if cap_t_ns is not None else time.perf_counter_ns(),
                         't_utc': session_mod.utc_now_iso(),
                         'important': bool(cfg['important']),
                         **frame_meta,                          # bin + roi (sensor->frame mapping)
