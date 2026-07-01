@@ -92,6 +92,26 @@ def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0), device=None):
     return w, h, rgba.cpu().numpy()                                     # CPU only at the end, for dpg
 
 
+def draw_box(rgba, cx, cy, half, color):
+    """Draw a hollow square (work-image coords) into an (h,w,4) rgba array. The live GUI draws
+    overlays as dpg vectors, but this stays as a pure helper for baking boxes into saved frames."""
+    h, w = rgba.shape[:2]
+    x0, x1 = int(round(cx - half)), int(round(cx + half))
+    y0, y1 = int(round(cy - half)), int(round(cy + half))
+    x0, x1 = max(0, x0), min(w - 1, x1)
+    y0, y1 = max(0, y0), min(h - 1, y1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    rgba[y0, x0:x1 + 1] = color
+    rgba[y1, x0:x1 + 1] = color
+    rgba[y0:y1 + 1, x0] = color
+    rgba[y0:y1 + 1, x1] = color
+
+
+_MOVING = np.array([0.2, 1.0, 0.2, 1.0], dtype=np.float32)
+_STATIC = np.array([1.0, 0.8, 0.2, 1.0], dtype=np.float32)
+
+
 ROLES = ('guide', 'main')      # the two fixed roles: a wide guide cam that points a narrow main cam.
                                # Either may be absent/unconfigured; we don't add roles dynamically.
 
