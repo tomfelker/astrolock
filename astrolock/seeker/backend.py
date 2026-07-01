@@ -231,7 +231,7 @@ def main(argv=None):
                      + (['--playback-loop'] if args.playback_loop else [])
                      if args.source == 'playback' and args.playback_ser else [])
     estop = False
-    recording = False
+    recording = {role: False for role in roles}   # per-role: each cam records independently
     gui_quit = False        # set when the GUI tells us it's closing (faster than watching it exit)
 
     # Auto-tracking state (pixel-space closed loop).
@@ -323,10 +323,10 @@ def main(argv=None):
             '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
-            '--important', '1' if recording else '0', '--control-file', cf,
+            '--important', '1' if recording[role] else '0', '--control-file', cf,
             *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
         ])
-        control_writers[role].append({'important': 1 if recording else 0})
+        control_writers[role].append({'important': 1 if recording[role] else 0})
 
     detect_procs = {}
 
@@ -516,13 +516,16 @@ def main(argv=None):
             tracking = coasting = False
             mount.set_rates(0.0, 0.0)
         elif t == 'record':
-            recording = bool(cmd.get('on', False))
-            print(f"[backend] recording {'ON' if recording else 'off'}", flush=True)
-            # Record: whole pass in one important file (stop rolling). Stop: resume rolling,
-            # which finalizes the (now over-length) pass file and starts a fresh throwaway.
-            for role in roles:
-                control_write(role, {'important': 1 if recording else 0,
-                                     'frame_limit': -1 if recording else args.segment_frames})
+            on = bool(cmd.get('on', False))
+            r = cmd.get('role')
+            targets = [r] if r in roles else roles    # a named role, else all (back-compat)
+            for role in targets:
+                recording[role] = on
+                # Record: whole pass in one important file (stop rolling). Stop: resume rolling,
+                # which finalizes the (now over-length) pass file and starts a fresh throwaway.
+                control_write(role, {'important': 1 if on else 0,
+                                     'frame_limit': -1 if on else args.segment_frames})
+            print(f"[backend] recording {'ON' if on else 'off'} for {', '.join(targets)}", flush=True)
         elif t == 'capture':
             role = cmd.get('role')
             if role in roles:
@@ -620,7 +623,7 @@ def main(argv=None):
                 'enc_alt_deg': round(math.degrees(st['alt_rad']), 4),
                 'rate_az_deg_s': round(math.degrees(st['rate_az_rad_s']), 4),
                 'rate_alt_deg_s': round(math.degrees(st['rate_alt_rad_s']), 4),
-                'recording': recording,
+                'recording': dict(recording),           # per-role: {role: bool}
                 'tracking': tracking,
                 'track_role': track_role if tracking else None,
                 'target_px': track_target if tracking else None,
