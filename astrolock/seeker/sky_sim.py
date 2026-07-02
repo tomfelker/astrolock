@@ -5,7 +5,7 @@ It holds the mapping from *system time* (perf_counter_ns, shared across processe
 UTC of the test pass -- chosen once, here, so nobody downstream ever sees simulated time or picks
 their own epoch. It propagates every point source (Hipparcos stars via Skyfield, the target satellite
 via SGP4, resolved into its body-point cloud in an LVLH attitude) and publishes their topocentric ENU
-directions as piecewise-linear anchors, in system time, to a JSONL ephemeris (see ephemeris.py).
+directions as piecewise-linear anchors, in system time, to a JSONL almanac (see almanac.py).
 
 This replaces per-camera propagation. Previously each camera process did its own SGP4 + catalog pass
 and timed the sky against its own start, so two cameras placed a fast satellite at slightly different
@@ -27,7 +27,7 @@ import time
 import numpy as np
 
 from astrolock.seeker import bodies
-from astrolock.seeker.ephemeris import anchor_record
+from astrolock.seeker.almanac import fix_record
 from astrolock.seeker.sidecar import JsonlWriter
 
 
@@ -122,15 +122,15 @@ class SkyPublisher:
         return world / np.linalg.norm(world, axis=-1, keepdims=True)
 
     def emit_group(self, writer, ids, mags, dirs, t_ns):
-        """Write one record per point-target, carrying this chunk of anchors. ``dirs`` is (K, N, 3)."""
+        """Write one record per point-target, carrying this chunk of fixes. ``dirs`` is (K, N, 3)."""
         for i, tid in enumerate(ids):
             mag = mags if np.isscalar(mags) else mags[i]
-            writer.append(anchor_record(tid, mag, t_ns, dirs[:, i, :]))
+            writer.append(fix_record(tid, mag, t_ns, dirs[:, i, :]))
 
 
 def run(argv=None):
-    p = argparse.ArgumentParser(description="Single sky-sim: publish star + satellite ephemeris")
-    p.add_argument('--out', required=True, help="ephemeris JSONL output path")
+    p = argparse.ArgumentParser(description="Single sky-sim: publish star + satellite almanac")
+    p.add_argument('--out', required=True, help="almanac JSONL output path")
     p.add_argument('--lat', type=float, required=True)
     p.add_argument('--lon', type=float, required=True)
     p.add_argument('--elev', type=float, default=0.0)
@@ -140,7 +140,8 @@ def run(argv=None):
     p.add_argument('--mag-limit', type=float, default=7.0)
     p.add_argument('--cache-dir', default='data/skyfield_cache')
     p.add_argument('--stop-file', default=None)
-    # anchor cadence / look-ahead per group (seconds); ring in ephemeris.py must span these.
+    # fix cadence / look-ahead per group (seconds). The almanac evicts by age (floor-and-newer), so
+    # its buffer adapts to these -- there's no ring size to keep in agreement across processes.
     p.add_argument('--star-dt', type=float, default=30.0)
     p.add_argument('--star-lead', type=float, default=60.0)
     p.add_argument('--star-chunk', type=int, default=2)

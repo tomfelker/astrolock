@@ -2,7 +2,7 @@
 Camera-side sky renderer for Seeker (the optics/pixels half; propagation lives in sky_sim.py).
 
 Given a (hidden, truth) tripod orientation + optics, an *encoder* pose, and the set of point-source
-directions in the sky *at each exposure substep* (from the shared ephemeris), this renders a frame:
+directions in the sky *at each exposure substep* (from the shared almanac), this renders a frame:
 project sources to pixels (gnomonic / pinhole), sum across the substeps to get motion streaks (mount
 slew), convolve a PSF, add shot+read noise, quantize to the 12-bit-in-16-bit container the real cam
 produces.

@@ -198,19 +198,19 @@ def _open_sky(args, state_path=None, mount_path=None):
     import math as _math
     import torch
     from astrolock.seeker.skysim import SkySim, SkySimConfig
-    from astrolock.seeker.ephemeris import SkyEphemeris
+    from astrolock.seeker.almanac import SkyAlmanac
 
     cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um)
     sim = SkySim(cfg)                                   # render-only; propagation lives in sky_sim.py
-    ephem = SkyEphemeris(args.sky_ephemeris)            # shared, system-clock-timed source directions
+    almanac = SkyAlmanac(args.sky_almanac)              # shared, system-clock-timed source directions
     fov_x = _math.degrees(2 * _math.atan(cfg.width * cfg.pixel_pitch_um * 1e-3 / (2 * cfg.focal_length_mm)))
 
     # Fallback pose only for scripted (non-follow) runs; the mount drives it in closed loop.
     az0 = _math.radians(args.sky_az_deg) if args.sky_az_deg is not None else 0.0
     alt0 = _math.radians(args.sky_alt_deg) if args.sky_alt_deg is not None else _math.radians(45.0)
     rate_az, rate_alt = _math.radians(args.sky_rate_az), _math.radians(args.sky_rate_alt)
-    print(f"[cam] sky sim {cfg.width}x{cfg.height} FoV {fov_x:.1f}deg ephemeris={args.sky_ephemeris} "
+    print(f"[cam] sky sim {cfg.width}x{cfg.height} FoV {fov_x:.1f}deg almanac={args.sky_almanac} "
           f"exp={args.sky_exposure_s}s substeps={args.sky_substeps}", flush=True)
 
     # Prefer the sim mount's ground-truth trajectory (piecewise-linear, exact) over the backend's
@@ -250,10 +250,10 @@ def _open_sky(args, state_path=None, mount_path=None):
             elapsed = (now_ns - start_ns) * 1e-9
             az, alt = az0 + rate_az * elapsed, alt0 + rate_alt * elapsed
         # Source directions at each exposure substep, looked up on the shared clock. Stars are ~static
-        # across the substeps; the satellite points move -- both interpolated from the same ephemeris.
+        # across the substeps; the satellite points move -- both interpolated from the same almanac.
         sub_t = now_ns + (fr * exp * 1e9).to(torch.int64)    # keep now_ns exact (int64, not float64)
-        ephem.update()
-        dirs, mags = ephem.dirs_at(sub_t)
+        almanac.update()
+        dirs, mags = almanac.dirs_at(sub_t)
         frame = sim.render(az, alt, pose['raz'], pose['ralt'], dirs, mags, exposure_s=exp, substeps=S)
         return frame, int(now_ns + 0.5 * exp * 1e9)           # stamp at the exposure midpoint
 
@@ -336,7 +336,7 @@ def main(argv=None):
     p.add_argument('--auto-max-gain', type=int, default=400, help="auto: max gain")
     p.add_argument('--auto-target', type=int, default=100, help="auto: target brightness (0-255)")
     # sky simulator (--source sky): the camera only renders point sources it reads from the shared
-    # sky_sim ephemeris. It has no notion of stars vs satellites, nor of epoch/site/TLE -- sky_sim
+    # sky_sim almanac. It has no notion of stars vs satellites, nor of epoch/site/TLE -- sky_sim
     # owns all propagation. These args are just this camera's optics + pose + exposure.
     p.add_argument('--sky-width', type=int, default=1920, help="sky: sensor width (px)")
     p.add_argument('--sky-height', type=int, default=1080, help="sky: sensor height (px)")
@@ -348,8 +348,8 @@ def main(argv=None):
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky: scripted alt slew (deg/s)")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky: simulated exposure (s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
-    p.add_argument('--sky-ephemeris', default=None,
-                   help="sky: shared source-direction ephemeris (JSONL) published by sky_sim")
+    p.add_argument('--sky-almanac', default=None,
+                   help="sky: shared source-direction almanac (JSONL) published by sky_sim")
     p.add_argument('--sky-follow-state', action='store_true',
                    help="sky: render from the backend's encoder estimate in <ts>_state.jsonl")
     p.add_argument('--sky-follow-mount', action='store_true',

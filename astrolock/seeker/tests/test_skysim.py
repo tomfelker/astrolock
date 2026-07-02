@@ -1,9 +1,9 @@
 """
-Sky renderer + ephemeris sanity (no network / no Skyfield -- propagation lives in sky_sim now):
+Sky renderer + almanac sanity (no network / no Skyfield -- propagation lives in sky_sim now):
 
   - a source direction at the boresight lands at image centre; an off-axis source lands at its
     gnomonic-projected pixel.
-  - the ephemeris lerps a target's direction between anchors.
+  - the almanac lerps a target's direction between fixes.
 
     python -m astrolock.seeker.tests.test_skysim
 """
@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from astrolock.seeker.skysim import SkySim, SkySimConfig
-from astrolock.seeker.ephemeris import SkyEphemeris, anchor_record
+from astrolock.seeker.almanac import SkyAlmanac, fix_record
 from astrolock.seeker.sidecar import JsonlWriter
 
 
@@ -45,13 +45,13 @@ def test_source_projects_to_boresight():
     assert abs(py - cy) <= 3, f"off-axis peak drifted in y: {py}"
 
 
-def test_ephemeris_lerp():
+def test_almanac_lerp():
     d = tempfile.mkdtemp()
-    path = os.path.join(d, 'eph.jsonl')
+    path = os.path.join(d, 'almanac.jsonl')
     w = JsonlWriter(path)
-    w.append(anchor_record('a', 1.0, [1_000_000_000, 3_000_000_000], [[1, 0, 0], [0, 1, 0]]))
+    w.append(fix_record('a', 1.0, [1_000_000_000, 3_000_000_000], [[1, 0, 0], [0, 1, 0]]))
     w.close()
-    e = SkyEphemeris(path)
+    e = SkyAlmanac(path)
     e.update()
     dirs, _ = e.dirs_at(torch.tensor([2_000_000_000], dtype=torch.int64))   # midway
     v = dirs[0, 0].tolist()
@@ -60,5 +60,5 @@ def test_ephemeris_lerp():
 
 if __name__ == '__main__':
     test_source_projects_to_boresight()
-    test_ephemeris_lerp()
+    test_almanac_lerp()
     print("test_skysim: OK")
