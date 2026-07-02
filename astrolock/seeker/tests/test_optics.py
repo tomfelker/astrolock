@@ -9,15 +9,18 @@ from astrolock.seeker import optics
 
 def test_db_loads():
     sensors, opts, reducers = optics.load_db()
-    assert len(sensors) >= 17 and len(opts) >= 22 and len(reducers) == 3   # Stellarium baseline + ours
-    s = sensors["EOS 5D (Full Frame)"]
-    assert (s.res_x, s.res_y, s.pixel_um) == (4368, 2912, 8.2)
-    assert abs(s.chip_w_mm - 4368 * 8.2 / 1000.0) < 1e-9
-    assert opts["Celestron C8 f/10"].focal_length_mm == 2032
-    assert reducers["F/6.3 Reducer"] == 0.63
-    # our added rig
-    assert sensors["ZWO ASI678MC"].res_x == 3840 and sensors["ZWO ASI678MC"].pixel_um == 2.0
-    assert opts["8mm CS f/1.4"].focal_length_mm == 8 and opts["Celestron C11 f/10"].focal_length_mm == 2800
+    assert len(sensors) >= 40 and len(opts) >= 6 and len(reducers) == 2
+    # a mono ZWO chip: is_color reads False, no Bayer pattern
+    s = sensors["ZWO ASI678MM"]
+    assert (s.res_x, s.res_y, s.pixel_um) == (3840, 2160, 2.0)
+    assert s.is_color is False and s.bayer is None
+    assert abs(s.chip_w_mm - 3840 * 2.0 / 1000.0) < 1e-9
+    assert opts["Celestron CPC 1100"].focal_length_mm == 2800
+    assert reducers["Celestron f/6.3 Reducer/Corrector"] == 0.63
+    # the Seeker rig defaults (backend.py) must resolve
+    s = sensors["ZWO ASI678MC"]
+    assert s.res_x == 3840 and s.pixel_um == 2.0 and s.bayer == "RGGB" and s.is_color is True
+    assert opts["8mm CS f/1.4"].focal_length_mm == 8 and opts["Celestron CPC 1100"].focal_length_mm == 2800
 
 
 def test_plate_scale_and_fov():
@@ -34,10 +37,10 @@ def test_plate_scale_and_fov():
 
 def test_reducer_widens_barlow_narrows():
     sensors, opts, reducers = optics.load_db()
-    s, o = sensors["EOS 5D (Full Frame)"], opts["Celestron C8 f/10"]
+    s, o = sensors["ZWO ASI678MC"], opts["Celestron CPC 1100"]
     base = optics.configuration(s, o)['fov_x_deg']
-    wide = optics.configuration(s, o, reducers["F/6.3 Reducer"])['fov_x_deg']    # 0.63 -> wider
-    narrow = optics.configuration(s, o, reducers["Barlow 2x"])['fov_x_deg']      # 2.0 -> narrower
+    wide = optics.configuration(s, o, reducers["Celestron f/6.3 Reducer/Corrector"])['fov_x_deg']   # 0.63 -> wider
+    narrow = optics.configuration(s, o, reducers["Celestron X-Cel LX 3x Barlow"])['fov_x_deg']      # 3.0 -> narrower
     assert wide > base > narrow
 
 

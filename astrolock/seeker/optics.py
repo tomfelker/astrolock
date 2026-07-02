@@ -1,10 +1,10 @@
 """
 Sensor + optics database and field-of-view helpers for AstroLock Seeker.
 
-The facts in ``data/optics_db.json`` are vendored from Stellarium's Oculars plugin
-(``default_ocular.ini``) -- bare facts (chip resolution / pixel pitch, focal length / aperture);
-Stellarium itself is GPL. Source:
-https://github.com/Stellarium/stellarium/blob/master/plugins/Oculars/resources/default_ocular.ini
+The facts in ``data/optics_db.json`` are AstroLock's own database -- bare facts (chip
+resolution / pixel pitch, focal length / aperture) compiled from manufacturer spec pages
+and the underlying image-sensor datasheets. ZWO cameras are keyed by the Sony/Aptina/
+Panasonic sensor inside them (MC=color with a Bayer mosaic, MM=mono).
 
 Use this to pick a sensor + optic and get the field of view and plate scale, e.g. when bringing a
 new (main) camera online. The math is plain scalar trig: for ``N`` pixels at pitch ``p`` (um) on an

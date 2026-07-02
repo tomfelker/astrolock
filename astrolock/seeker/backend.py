@@ -12,7 +12,7 @@ Cameras are driven via per-role control JSONL files (control_<role>.jsonl): reco
 their `important` flag; capture on/off (re)launches or stops a cam. On exit, any .ser whose
 sidecar has no important frame is deleted; if nothing important remains, the session goes.
 
-Defaults are our rig: both the guide (ASI678MC + 8mm) and main (ASI678MC + C11) sim cameras
+Defaults are our rig: both the guide (ASI678MC + 8mm) and main (ASI678MC + CPC 1100) sim cameras
 on the ISS sky pass, with the GUI. Use --sim-downscale N for faster/smaller views.
 
     python -m astrolock.seeker.backend                       # the two-camera rig, defaults
@@ -105,7 +105,7 @@ def main(argv=None):
     p.add_argument('--guide-optic', default='8mm CS f/1.4', help="guide optic name in the optics DB")
     p.add_argument('--guide-reducer', default=None, help="guide reducer/barlow name (optional)")
     p.add_argument('--main-sensor', default='ZWO ASI678MC', help="main camera sensor name in the optics DB")
-    p.add_argument('--main-optic', default='Celestron C11 f/10', help="main optic name in the optics DB")
+    p.add_argument('--main-optic', default='Celestron CPC 1100', help="main optic name in the optics DB")
     p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
     p.add_argument('--guide-bin', type=int, default=2,
                    help="guide camera NxN binning (default 2x2): combine NxN pixels. A color cam "
