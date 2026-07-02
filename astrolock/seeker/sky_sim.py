@@ -79,18 +79,22 @@ class SkyPublisher:
         self.epoch = datetime.datetime.fromisoformat(args.epoch.replace('Z', '+00:00'))
         self.perf0_ns = time.perf_counter_ns()                             # system time <-> sim epoch anchor
 
+    def _sf_secs(self, t_ns):
+        """Seconds-from-epoch (as skyfield.ts.utc wants them) for system-time anchor(s) t_ns."""
+        return (np.asarray(t_ns, dtype=np.float64) - self.perf0_ns) * 1e-9
+
     def _sf_times(self, t_ns):
-        """Skyfield Time for system-time anchors t_ns (array): sim UTC = epoch + (t - perf0)."""
-        secs = (np.asarray(t_ns, dtype=np.float64) - self.perf0_ns) * 1e-9
+        """Skyfield Time for system-time anchors t_ns (scalar -> single Time, array -> Time array)."""
         e = self.epoch
         return self.ts.utc(e.year, e.month, e.day, e.hour, e.minute,
-                           e.second + e.microsecond * 1e-6 + secs)
+                           e.second + e.microsecond * 1e-6 + self._sf_secs(t_ns))
 
     def star_dirs(self, t_ns):
-        """(len(t_ns), N_stars, 3) ENU dirs of every star at each anchor time."""
+        """(len(t_ns), N_stars, 3) ENU dirs of every star at each anchor time. Uses a *scalar* time
+        per anchor -- observing N stars against an array time mis-broadcasts in Skyfield."""
         out = []
         for t in t_ns:                                    # a few anchors per emit; catalog pass each
-            alt, az, _ = self.observer.at(self._sf_times([t])).observe(self.stars).apparent().altaz()
+            alt, az, _ = self.observer.at(self._sf_times(float(t))).observe(self.stars).apparent().altaz()
             out.append(_enu_from_altaz(np.asarray(az.radians).reshape(-1),
                                        np.asarray(alt.radians).reshape(-1)))
         return np.stack(out, axis=0)                       # (K, N, 3)
@@ -136,10 +140,13 @@ def run(argv=None):
     p.add_argument('--mag-limit', type=float, default=7.0)
     p.add_argument('--cache-dir', default='data/skyfield_cache')
     p.add_argument('--stop-file', default=None)
-    # anchor cadence / look-ahead per group (seconds); ring in ephemeris.py must span these
+    # anchor cadence / look-ahead per group (seconds); ring in ephemeris.py must span these.
     p.add_argument('--star-dt', type=float, default=30.0)
-    p.add_argument('--star-lead', type=float, default=90.0)
-    p.add_argument('--star-chunk', type=int, default=3)
+    p.add_argument('--star-lead', type=float, default=60.0)
+    p.add_argument('--star-chunk', type=int, default=2)
+    p.add_argument('--star-write-batch', type=int, default=2000,
+                   help="stars written per loop iteration -- dribble the ~15k catalog out (one target "
+                        "per line) so no consumer parses it all in a single poll")
     p.add_argument('--sat-dt', type=float, default=0.2)
     p.add_argument('--sat-lead', type=float, default=2.0)
     p.add_argument('--sat-chunk', type=int, default=10)
@@ -155,23 +162,33 @@ def run(argv=None):
     sat_next = pub.perf0_ns - int(args.sat_dt * 1e9)
     star_dt_ns, sat_dt_ns = int(args.star_dt * 1e9), int(args.sat_dt * 1e9)
     star_lead_ns, sat_lead_ns = int(args.star_lead * 1e9), int(args.sat_lead * 1e9)
+    nstars = len(pub.star_ids)
+    star_pending = None                                    # [t_ns list, dirs (K,N,3), cursor]
 
     while True:
         if args.stop_file and os.path.exists(args.stop_file):
             break
         now = time.perf_counter_ns()
 
-        if star_next <= now + star_lead_ns:
-            t_ns = np.array([star_next + k * star_dt_ns for k in range(args.star_chunk)], dtype=np.int64)
-            pub.emit_group(writer, pub.star_ids, pub.star_mag, pub.star_dirs(t_ns), t_ns.tolist())
-            star_next = int(t_ns[-1]) + star_dt_ns
-
+        # Satellite: dense but low-volume (~68 points) -- write its whole chunk when due.
         if pub.sat and sat_next <= now + sat_lead_ns:
             t_ns = np.array([sat_next + k * sat_dt_ns for k in range(args.sat_chunk)], dtype=np.int64)
             pub.emit_group(writer, pub.sat_ids, pub.sat_mag, pub.sat_point_dirs(t_ns), t_ns.tolist())
             sat_next = int(t_ns[-1]) + sat_dt_ns
 
-        time.sleep(min(args.sat_dt, 0.1))
+        # Stars: compute the next anchor chunk when due, then dribble the ~15k targets out a batch at
+        # a time so no single poll re-parses the whole catalog.
+        if star_pending is None and star_next <= now + star_lead_ns:
+            t_ns = [int(star_next + k * star_dt_ns) for k in range(args.star_chunk)]
+            star_pending = [t_ns, pub.star_dirs(np.array(t_ns, dtype=np.int64)), 0]
+            star_next = t_ns[-1] + star_dt_ns
+        if star_pending is not None:
+            t_ns, sd, cur = star_pending
+            end = min(cur + args.star_write_batch, nstars)
+            pub.emit_group(writer, pub.star_ids[cur:end], pub.star_mag[cur:end], sd[:, cur:end], t_ns)
+            star_pending = None if end >= nstars else [t_ns, sd, end]
+
+        time.sleep(min(args.sat_dt, 0.05))
 
     writer.close()
 

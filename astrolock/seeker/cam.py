@@ -335,28 +335,21 @@ def main(argv=None):
     p.add_argument('--auto-max-exp-ms', type=int, default=200, help="auto: max exposure (ms)")
     p.add_argument('--auto-max-gain', type=int, default=400, help="auto: max gain")
     p.add_argument('--auto-target', type=int, default=100, help="auto: target brightness (0-255)")
-    # sky simulator (--source sky); defaults bake in the ISS test pass over San Carlos
-    p.add_argument('--sky-epoch', default='2026-07-06T05:22:00Z', help="sky: UTC epoch ISO")
-    p.add_argument('--sky-lat', type=float, default=None, help="sky: observer latitude (deg)")
-    p.add_argument('--sky-lon', type=float, default=None, help="sky: observer longitude (deg)")
-    p.add_argument('--sky-elev', type=float, default=None, help="sky: observer elevation (m)")
+    # sky simulator (--source sky): the camera only renders point sources it reads from the shared
+    # sky_sim ephemeris. It has no notion of stars vs satellites, nor of epoch/site/TLE -- sky_sim
+    # owns all propagation. These args are just this camera's optics + pose + exposure.
     p.add_argument('--sky-width', type=int, default=1920, help="sky: sensor width (px)")
     p.add_argument('--sky-height', type=int, default=1080, help="sky: sensor height (px)")
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky: lens focal length (mm); FoV = w*pitch/focal")
     p.add_argument('--sky-pixel-um', type=float, default=2.0, help="sky: sensor pixel pitch (um)")
-    p.add_argument('--sky-az-deg', type=float, default=None, help="sky: encoder az (default: auto-point a bright star)")
-    p.add_argument('--sky-alt-deg', type=float, default=None, help="sky: encoder alt")
+    p.add_argument('--sky-az-deg', type=float, default=None, help="sky: fallback encoder az for scripted (non-follow) runs")
+    p.add_argument('--sky-alt-deg', type=float, default=None, help="sky: fallback encoder alt")
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky: scripted az slew (deg/s) for streaks")
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky: scripted alt slew (deg/s)")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky: simulated exposure (s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
-    p.add_argument('--sky-star-interval', type=float, default=1.0,
-                   help="sky: recompute star positions at most this often (s); speeds up rendering")
     p.add_argument('--sky-ephemeris', default=None,
                    help="sky: shared source-direction ephemeris (JSONL) published by sky_sim")
-    p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
-                   help="sky: TLE file (2 or 3 lines) for a satellite target (default: the ISS)")
-    p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky: satellite target magnitude")
     p.add_argument('--sky-follow-state', action='store_true',
                    help="sky: render from the backend's encoder estimate in <ts>_state.jsonl")
     p.add_argument('--sky-follow-mount', action='store_true',

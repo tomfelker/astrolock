@@ -15,13 +15,17 @@ process start -- so two cameras placed a fast satellite at slightly different wo
 apart. Centralising propagation (one clock, one SGP4/catalog pass) fixes that, kills the once-a-second
 star recompute jump, and lets the GUI reuse the exact same positions.
 
+The dense (t, dir) tables are maintained *incrementally*: new anchors refresh only the rows that
+changed (a sat emit touches ~68 rows, not the whole ~15k-star table), so per-frame lookup stays cheap.
+
 File format: JSONL, one record per target-extension::
 
     {"id": "<str>", "mag": <float>, "anchors": [[t_mono_ns, x, y, z], ...]}
-
-Anchors append to that target's ring (newest kept); a consumer lerps the two that bracket its query.
 """
 
+from collections import defaultdict
+
+import numpy as np
 import torch
 
 from astrolock.seeker.sidecar import JsonlTailer
@@ -38,7 +42,10 @@ def anchor_record(target_id, mag, times_ns, dirs):
 class SkyEphemeris:
     """Tails an ephemeris JSONL and answers ``dirs_at(times)`` for every target at once (torch)."""
 
-    def __init__(self, path, ring=16, device='cpu'):
+    def __init__(self, path, ring=32, device='cpu'):
+        # ring must span more than sky_sim's emit-ahead window for the densest target, or the newest
+        # anchors evict the ones bracketing `now` and lookups clamp+jump (a fast satellite then
+        # zig-zags). For the sat defaults (0.2 s spacing, ~4 s ahead) that needs > 20; 32 leaves margin.
         self.device = device
         self.ring = ring
         self._tailer = JsonlTailer(path)
@@ -47,13 +54,15 @@ class SkyEphemeris:
         self._at = []           # per target: list[int ns] (sorted, <= ring)
         self._ad = []           # per target: list[[x, y, z]]
         self._mag = []
-        self._dirty = True
-        self._times = None      # (T, ring) int64 ns
-        self._dirs = None       # (T, ring, 3) float32
-        self._mag_t = None      # (T,) float32
+        self._pending = set()   # target indices whose tensor rows need refreshing
+        self._times = torch.zeros((0, ring), dtype=torch.int64, device=device)
+        self._dirs = torch.zeros((0, ring, 3), dtype=torch.float32, device=device)
+        self._mag_t = torch.zeros((0,), dtype=torch.float32, device=device)
 
     def update(self):
-        """Ingest any newly-committed records. Cheap; call once per frame before dirs_at()."""
+        """Ingest newly-committed records. Cheap; call once per frame before dirs_at(). Only marks
+        which rows changed -- the tensor refresh happens lazily in dirs_at, for those rows only."""
+        new = 0
         for rec in self._tailer.poll():
             tid = rec.get('id')
             if tid is None:
@@ -66,6 +75,7 @@ class SkyEphemeris:
                 self._at.append([])
                 self._ad.append([])
                 self._mag.append(float(rec.get('mag', 12.0)))
+                new += 1
             if 'mag' in rec:
                 self._mag[i] = float(rec['mag'])
             at, ad = self._at[i], self._ad[i]
@@ -78,54 +88,66 @@ class SkyEphemeris:
             if len(at) > self.ring:                # keep only the newest `ring` anchors
                 del at[:len(at) - self.ring]
                 del ad[:len(ad) - self.ring]
-            self._dirty = True
+            self._pending.add(i)
+        if new:                                    # grow the tensors for the new targets
+            z_t = torch.zeros((new, self.ring), dtype=torch.int64, device=self.device)
+            z_d = torch.zeros((new, self.ring, 3), dtype=torch.float32, device=self.device)
+            z_m = torch.zeros((new,), dtype=torch.float32, device=self.device)
+            self._times = torch.cat([self._times, z_t], 0)
+            self._dirs = torch.cat([self._dirs, z_d], 0)
+            self._mag_t = torch.cat([self._mag_t, z_m], 0)
 
-    def _rebuild(self):
-        """Pack the ragged per-target rings into dense (T, ring) tensors. Rows shorter than `ring`
-        are left-padded by repeating the oldest anchor at strictly-earlier fake times, so every row
-        is sorted and any real query time lands in the real (non-padded) span."""
-        T, R = len(self._ids), self.ring
-        times = torch.zeros((T, R), dtype=torch.int64)
-        dirs = torch.zeros((T, R, 3), dtype=torch.float32)
-        for i in range(T):
-            at, ad = self._at[i], self._ad[i]
-            n = len(at)
+    def _flush(self):
+        """Refresh only the changed rows. Group them by anchor-count and build each group with one
+        batched np.array (no Python-per-row overhead) -- all stars in an emit share a count, so this
+        stays one or two batches whether they're warming up or full. Rows shorter than `ring` are
+        left-padded by repeating the oldest anchor at strictly-earlier fake times, so rows stay sorted."""
+        if not self._pending:
+            return
+        idx = sorted(self._pending)
+        self._pending.clear()
+        R = self.ring
+        by_n = defaultdict(list)
+        for i in idx:
+            by_n[len(self._at[i])].append(i)
+        for n, group in by_n.items():
+            tt = np.zeros((len(group), R), dtype=np.int64)
+            dd = np.zeros((len(group), R, 3), dtype=np.float32)
             if n == 0:
-                times[i] = torch.arange(R, dtype=torch.int64)     # harmless placeholder
-                continue
-            pad = R - n
-            for k in range(R):
-                if k < pad:
-                    times[i, k] = at[0] - (pad - k)               # strictly increasing, all < at[0]
-                    dirs[i, k] = torch.tensor(ad[0])
-                else:
-                    times[i, k] = at[k - pad]
-                    dirs[i, k] = torch.tensor(ad[k - pad])
-        self._times = times.to(self.device)
-        self._dirs = dirs.to(self.device)
-        self._mag_t = torch.tensor(self._mag, dtype=torch.float32, device=self.device)
-        self._dirty = False
+                tt[:] = np.arange(R)
+            else:
+                ats = np.array([self._at[i] for i in group], dtype=np.int64)       # (Kg, n)
+                ads = np.array([self._ad[i] for i in group], dtype=np.float32)     # (Kg, n, 3)
+                pad = R - n
+                if pad > 0:                                    # left-pad below the oldest real anchor
+                    tt[:, :pad] = ats[:, 0:1] - np.arange(pad, 0, -1)[None, :]
+                    dd[:, :pad] = ads[:, 0:1, :]
+                tt[:, pad:] = ats
+                dd[:, pad:] = ads
+            ii = torch.tensor(group, dtype=torch.int64, device=self.device)
+            self._times[ii] = torch.from_numpy(tt).to(self.device)
+            self._dirs[ii] = torch.from_numpy(dd).to(self.device)
+            self._mag_t[ii] = torch.tensor([self._mag[i] for i in group],
+                                           dtype=torch.float32, device=self.device)
 
     def dirs_at(self, t_ns):
         """Interpolated unit directions at query times ``t_ns`` (shape (S,), int64 ns).
         Returns (dirs (T, S, 3), mags (T,)). One batched piecewise-linear lerp over all targets."""
-        if self._dirty:
-            self._rebuild()
-        if not self._ids:
+        self._flush()
+        T = self._times.shape[0]
+        if T == 0:
             return (torch.zeros((0, t_ns.numel(), 3), device=self.device),
                     torch.zeros((0,), device=self.device))
         times = self._times                                       # (T, R) int64
-        T, R = times.shape
+        R = times.shape[1]
         vals = t_ns.to(torch.int64).view(-1).unsqueeze(0).expand(T, -1).contiguous()   # (T, S)
         idx = torch.searchsorted(times, vals).clamp(1, R - 1)     # per-row segment upper index
         lo = idx - 1
         t0 = torch.gather(times, 1, lo).double()
         t1 = torch.gather(times, 1, idx).double()
         frac = ((vals.double() - t0) / (t1 - t0).clamp(min=1.0)).clamp(0.0, 1.0).float()  # (T, S)
-        g_lo = lo.unsqueeze(-1).expand(-1, -1, 3)
-        g_hi = idx.unsqueeze(-1).expand(-1, -1, 3)
-        d0 = torch.gather(self._dirs, 1, g_lo)                    # (T, S, 3)
-        d1 = torch.gather(self._dirs, 1, g_hi)
+        d0 = torch.gather(self._dirs, 1, lo.unsqueeze(-1).expand(-1, -1, 3))   # (T, S, 3)
+        d1 = torch.gather(self._dirs, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
         d = d0 + (d1 - d0) * frac.unsqueeze(-1)
         d = d / d.norm(dim=-1, keepdim=True).clamp(min=1e-9)
         return d, self._mag_t

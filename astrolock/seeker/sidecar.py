@@ -87,11 +87,14 @@ class JsonlTailer:
         chunk = self._file.read()
         if chunk:
             self._partial += chunk
-            while '\n' in self._partial:
-                line, self._partial = self._partial.split('\n', 1)
-                line = line.strip()
-                if line:
-                    out.append(json.loads(line))
+            if '\n' in self._partial:
+                # Split once (O(n)), not by peeling one line at a time (which recopies the whole
+                # remaining buffer each step -> O(n^2), seconds when ~15k lines arrive in one read).
+                *lines, self._partial = self._partial.split('\n')   # last piece = incomplete tail
+                for line in lines:
+                    line = line.strip()
+                    if line:
+                        out.append(json.loads(line))
         return out
 
     def close(self):
