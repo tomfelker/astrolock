@@ -1,14 +1,12 @@
 """
-SkyTracker: sky-space closed-loop tracker (Layers A + B), an alternative to the pixel-space
-PixelTracker. Select it with ``--track-mode sky``; PixelTracker (``pixel``) is the default and is
-untouched.
+SkyTracker: the sky-space closed-loop tracker (Layers A + B).
 
 Three parts:
 
   - Reconstruction (the bridge): a detection pixel + the mount pose interpolated to the frame's
     capture time + the plate scale => an absolute sky *direction*. Blind: the camera is assumed
     roughly upright (sign_az/sign_alt) and small-FoV; an unknown roll is a small cross-track bias
-    the loop absorbs. This is the only approximation, and it is the same one the pixel loop makes.
+    the loop absorbs. This is the only approximation.
 
   - Layer A (TargetModel): a blind model of the target's motion in sky directions, fed the
     reconstructed directions. Default EmaAngularVelModel (constant-angular-velocity). It answers "where will
@@ -24,8 +22,9 @@ Three parts:
     arrival time -- and, because a direction has two alt-az poses ((az, alt) and (az+pi, pi-alt)),
     it will tip altitude *over the top* rather than whip az 180 degrees, whichever is gentler.
 
-Contract with the backend: ``owns_ik = True`` -- update() returns final axis rates (az, alt), so the
-backend does NOT apply its own cos(alt) compensation for this tracker.
+Contract with the backend: update() returns *final* axis rates (az, alt) -- SkyTracker owns the
+alt-az inverse kinematics (the cos(alt) az-rate scaling and the pole tip-over), so the backend just
+forwards the rates to the mount.
 
 Not yet enforced (TODO): the motion-blur cap -- limiting the residual image-space speed at the
 intercept so the target doesn't streak. During normal pursuit slewing toward the target only lowers
@@ -43,8 +42,6 @@ from astrolock.seeker.target_model import EmaAngularVelModel
 
 
 class SkyTracker:
-    owns_ik = True     # our update() returns final axis rates; backend must not re-apply cos(alt)
-
     def __init__(self, cx, cy, rad_per_px, max_rate_rad_s,
                  model=None, min_intercept_s=0.3, command_latency_s=0.15, max_horizon_s=8.0,
                  horizon_step_s=0.1, gate_px=80.0, lost_s=1.5, lock_min_time=1.0,
@@ -69,7 +66,7 @@ class SkyTracker:
         self._mount_rate = (0.0, 0.0)
 
     def diagnostics(self):
-        """(info_lines, warnings) printed by the backend at lock time, mirroring PixelTracker."""
+        """(info_lines, warnings) printed by the backend at lock time."""
         info = [f"sky: model {type(self.model).__name__}, min-intercept {self.min_intercept:.2f}s "
                 f"(position stiffness ~{1.0 / self.min_intercept:.1f}/s), latency {self.latency:.2f}s, "
                 f"horizon {self.max_horizon:.1f}s"]
