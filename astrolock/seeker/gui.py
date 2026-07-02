@@ -349,6 +349,27 @@ def main(argv=None):
             dpg.draw_text((x0 + S(6), y0 + S(5)), label, size=S(13), color=(235, 235, 240, 255),
                           parent=f"L_tb_{name}")
 
+    PIP_R = S(15)      # pipper circle radius; a view's centre crosshairs stop here so a centred pipper joins them
+
+    def _draw_pipper(name, tx, ty, col, box):
+        """Circle at the target, clamped to stay inside the visible camera view `box` (x0,y0,x1,y1),
+        + 4 short lines from the circle pointing toward the *true* target centre. In-frame that's the
+        symmetric inward ticks (circle -> halfway to centre); when the target is off-frame the circle
+        sits at the view edge and the lines point the way to it."""
+        x0, y0, x1, y1 = box
+        m = PIP_R + S(2)
+        ccx = min(max(tx, x0 + m), max(x0 + m, x1 - m))   # inner max guards a view narrower than 2m
+        ccy = min(max(ty, y0 + m), max(y0 + m, y1 - m))
+        dpg.draw_circle((ccx, ccy), PIP_R, color=col, thickness=1.0, parent=f"L_trk_{name}")
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            sx, sy = ccx + dx * PIP_R, ccy + dy * PIP_R      # a point on the circle
+            vx, vy = tx - sx, ty - sy                         # toward the true target centre
+            n = math.hypot(vx, vy)
+            if n < 1e-6:
+                continue
+            dpg.draw_line((sx, sy), (sx + vx / n * PIP_R * 0.5, sy + vy / n * PIP_R * 0.5),
+                          color=col, thickness=1.0, parent=f"L_trk_{name}")
+
     # Both dividers are thin dpg windows, but a dpg window has a ~32px minimum size, so a thin one's
     # body overflows past its visible sliver. Each is created *behind* the pane it borders and kept
     # there (no_bring_to_front_on_focus) so that pane covers the overflow; only the sliver in the gap
@@ -419,63 +440,82 @@ def main(argv=None):
             dpg.draw_rectangle((X - half, Y - half), (X + half, Y + half), color=col,
                                thickness=1.0, parent=f"L_box_{name}")
 
-        # Reticles (toggle): boresight crosshair at the pane centre + nested narrower-cam FoV rects.
+        # --- Reticles + target pipper (alpha'd red unless noted; all FoV via the pinhole tan-ratio) ---
+        RED = (255, 70, 70, 160)                  # alpha'd red (the default for reticle geometry)
+        il, ir, it, ib = offx, offx + dw, offy, offy + dh   # image edges (not the letterbox bars)
         if sset['reticles']:
-            rcol, cr = (0, 220, 220, 200), S(10)
-            dpg.draw_circle((cx, cy), cr, color=rcol, thickness=1.0, parent=f"L_ret_{name}")
-            for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                dpg.draw_line((cx + ex * cr * 2.2, cy + ey * cr * 2.2),
-                              (cx + ex * cr * 0.8, cy + ey * cr * 0.8), color=rcol,
-                              thickness=1.0, parent=f"L_ret_{name}")
             optx = (ctrl['state'] or {}).get('optics', {})
             me = optx.get(role)
+            inner = None                          # a narrower co-aligned cam nested in this view (main in guide)
             if me:
                 for r2, fv2 in optx.items():
-                    if r2 == role or not (fv2['fov_x_deg'] < me['fov_x_deg']
-                                          and fv2['fov_y_deg'] < me['fov_y_deg']):
-                        continue
-                    hw = math.tan(math.radians(fv2['fov_x_deg'] / 2)) / \
-                        math.tan(math.radians(me['fov_x_deg'] / 2)) * (dw / 2.0)
-                    hh = math.tan(math.radians(fv2['fov_y_deg'] / 2)) / \
-                        math.tan(math.radians(me['fov_y_deg'] / 2)) * (dh / 2.0)
-                    col2 = (120, 180, 255, 220)
-                    dpg.draw_rectangle((cx - hw, cy - hh), (cx + hw, cy + hh), color=col2,
-                                       thickness=1.0, parent=f"L_fov_{name}")
-                    dpg.draw_text((cx - hw, cy - hh - S(14)), r2, size=S(13), color=col2, parent=f"L_fov_{name}")
+                    if r2 != role and fv2['fov_x_deg'] < me['fov_x_deg'] and fv2['fov_y_deg'] < me['fov_y_deg']:
+                        inner = fv2
+                        break
+            if inner is not None:
+                # Main-cam FoV half-size (pinhole: a ray at half-angle th lands at focal_px*tan(th),
+                # so the inner edge sits at (dw/2)*tan(inner_half)/tan(my_half)).
+                hw = math.tan(math.radians(inner['fov_x_deg'] / 2)) / \
+                    math.tan(math.radians(me['fov_x_deg'] / 2)) * (dw / 2.0)
+                hh = math.tan(math.radians(inner['fov_y_deg'] / 2)) / \
+                    math.tan(math.radians(me['fov_y_deg'] / 2)) * (dh / 2.0)
+                mrcx, mrcy = cx, cy               # main-rect centre = boresight; centre until configurable
+                gh, gv = dw / 2.0 - hw, dh / 2.0 - hh   # image-edge -> centred-rect-edge gaps
+                # Centre crosshairs: from each image edge, 90% of the way to the *centred* rect edge.
+                dpg.draw_line((il, cy), (il + 0.9 * gh, cy), color=RED, thickness=1.0, parent=f"L_ret_{name}")
+                dpg.draw_line((ir, cy), (ir - 0.9 * gh, cy), color=RED, thickness=1.0, parent=f"L_ret_{name}")
+                dpg.draw_line((cx, it), (cx, it + 0.9 * gv), color=RED, thickness=1.0, parent=f"L_ret_{name}")
+                dpg.draw_line((cx, ib), (cx, ib - 0.9 * gv), color=RED, thickness=1.0, parent=f"L_ret_{name}")
+                # Main-cam rect + its own crosshair stubs (outside it), each the last 10% of the gap
+                # drawn from the rect edge -> they meet the centre crosshairs *iff* the rect is centred,
+                # so a boresight offset will show up as a visible break (once boresight is configurable).
+                dpg.draw_rectangle((mrcx - hw, mrcy - hh), (mrcx + hw, mrcy + hh), color=RED,
+                                   thickness=1.0, parent=f"L_fov_{name}")
+                dpg.draw_line((mrcx - hw, mrcy), (mrcx - hw - 0.1 * gh, mrcy), color=RED, thickness=1.0, parent=f"L_fov_{name}")
+                dpg.draw_line((mrcx + hw, mrcy), (mrcx + hw + 0.1 * gh, mrcy), color=RED, thickness=1.0, parent=f"L_fov_{name}")
+                dpg.draw_line((mrcx, mrcy - hh), (mrcx, mrcy - hh - 0.1 * gv), color=RED, thickness=1.0, parent=f"L_fov_{name}")
+                dpg.draw_line((mrcx, mrcy + hh), (mrcx, mrcy + hh + 0.1 * gv), color=RED, thickness=1.0, parent=f"L_fov_{name}")
+            else:
+                # Narrowest cam (main): crosshairs from each image edge to the pipper radius, so a
+                # centred target's pipper circle connects them.
+                dpg.draw_line((il, cy), (cx - PIP_R, cy), color=RED, thickness=1.0, parent=f"L_ret_{name}")
+                dpg.draw_line((ir, cy), (cx + PIP_R, cy), color=RED, thickness=1.0, parent=f"L_ret_{name}")
+                dpg.draw_line((cx, it), (cx, cy - PIP_R), color=RED, thickness=1.0, parent=f"L_ret_{name}")
+                dpg.draw_line((cx, ib), (cx, cy + PIP_R), color=RED, thickness=1.0, parent=f"L_ret_{name}")
 
-        # Locked-target marker (magenta; amber while coasting). A cursor -> constant size, position zooms.
+        # Target pipper: green where THIS view is doing the tracking (amber while coasting), red where
+        # the target is tracked via the *other* camera (its direction mapped in via the pinhole tan-ratio).
         stt = ctrl['state']
-        if stt and stt.get('tracking') and stt.get('track_role') == role and stt.get('target_px'):
-            X, Y = T(stt['target_px'][0], stt['target_px'][1])
-            col = (255, 180, 40, 255) if stt.get('mode') == 'coast' else (255, 60, 220, 255)
-            r = S(14)
-            dpg.draw_circle((X, Y), r, color=col, thickness=1.0, parent=f"L_trk_{name}")
-            for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                dpg.draw_line((X + ex * (r + S(6)), Y + ey * (r + S(6))), (X + ex * S(4), Y + ey * S(4)),
-                              color=col, thickness=1.0, parent=f"L_trk_{name}")
-        elif (stt and stt.get('tracking') and stt.get('target_px')
-              and stt.get('track_role') and stt.get('track_role') != role):
-            # Pipper at the *other* cam's target direction, mapped into this view through the same
-            # gnomonic projection as the FoV boxes (co-aligned boresights assumed). On the higher-mag
-            # main view it magnifies any reconstruction jitter, so it reads as a noise gauge: steady =
-            # clean reconstruction, dancing = noisy.
-            optx = stt.get('optics') or {}
-            src, sf, mf = cams.get(stt['track_role']), optx.get(stt['track_role']), optx.get(role)
-            if src is not None and sf and mf:
-                gtx = stt['target_px'][0] * src['ox']            # guide target -> its texture space
-                gty = stt['target_px'][1] * src['oy']
-                sfx = (src['w'] / 2.0) / math.tan(math.radians(sf['fov_x_deg'] / 2.0))   # guide focal (px)
-                sfy = (src['h'] / 2.0) / math.tan(math.radians(sf['fov_y_deg'] / 2.0))
-                mfx = (cam['w'] / 2.0) / math.tan(math.radians(mf['fov_x_deg'] / 2.0))   # this view's focal
-                mfy = (cam['h'] / 2.0) / math.tan(math.radians(mf['fov_y_deg'] / 2.0))
-                mtx = cam['w'] / 2.0 + (gtx - src['w'] / 2.0) / sfx * mfx                # tan(angle) preserved
-                mty = cam['h'] / 2.0 + (gty - src['h'] / 2.0) / sfy * mfy
-                X, Y = offx + mtx * scale, offy + mty * scale
-                col, r = (60, 220, 255, 255), S(10)              # cyan (vs the guide's magenta)
-                dpg.draw_circle((X, Y), S(3), color=col, thickness=1.0, parent=f"L_trk_{name}")
-                for ex, ey in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    dpg.draw_line((X + ex * (r + S(5)), Y + ey * (r + S(5))), (X + ex * S(3), Y + ey * S(3)),
-                                  color=col, thickness=1.0, parent=f"L_trk_{name}")
+        pip = pcol = None
+        if stt and stt.get('tracking') and stt.get('target_px'):
+            tr = stt.get('track_role')
+            if tr == role:
+                pip = T(stt['target_px'][0], stt['target_px'][1])
+                pcol = (255, 180, 40, 185) if stt.get('mode') == 'coast' else (70, 230, 100, 185)
+            elif tr and tr != role:
+                optx = stt.get('optics') or {}
+                src, sf, mf = cams.get(tr), optx.get(tr), optx.get(role)
+                if src is not None and sf and mf:
+                    gtx, gty = stt['target_px'][0] * src['ox'], stt['target_px'][1] * src['oy']
+                    sfx = (src['w'] / 2.0) / math.tan(math.radians(sf['fov_x_deg'] / 2.0))
+                    sfy = (src['h'] / 2.0) / math.tan(math.radians(sf['fov_y_deg'] / 2.0))
+                    mfx = (cam['w'] / 2.0) / math.tan(math.radians(mf['fov_x_deg'] / 2.0))
+                    mfy = (cam['h'] / 2.0) / math.tan(math.radians(mf['fov_y_deg'] / 2.0))
+                    mtx = cam['w'] / 2.0 + (gtx - src['w'] / 2.0) / sfx * mfx     # tan(angle) preserved across cams
+                    mty = cam['h'] / 2.0 + (gty - src['h'] / 2.0) / sfy * mfy
+                    pip, pcol = (offx + mtx * scale, offy + mty * scale), (255, 80, 80, 195)
+        if pip is not None:
+            # Clamp box = the visible camera view (image ∩ pane): the letterboxed image when zoomed
+            # out, the pane itself when zoomed in past fit.
+            box = (max(0.0, il), max(0.0, it), min(float(SW), ir), min(float(SH), ib))
+            _draw_pipper(name, pip[0], pip[1], pcol, box)
+
+        # Tracker ROI: the detect search window around the predicted target, drawn in the tracked view.
+        if stt and stt.get('track_roi') and stt.get('track_role') == role:
+            rcx, rcy, rsz = stt['track_roi']
+            x0, y0 = T(rcx - rsz / 2.0, rcy - rsz / 2.0)
+            x1, y1 = T(rcx + rsz / 2.0, rcy + rsz / 2.0)
+            dpg.draw_rectangle((x0, y0), (x1, y1), color=(255, 95, 95, 130), thickness=1.0, parent=f"L_box_{name}")
 
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
         if dw > SW + 1:
