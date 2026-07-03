@@ -232,6 +232,7 @@ def main(argv=None):
     followers = {}
     cams = {}                 # role -> live camera data (texture + frames + detections); lazily created
     view_settings = {}        # role -> display prefs {zoom, reticles, histogram}; persists across cams
+    cam_ctrl_val = {}         # (role, control name) -> current value; the GUI owns it once a control is shown
     layout = {'panel_open': True, 'pip_open': True, 'panel_w': S(PANEL_W), 'pip_h': S(200),
               'big_role': ROLES[0], '_sig': None}
 
@@ -676,6 +677,7 @@ def main(argv=None):
         _combo_row("camera", ['(auto)'], f"chooser_{role}",
                    lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)')
         _tip("Which physical ZWO camera to use (by model). '(auto)' = the first one. Press Rescan after plugging in.")
+        dpg.add_group(tag=f"ctrls_{role}", parent=parent)   # caps-driven controls (exposure/gain/...), filled live
         dpg.add_checkbox(label="Running", tag=f"run_{role}", parent=parent)
         _tip("Capture on/off for this camera.")
         dpg.add_checkbox(label="Recording", tag=f"rec_{role}", parent=parent)
@@ -754,6 +756,73 @@ def main(argv=None):
     def _on_camera_pick(role, url):
         _send({'type': 'set_camera', 'role': role, 'url': None if url in (None, '', '(auto)') else url})
         _automatch_optics(role, url)
+
+    # Caps-driven camera controls (exposure/gain/...). The cam publishes each control's kind/range/value;
+    # we render a "[<<][<] value [>][>>]" stepper per number control (single = small step, double = large;
+    # log scale multiplies, linear scale adds) and push changes live. The GUI owns the value once shown
+    # (the user is the source of truth), so we only rebuild when the *set* of controls changes -- e.g. the
+    # source switched and a different camera's caps arrived.
+    def _fmt_ctrl(v):
+        return f"{v:.4g}"
+
+    def _set_cam_ctrl(role, desc, value):
+        value = min(desc['max'], max(desc['min'], float(value)))
+        cam_ctrl_val[(role, desc['name'])] = value
+        tag = f"cinp_{role}_{desc['name']}"
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, _fmt_ctrl(value))
+        _send({'type': 'set_cam_control', 'role': role, 'name': desc['name'], 'value': value})
+
+    def _num_step(role, desc, kind):
+        cur = cam_ctrl_val.get((role, desc['name']), desc.get('value', 0.0))
+        if desc.get('scale') == 'log':
+            cur = max(cur, 1e-9)                        # multiplicative: never stuck at 0
+            cur *= {'ld': 0.5, 'sd': 2 ** -0.25, 'su': 2 ** 0.25, 'lu': 2.0}[kind]
+        else:
+            span = max(1e-9, desc['max'] - desc['min'])
+            cur += {'ld': -span / 10, 'sd': -span / 50, 'su': span / 50, 'lu': span / 10}[kind]
+        _set_cam_ctrl(role, desc, cur)
+
+    def _num_input(role, desc):
+        try:
+            v = float(dpg.get_value(f"cinp_{role}_{desc['name']}"))
+        except (ValueError, TypeError):
+            v = cam_ctrl_val.get((role, desc['name']), desc.get('value', 0.0))
+        _set_cam_ctrl(role, desc, v)
+
+    def _set_cam_choice(role, desc, value):            # relaunch-tier controls (binning/ROI): send as-is
+        cam_ctrl_val[(role, desc['name'])] = value
+        _send({'type': 'set_cam_control', 'role': role, 'name': desc['name'], 'value': value})
+
+    def build_cam_controls(role, caps):
+        """(Re)build a role's caps-driven control widgets into ctrls_<role>."""
+        parent = f"ctrls_{role}"
+        if not dpg.does_item_exist(parent):
+            return
+        dpg.delete_item(parent, children_only=True)
+        for desc in (caps or {}).get('controls', []):
+            cam_ctrl_val[(role, desc['name'])] = desc.get('value', 0.0)
+            if desc.get('kind') == 'number':
+                with dpg.group(horizontal=True, parent=parent):
+                    dpg.add_text(f"{desc.get('label', desc['name'])}:")
+                    for lbl, k in (('<<', 'ld'), ('<', 'sd')):
+                        dpg.add_button(label=lbl, width=S(20), user_data=(role, desc, k),
+                                       callback=lambda _s, _a, u: _num_step(u[0], u[1], u[2]))
+                    dpg.add_input_text(tag=f"cinp_{role}_{desc['name']}", width=S(62), on_enter=True,
+                                       default_value=_fmt_ctrl(desc.get('value', 0.0)),
+                                       user_data=(role, desc), callback=lambda _s, _a, u: _num_input(u[0], u[1]))
+                    for lbl, k in (('>', 'su'), ('>>', 'lu')):
+                        dpg.add_button(label=lbl, width=S(20), user_data=(role, desc, k),
+                                       callback=lambda _s, _a, u: _num_step(u[0], u[1], u[2]))
+                    if desc.get('unit'):
+                        dpg.add_text(desc['unit'], color=(140, 145, 160))
+            elif desc.get('kind') == 'choice':         # relaunch-tier (binning/ROI): a dropdown; each pick relaunches
+                with dpg.group(horizontal=True, parent=parent):
+                    dpg.add_text(f"{desc.get('label', desc['name'])}:")
+                    dpg.add_combo(desc.get('choices', []), tag=f"cinp_{role}_{desc['name']}",
+                                  default_value=str(desc.get('value', '')), width=S(72),
+                                  user_data=(role, desc), callback=lambda _s, a, u: _set_cam_choice(u[0], u[1], a))
+            # (bool / file kinds -> later slices)
 
     # Settings persistence: gather the current settings into a JSON-able dict / apply a loaded one.
     # Grows as mount/camera/optics land; today it covers the layout + per-role display + optics prefs.
@@ -961,6 +1030,17 @@ def main(argv=None):
             val = cam_sel_st.get(role)
             dpg.set_value(f"chooser_{role}", val if val in cam_items else '(auto)')
             cam_init.add(role)
+
+        # Caps-driven camera controls: rebuild a role's stepper widgets whenever the *set* of controls
+        # changes (source switch -> a different camera's caps). Values track the GUI's own state after that.
+        caps_st = (st or {}).get('camera_caps') or {}
+        ctrl_sig = ctrl.setdefault('ctrl_sig', {})
+        for role in roles:
+            caps = caps_st.get(role)
+            sig = (caps.get('source'), tuple(c['name'] for c in caps.get('controls', []))) if caps else None
+            if sig != ctrl_sig.get(role) and dpg.does_item_exist(f"ctrls_{role}"):
+                build_cam_controls(role, caps)
+                ctrl_sig[role] = sig
 
         # 2D slew pad: drag inside it to drive the mount at a log-scaled az/alt rate (centre dead-zone
         # = zero). Momentarily overrides tracking, and resumes it on release. Drag latches, so it

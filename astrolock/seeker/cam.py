@@ -15,6 +15,7 @@ SER header's frame count on the way out.
 """
 
 import argparse
+import json
 import math
 import os
 import time
@@ -227,10 +228,34 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         except Exception:
             return None
 
+    # Live-settable controls the GUI renders, with the device's own ranges (from get_controls()).
+    def _rng(nm, dlo, dhi):
+        c = ctrls.get(nm, {})
+        return c.get('MinValue', dlo), c.get('MaxValue', dhi)
+    exp_lo, exp_hi = _rng('Exposure', 32, 2_000_000)             # microseconds
+    gain_lo, gain_hi = _rng('Gain', 0, 570)
+    caps = [
+        {'name': 'exposure', 'label': 'Exposure', 'kind': 'number', 'unit': 'ms', 'scale': 'log',
+         'min': exp_lo / 1000.0, 'max': exp_hi / 1000.0, 'value': exposure_us / 1000.0, 'live': True},
+        {'name': 'gain', 'label': 'Gain', 'kind': 'number', 'unit': '', 'scale': 'linear',
+         'min': float(gain_lo), 'max': float(gain_hi), 'value': float(gain), 'live': True},
+    ]
+
+    def set_control(name, value):
+        if name == 'exposure':
+            us = max(1, int(round(value * 1000)))
+            _set(z.ASI_EXPOSURE, us)
+            return us / 1000.0
+        if name == 'gain':
+            g = int(round(value))
+            _set(z.ASI_GAIN, g)
+            return float(g)
+        return None
+    controls = {'source': 'zwo', 'controls': caps, 'set': set_control}
     # Sensor->frame mapping for this capture (constant); the backend uses it to map detection
     # pixels back to sensor angles. We capture full-frame, so roi origin is (0,0).
     meta = {'bin': [bins, bins], 'roi': [0, 0, width, height]}
-    return capture, width, height, color_id, bit_depth, get_settings, meta
+    return capture, width, height, color_id, bit_depth, get_settings, meta, controls
 
 
 def _open_sky(args, state_path=None, mount_path=None):
@@ -271,7 +296,8 @@ def _open_sky(args, state_path=None, mount_path=None):
     kt = 't_mono_ns' if follow_mount else 'enc_t_mono_ns'
     ahead_cap = 5.0 if follow_mount else 0.2
     pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt, 'enc_t': None}
-    exp, S = args.sky_exposure_s, args.sky_substeps
+    _live = {'exp': args.sky_exposure_s}                       # exposure (s), live-settable
+    S = args.sky_substeps
     fr = (torch.arange(S, dtype=torch.float64) + 0.5) / S      # (S,) substep mid-fractions
     start_ns = time.perf_counter_ns()
 
@@ -297,14 +323,28 @@ def _open_sky(args, state_path=None, mount_path=None):
             az, alt = az0 + rate_az * elapsed, alt0 + rate_alt * elapsed
         # Source directions at each exposure substep, looked up on the shared clock. Stars are ~static
         # across the substeps; the satellite points move -- both interpolated from the same almanac.
+        exp = _live['exp']
         sub_t = now_ns + (fr * exp * 1e9).to(torch.int64)    # keep now_ns exact (int64, not float64)
         almanac.update()
         dirs, mags = almanac.dirs_at(sub_t)
         frame = sim.render(az, alt, pose['raz'], pose['ralt'], dirs, mags, exposure_s=exp, substeps=S)
-        return frame, int(now_ns + 0.5 * exp * 1e9)           # stamp at the exposure midpoint
+        # (frame, stamp, available-at): the sim renders in ~zero wall-clock, but a real camera can't
+        # deliver a frame until the exposure ends. Stamp at the exposure midpoint (best time to
+        # associate the averaged light with), and tell the loop not to *commit* the frame until the
+        # exposure-end wall-clock -- so consumers see the same latency, and a long exposure floors fps.
+        return frame, int(now_ns + 0.5 * exp * 1e9), now_ns + int(exp * 1e9)
 
+    caps = [{'name': 'exposure', 'label': 'Exposure', 'kind': 'number', 'unit': 'ms', 'scale': 'log',
+             'min': 1.0, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True}]
+
+    def set_control(name, value):
+        if name == 'exposure':
+            _live['exp'] = max(0.001, value / 1000.0)
+            return _live['exp'] * 1000.0
+        return None
+    controls = {'source': 'sky', 'controls': caps, 'set': set_control}
     meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
-    return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta
+    return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta, controls
 
 
 def _open_playback(args):
@@ -349,7 +389,7 @@ def _open_playback(args):
         return frame
 
     return (capture, h.image_width, h.image_height, ser_mod.ColorId(h.color_id),
-            h.pixel_depth_per_plane, None, meta)
+            h.pixel_depth_per_plane, None, meta, None)     # controls: none yet (loop/speed/file -> later)
 
 
 def main(argv=None):
@@ -366,6 +406,9 @@ def main(argv=None):
                    help="NxN binning. sim/synthetic: --width/--height are already the binned size; this "
                         "just records bin=[N,N] in the frame metadata. zwo: sets hardware binning "
                         "(a color cam binned >1 reads out mono).")
+    p.add_argument('--roi', default=None,
+                   help="centered readout window 'x0,y0,w,h' in native sensor px, recorded in the frame "
+                        "metadata (the render is already cropped to it via --width/--height).")
     p.add_argument('--fps', type=float, default=15.0)
     p.add_argument('--frame-limit', type=int, default=-1,
                    help="frames for the current file before rolling over (-1 = unlimited)")
@@ -432,20 +475,32 @@ def main(argv=None):
     color_id = ser_mod.ColorId.MONO
     pixel_depth = 16  # synthetic frames are full-range 16-bit
     frame_meta = None
+    controls = None                                        # {'source','controls':[caps],'set':fn} or None
     if args.source == 'zwo':
-        capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_zwo(
+        capture, width, height, color_id, pixel_depth, get_settings, frame_meta, controls = _open_zwo(
             args.camera_index, args.exposure_us, args.gain, force_mono=args.mono,
             auto=args.auto, auto_max_exp_ms=args.auto_max_exp_ms,
             auto_max_gain=args.auto_max_gain, auto_target=args.auto_target,
             neutral_wb=not args.camera_wb, bin=args.bin, camera_url=args.camera_url)
     elif args.source == 'sky':
-        capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_sky(
+        capture, width, height, color_id, pixel_depth, get_settings, frame_meta, controls = _open_sky(
             args, state_path=os.path.join(out_dir, session_mod.state_name(ts)),
             mount_path=os.path.join(out_dir, session_mod.sim_mount_name(ts)))
     elif args.source == 'playback':
-        capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_playback(args)
+        capture, width, height, color_id, pixel_depth, get_settings, frame_meta, controls = _open_playback(args)
     if frame_meta is None:                                  # synthetic: rendered at the binned size
         frame_meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, width, height]}
+    if args.roi:                                            # backend's centered readout window (sensor px)
+        try:
+            frame_meta['roi'] = [int(v) for v in args.roi.split(',')]
+        except ValueError:
+            pass
+
+    # Publish the camera's live controls (name/kind/range/value) so the backend + GUI can render them.
+    caps_path = os.path.join(out_dir, f'caps_{args.role}.json')
+    with open(caps_path, 'w', encoding='utf-8') as _cf:
+        json.dump({'source': args.source, 'controls': (controls['controls'] if controls else [])}, _cf)
+    applied = {c['name']: c.get('value') for c in controls['controls']} if controls else {}   # live values in effect
 
     control = control_mod.ControlReader(args.control_file) if args.control_file else None
     cfg = {'frame_limit': args.frame_limit, 'file_limit': args.file_limit,
@@ -473,22 +528,35 @@ def main(argv=None):
             try:
                 while True:
                     if control is not None:
+                        ctrl_changed = False
                         for cmd in control.drain():
                             if cmd.get('stop'):
                                 stop = True
                             for k in ('frame_limit', 'file_limit', 'important', 'fps'):
                                 if k in cmd:
                                     cfg[k] = cmd[k]
+                            if 'controls' in cmd and controls is not None:   # live camera controls
+                                for _n, _v in cmd['controls'].items():
+                                    got = controls['set'](_n, _v)
+                                    applied[_n] = got if got is not None else _v
+                                    ctrl_changed = True
+                        # Roll to a fresh .ser on a settings change so every segment stays uniform (no
+                        # per-frame resolution/exposure changes to reconstruct). Only if we've written
+                        # something -- an empty just-opened segment simply adopts the new value.
+                        if ctrl_changed and frames_in_file > 0 and not stop:
+                            break
                     if stop or cfg['file_limit'] == 0:    # {stop} or shutdown -> finalize + exit
                         stop = True
                         break
 
                     loop_start = time.perf_counter()
                     cap_t_ns = None                            # a source may supply the true frame time
+                    avail_ns = None                            # ...and a wall-clock before which not to commit
                     if capture is not None:
                         frame = capture()
-                        if isinstance(frame, tuple):           # (frame, t_mono_ns) -- e.g. sim exposure midpoint
-                            frame, cap_t_ns = frame
+                        if isinstance(frame, tuple):           # (frame, t_mono_ns[, available_at_ns])
+                            frame, cap_t_ns, *rest = frame     # e.g. sim: exposure midpoint + exposure-end
+                            avail_ns = rest[0] if rest else None
                         if frame is None:
                             if args.source == 'playback' and not args.playback_loop:
                                 print(f"[cam:{args.role}] playback complete", flush=True)
@@ -499,12 +567,17 @@ def main(argv=None):
                     else:
                         frame = make_synthetic_frame(width, height, loop_start - start)
 
-                    writer.write_frame(frame)                 # pixels flushed
+                    writer.write_frame(frame)                 # pixels flushed (may precede the commit line)
+                    if avail_ns is not None:                   # hold the commit until the exposure really ends
+                        wait = (avail_ns - time.perf_counter_ns()) * 1e-9
+                        if wait > 0:
+                            time.sleep(wait)
                     sidecar.append({                           # then commit-point line
                         't_mono_ns': cap_t_ns if cap_t_ns is not None else time.perf_counter_ns(),
                         't_utc': session_mod.utc_now_iso(),
                         'important': bool(cfg['important']),
                         **frame_meta,                          # bin + roi (sensor->frame mapping)
+                        **({'settings': applied} if applied else {}),   # exposure/gain in effect this segment
                     })
                     frames_in_file += 1
                     total += 1

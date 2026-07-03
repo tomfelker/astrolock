@@ -13,10 +13,11 @@ their `important` flag; capture on/off (re)launches or stops a cam. On exit, any
 sidecar has no important frame is deleted; if nothing important remains, the session goes.
 
 Defaults are our rig: both the guide (ASI678MC + 8mm) and main (ASI678MC + CPC 1100) sim cameras
-on the ISS sky pass, with the GUI. Use --sim-downscale N for faster/smaller views.
+on the ISS sky pass, with the GUI. Bin a sim camera (--<role>-bin N) for faster/smaller views --
+a sim downscale and NxN binning render identically.
 
     python -m astrolock.seeker.backend                       # the two-camera rig, defaults
-    python -m astrolock.seeker.backend --sim-downscale 4     # same, 1/4 render res (faster)
+    python -m astrolock.seeker.backend --guide-bin 4         # guide at 1/4 render res (faster)
     python -m astrolock.seeker.backend --roles guide --source synthetic   # one cam, no deps
 """
 
@@ -72,8 +73,8 @@ def main(argv=None):
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=30.0)
     p.add_argument('--sim-downscale', type=int, default=1,
-                   help="render sim cameras at 1/N resolution, same FoV (fewer pixels = faster + "
-                        "smaller windows); e.g. 4. Only affects DB-optic sim cams.")
+                   help="DEPRECATED: folded into binning (a sim downscale is an NxN bin). "
+                        "Prefer --<role>-bin; this multiplies into every role's bin.")
     p.add_argument('--segment-frames', type=int, default=300,
                    help="roll cams to a new file every N frames (old non-important ones are deleted)")
     p.add_argument('--auto', dest='auto', action='store_true', default=True,
@@ -213,14 +214,42 @@ def main(argv=None):
     # Per-role plate scale from the optics DB if a sensor+optic is named for that role; else the
     # sky-derived/override rad_per_px above. Print the resolved FoV so it's easy to sanity-check.
     _sensors, _optics, _reducers = optics.load_db()
-    ds = max(1, args.sim_downscale)            # render sim cams at 1/ds resolution (same FoV)
+    ds = max(1, args.sim_downscale)            # DEPRECATED: folded into binning (a sim downscale *is* a bin)
+    if ds > 1:
+        print(f"[backend] note: --sim-downscale {ds} is deprecated; folding it into binning. A sim "
+              f"downscale and NxN binning render identically -- prefer --<role>-bin.", flush=True)
     rad_per_px_by_role = {}
     render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
     bin_by_role = {}           # role -> physical NxN bin (recorded in frame metadata; scales plate scale)
+    roi_frac_by_role = {role: 1.0 for role in roles}    # role -> centered readout window, fraction of sensor
+    roi_window_by_role = {}    # role -> [x0, y0, w, h] in native sensor px (provenance -> frame metadata)
     optics_sel = {role: [None, None, None] for role in roles}   # role -> [sensor, optic, reducer] in effect
+
+    def _geom(role, s, feff):
+        """The one place geometry is computed: render size / plate scale / FoV / readout window for a
+        role from its binning (bin_by_role) and ROI fraction (roi_frac_by_role), given DB sensor `s`
+        at effective focal length `feff`. Startup and every live bin/ROI/optics change call this.
+
+        Binning shrinks the rendered frame 1/b per axis at b x the pixel pitch (same FoV), reported as
+        frame_binning so the tracker's rad_per_px * bin recovers the true scale -- exactly a real binned
+        camera. ROI is a *centered crop* of the sensor: same plate scale, fewer pixels, smaller FoV (the
+        boresight stays at frame centre, so the tracker needs no offset). Returns the rendered (rx, ry)."""
+        b = max(1, bin_by_role.get(role, 1))
+        frac = min(1.0, max(0.05, roi_frac_by_role.get(role, 1.0)))
+        roi_w, roi_h = max(b, round(s.res_x * frac)), max(b, round(s.res_y * frac))   # window, native px
+        x0, y0 = (s.res_x - roi_w) // 2, (s.res_y - roi_h) // 2
+        rx, ry = max(1, roi_w // b), max(1, roi_h // b)                                # rendered (binned)
+        rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um, feff)                 # per native px
+        render_by_role[role] = (rx, ry, s.pixel_um * b, feff)
+        roi_window_by_role[role] = [x0, y0, roi_w, roi_h]
+        pmm = s.pixel_um / 1000.0
+        fov_by_role[role] = (math.degrees(2 * math.atan(roi_w * pmm / (2 * feff))),
+                             math.degrees(2 * math.atan(roi_h * pmm / (2 * feff))))
+        return rx, ry
+
     for role in roles:
-        b = max(1, getattr(args, f'{role}_bin', 1))
+        b = max(1, getattr(args, f'{role}_bin', 1)) * ds        # deprecated downscale folds straight in
         bin_by_role[role] = b
         rad_per_px_by_role[role] = rad_per_px
         render_by_role[role] = (max(1, args.width // b), max(1, args.height // b),
@@ -232,21 +261,10 @@ def main(argv=None):
                 s, o = _sensors[sname], _optics[oname]
                 mult = _reducers[rname] if rname else 1.0
                 feff = o.focal_length_mm * mult
-                # Render reduction = physical bin (b) x sim downscale (ds). Both shrink the rendered
-                # frame 1/N per axis with N x the pixel pitch, so the FoV is unchanged. The physical
-                # bin is reported in the frame metadata and applied by detect/tracker (frame_binning),
-                # exactly like a real binned camera; only the sim-only downscale is folded into the
-                # plate scale here. So rad_per_px stays per *native* pixel x ds, and the tracker's
-                # rad_per_px * frame_binning(=b) recovers the true rendered scale -- real/sim consistent.
-                total = ds * b
-                rx, ry = max(1, s.res_x // total), max(1, s.res_y // total)
-                pum = s.pixel_um * total
-                rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um * ds, feff)
-                render_by_role[role] = (rx, ry, pum, feff)
-                fx, fy = optics.fov_deg(s, feff)      # physical FoV (full sensor; bin/ds-invariant)
-                fov_by_role[role] = (fx, fy)
                 optics_sel[role] = [sname, oname, rname]
-                extra = (f" (bin {b}x{b})" if b > 1 else "") + (f" (downscale {ds}x)" if ds > 1 else "")
+                rx, ry = _geom(role, s, feff)
+                fx, fy = fov_by_role[role]
+                extra = f" (bin {b}x{b})" if b > 1 else ""
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
                       f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(s.pixel_um * b, feff):.3f} arcsec/px, "
                       f"render {rx}x{ry}{extra}", flush=True)
@@ -268,24 +286,31 @@ def main(argv=None):
             print(f"[backend] {role}: unknown optics {e}; using fallback plate scale", flush=True)
 
     def resolve_optics(role, sname, oname, rname):
-        """Re-resolve a role's plate scale + sim render size + FoV from the optics DB (same math as
-        the startup loop) and record the selection. Returns True if a known sensor+optic was named."""
-        b = bin_by_role.get(role, 1)
+        """Re-resolve a role's plate scale + sim render size + FoV + readout window from the optics DB
+        (via _geom, the shared geometry) and record the selection. True if a known sensor+optic named."""
         optics_sel[role] = [sname or None, oname or None, rname or None]
         if not (sname and oname and sname in _sensors and oname in _optics):
             return False
-        s, o = _sensors[sname], _optics[oname]
+        o = _optics[oname]
         mult = _reducers.get(rname, 1.0) if rname else 1.0
-        feff = o.focal_length_mm * mult
-        total = ds * b
-        rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um * ds, feff)
-        render_by_role[role] = (max(1, s.res_x // total), max(1, s.res_y // total), s.pixel_um * total, feff)
-        fov_by_role[role] = optics.fov_deg(s, feff)
+        _geom(role, _sensors[sname], o.focal_length_mm * mult)
         return True
+
+    def recompute_render(role):
+        """Recompute a role's render geometry after a bin/ROI change. Uses the DB optics if named,
+        else falls back to binning the configured frame (ROI is DB-optics-only for now)."""
+        if not resolve_optics(role, *optics_sel[role]):
+            b = max(1, bin_by_role.get(role, 1))
+            render_by_role[role] = (max(1, args.width // b), max(1, args.height // b),
+                                    args.sky_pixel_um * b, args.sky_focal_mm)
+            roi_window_by_role.pop(role, None)
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
     camera_url = {role: None for role in roles}           # per-role selected ZWO camera URL (None = default)
     cams_available = cam_mod.zwo_camera_urls()            # detected ZWO cameras (model-qualified URLs), [] if none
+    cam_caps = {role: None for role in roles}             # role -> {'source','controls':[...]} from caps_<role>.json
+    caps_mtime = {}                                       # role -> last-read mtime of its caps file
+    cam_control_vals = {role: {} for role in roles}       # role -> {control name: value}; live user changes
     launch_seq = {role: 0 for role in roles}
     cam_procs = {}
     control_writers = {}
@@ -304,6 +329,8 @@ def main(argv=None):
             per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum)]
             if role in fov_by_role:                   # DB optics named -> render at the true sensor
                 per_role_sky += ['--sky-width', str(rx), '--sky-height', str(ry)]   # res, so FoV matches
+            if role in roi_window_by_role:            # centered readout window (sensor px) -> frame metadata
+                per_role_sky += ['--roi', ','.join(str(v) for v in roi_window_by_role[role])]
         cam_sel = ['--camera-url', camera_url[role]] if (sources[role] == 'zwo' and camera_url[role]) else []
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
@@ -314,6 +341,8 @@ def main(argv=None):
             *cam_sel, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
         ])
         control_writers[role].append({'important': 1 if recording[role] else 0})
+        if cam_control_vals.get(role):                 # re-apply live control values across a relaunch
+            control_writers[role].append({'controls': dict(cam_control_vals[role])})
 
     detect_procs = {}
 
@@ -406,6 +435,45 @@ def main(argv=None):
     def control_write(role, obj):
         if role in control_writers:
             control_writers[role].append(obj)
+
+    def read_caps(role):
+        """Pick up a role's camera controls from caps_<role>.json (the cam rewrites it each launch)."""
+        path = os.path.join(session_dir, f'caps_{role}.json')
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            return
+        if caps_mtime.get(role) == m:
+            return
+        try:
+            cam_caps[role] = json.load(open(path, encoding='utf-8'))
+            caps_mtime[role] = m
+        except (OSError, ValueError):
+            pass
+
+    def geometry_caps(role):
+        """Backend-owned geometry controls (binning, ROI). Unlike exposure/gain -- which the cam owns,
+        having the device open -- the backend owns render size, so it publishes these. Relaunch-tier
+        (they change frame geometry), presented as choices so one pick = one relaunch. Sky only for
+        now (the render *is* the crop); zwo hardware bin/ROI is a follow-up."""
+        if sources.get(role) != 'sky':
+            return []
+        return [
+            {'name': 'bin', 'label': 'Binning', 'kind': 'choice', 'choices': ['1', '2', '3', '4'],
+             'value': str(bin_by_role.get(role, 1)), 'live': False},
+            {'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': ['100%', '75%', '50%', '25%'],
+             'value': f"{round(roi_frac_by_role.get(role, 1.0) * 100)}%", 'live': False},
+        ]
+
+    def published_caps(role):
+        """The role's caps with each control's value overridden by the live user setting (so the GUI
+        shows what's actually in effect, not the launch default), plus backend geometry controls."""
+        caps = cam_caps.get(role)
+        if not caps:
+            return None
+        vals = cam_control_vals.get(role, {})
+        ctrls = [{**c, 'value': vals.get(c['name'], c.get('value'))} for c in caps.get('controls', [])]
+        return {'source': caps.get('source'), 'controls': ctrls + geometry_caps(role)}
 
     def restart_cam(role, stop_first):
         if stop_first:
@@ -533,6 +601,27 @@ def main(argv=None):
         elif t == 'rescan_cameras':
             cams_available[:] = cam_mod.zwo_camera_urls()
             print(f"[backend] cameras: {cams_available}", flush=True)
+        elif t == 'set_cam_control':
+            role, name, value = cmd.get('role'), cmd.get('name'), cmd.get('value')
+            if role in roles and name == 'bin':                        # geometry: recompute render + relaunch
+                bin_by_role[role] = max(1, int(round(float(value))))
+                recompute_render(role)
+                restart_cam(role, stop_first=True)
+                print(f"[backend] {role} bin = {bin_by_role[role]} (relaunch)", flush=True)
+            elif role in roles and name == 'roi':
+                roi_frac_by_role[role] = min(1.0, max(0.05, float(str(value).rstrip('%')) / 100.0))
+                recompute_render(role)
+                restart_cam(role, stop_first=True)
+                print(f"[backend] {role} roi = {round(roi_frac_by_role[role] * 100)}% (relaunch)", flush=True)
+            elif role in roles and name is not None:
+                cam_control_vals[role][name] = value
+                live = next((c.get('live', True) for c in (cam_caps.get(role) or {}).get('controls', [])
+                             if c['name'] == name), True)
+                if live:
+                    control_write(role, {'controls': {name: value}})   # apply on the running cam
+                else:
+                    restart_cam(role, stop_first=True)                 # format change -> relaunch (later)
+                print(f"[backend] {role} control {name} = {value} ({'live' if live else 'relaunch'})", flush=True)
 
     start = time.perf_counter()
     last_health = start
@@ -546,6 +635,8 @@ def main(argv=None):
             for cmd in cmd_server.drain():
                 apply_command(cmd)
             update_detections()
+            for role in roles:
+                read_caps(role)                        # pick up each cam's live-control descriptors
 
             st = mount.get_state()
             if tracking and tracker is not None:
@@ -612,6 +703,7 @@ def main(argv=None):
                 'sources': dict(sources),
                 'cameras_available': list(cams_available),   # detected ZWO URLs, for the GUI chooser
                 'camera': dict(camera_url),                   # per-role selected camera URL (or null)
+                'camera_caps': {r: published_caps(r) for r in roles},   # live camera controls for the GUI
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},
                 'cameras': {role: {'frames': followers[role].committed_count()} for role in roles},
