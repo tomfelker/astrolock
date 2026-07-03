@@ -75,6 +75,46 @@ def list_zwo_cameras():
     return out
 
 
+def list_zwo_camera_names():
+    """ZWO camera model names in enumeration order. Safe to call while a camera is in use -- it only
+    *lists* (never opens one). Returns [] if zwoasi / the ASI SDK is missing or none are attached."""
+    try:
+        return list(_zwo_module().list_cameras())
+    except Exception:
+        return []
+
+
+def zwo_camera_urls(names=None):
+    """Model-qualified URLs for the attached ZWO cameras: 'zwo:<model>', with '#<k>' appended when
+    several of the same model are present so two identical cams stay distinguishable, e.g.
+    'zwo:ZWO ASI678MC#0'. Keying on the model (not the USB endpoint) keeps per-camera settings stable."""
+    names = list_zwo_camera_names() if names is None else names
+    seen, urls = {}, []
+    for nm in names:
+        if names.count(nm) > 1:
+            k = seen.get(nm, 0)
+            seen[nm] = k + 1
+            urls.append(f"zwo:{nm}#{k}")
+        else:
+            urls.append(f"zwo:{nm}")
+    return urls
+
+
+def _resolve_zwo_index(camera_url, names):
+    """Map a 'zwo:<model>[#k]' URL (or a bare integer) to a list_cameras() index, else None."""
+    if not camera_url or not camera_url.startswith('zwo:'):
+        return None
+    spec = camera_url[len('zwo:'):]
+    inst = 0
+    if '#' in spec:
+        spec, _, k = spec.rpartition('#')
+        inst = int(k) if k.isdigit() else 0
+    matches = [i for i, nm in enumerate(names) if nm == spec]
+    if matches:
+        return matches[min(inst, len(matches) - 1)]
+    return int(spec) if spec.isdigit() and int(spec) < len(names) else None
+
+
 # ASI BayerPattern enum (RG/BG/GR/GB) -> our SER ColorId for the raw mosaic.
 _ASI_BAYER_TO_COLOR_ID = {
     0: ser_mod.ColorId.BAYER_RGGB,
@@ -86,7 +126,7 @@ _ASI_BAYER_TO_COLOR_ID = {
 
 def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
               auto=False, auto_max_exp_ms=200, auto_max_gain=400, auto_target=100,
-              neutral_wb=True, bin=1):
+              neutral_wb=True, bin=1, camera_url=None):
     """
     Open a ZWO camera for RAW16 full-frame video capture.
     Returns (capture, width, height, color_id, get_settings).
@@ -103,7 +143,13 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
     if not names:
         raise RuntimeError("no ZWO cameras found (plugged in? ASI SDK installed?)")
 
-    cam = z.Camera(camera_index)
+    idx = _resolve_zwo_index(camera_url, names)          # a model URL wins; else fall back to the index
+    if idx is None:
+        if camera_url:
+            print(f"[cam] camera-url {camera_url!r} not found among {names}; using index {camera_index}",
+                  flush=True)
+        idx = camera_index
+    cam = z.Camera(idx)
     info = cam.get_camera_property()
     is_color = bool(info.get('IsColorCam', False))
 
@@ -355,7 +401,9 @@ def main(argv=None):
     p.add_argument('--sky-follow-mount', action='store_true',
                    help="sky: render from the sim mount's ground-truth trajectory in <ts>_sim_mount.jsonl "
                         "(piecewise-linear; preferred over --sky-follow-state for the sim mount)")
-    p.add_argument('--camera-index', type=int, default=0, help="zwo camera index")
+    p.add_argument('--camera-index', type=int, default=0, help="zwo camera index (fallback)")
+    p.add_argument('--camera-url', default=None,
+                   help="zwo camera by model: 'zwo:<model>[#k]' (see zwo_camera_urls); wins over --camera-index")
     p.add_argument('--camera-wb', action='store_true',
                    help="zwo: keep the camera's white balance (default: neutral WB for pristine raw)")
     p.add_argument('--mono', action='store_true', help="store raw mosaic as MONO (no Bayer tag)")
@@ -389,7 +437,7 @@ def main(argv=None):
             args.camera_index, args.exposure_us, args.gain, force_mono=args.mono,
             auto=args.auto, auto_max_exp_ms=args.auto_max_exp_ms,
             auto_max_gain=args.auto_max_gain, auto_target=args.auto_target,
-            neutral_wb=not args.camera_wb, bin=args.bin)
+            neutral_wb=not args.camera_wb, bin=args.bin, camera_url=args.camera_url)
     elif args.source == 'sky':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta = _open_sky(
             args, state_path=os.path.join(out_dir, session_mod.state_name(ts)),
