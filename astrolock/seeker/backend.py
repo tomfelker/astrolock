@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 
+from astrolock.seeker import cam as cam_mod
 from astrolock.seeker import control
 from astrolock.seeker import mount as mount_mod
 from astrolock.seeker import session as session_mod
@@ -130,7 +131,7 @@ def main(argv=None):
     p.add_argument('--track-lock-min-time', type=float, default=1.0,
                    help="coast-on-loss: how long (s) a lock must hold before losing it coasts (keep "
                         "slewing the extrapolation to re-acquire) rather than stops")
-    p.add_argument('--track-roi-size', type=int, default=256,
+    p.add_argument('--track-roi-size', type=int, default=128,
                    help="while tracking, publish a square ROI (this many frame px) around the predicted "
                         "target so detect can work just that window instead of the whole frame. 0 = full-frame.")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
@@ -217,6 +218,7 @@ def main(argv=None):
     render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
     bin_by_role = {}           # role -> physical NxN bin (recorded in frame metadata; scales plate scale)
+    optics_sel = {role: [None, None, None] for role in roles}   # role -> [sensor, optic, reducer] in effect
     for role in roles:
         b = max(1, getattr(args, f'{role}_bin', 1))
         bin_by_role[role] = b
@@ -243,6 +245,7 @@ def main(argv=None):
                 render_by_role[role] = (rx, ry, pum, feff)
                 fx, fy = optics.fov_deg(s, feff)      # physical FoV (full sensor; bin/ds-invariant)
                 fov_by_role[role] = (fx, fy)
+                optics_sel[role] = [sname, oname, rname]
                 extra = (f" (bin {b}x{b})" if b > 1 else "") + (f" (downscale {ds}x)" if ds > 1 else "")
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
                       f"{fx:.3f}x{fy:.3f} deg, {optics.arcsec_per_px(s.pixel_um * b, feff):.3f} arcsec/px, "
@@ -264,7 +267,25 @@ def main(argv=None):
         except KeyError as e:
             print(f"[backend] {role}: unknown optics {e}; using fallback plate scale", flush=True)
 
+    def resolve_optics(role, sname, oname, rname):
+        """Re-resolve a role's plate scale + sim render size + FoV from the optics DB (same math as
+        the startup loop) and record the selection. Returns True if a known sensor+optic was named."""
+        b = bin_by_role.get(role, 1)
+        optics_sel[role] = [sname or None, oname or None, rname or None]
+        if not (sname and oname and sname in _sensors and oname in _optics):
+            return False
+        s, o = _sensors[sname], _optics[oname]
+        mult = _reducers.get(rname, 1.0) if rname else 1.0
+        feff = o.focal_length_mm * mult
+        total = ds * b
+        rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um * ds, feff)
+        render_by_role[role] = (max(1, s.res_x // total), max(1, s.res_y // total), s.pixel_um * total, feff)
+        fov_by_role[role] = optics.fov_deg(s, feff)
+        return True
+
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
+    camera_url = {role: None for role in roles}           # per-role selected ZWO camera URL (None = default)
+    cams_available = cam_mod.zwo_camera_urls()            # detected ZWO cameras (model-qualified URLs), [] if none
     launch_seq = {role: 0 for role in roles}
     cam_procs = {}
     control_writers = {}
@@ -283,13 +304,14 @@ def main(argv=None):
             per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum)]
             if role in fov_by_role:                   # DB optics named -> render at the true sensor
                 per_role_sky += ['--sky-width', str(rx), '--sky-height', str(ry)]   # res, so FoV matches
+        cam_sel = ['--camera-url', camera_url[role]] if (sources[role] == 'zwo' and camera_url[role]) else []
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
             '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
             '--important', '1' if recording[role] else '0', '--control-file', cf,
-            *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
+            *cam_sel, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
         ])
         control_writers[role].append({'important': 1 if recording[role] else 0})
 
@@ -494,6 +516,23 @@ def main(argv=None):
                 sources[role] = src
                 restart_cam(role, stop_first=True)       # swap sim <-> real live
                 print(f"[backend] {role} source -> {src}", flush=True)
+        elif t == 'set_optics':
+            role = cmd.get('role')
+            if role in roles:
+                ok = resolve_optics(role, cmd.get('sensor'), cmd.get('optic'), cmd.get('reducer'))
+                print(f"[backend] {role} optics -> {optics_sel[role]} ({'ok' if ok else 'fallback'})", flush=True)
+                if ok and sources[role] == 'sky':        # sim FoV changed -> relaunch to render at it
+                    restart_cam(role, stop_first=True)
+        elif t == 'set_camera':
+            role = cmd.get('role')
+            if role in roles:
+                camera_url[role] = cmd.get('url') or None
+                print(f"[backend] {role} camera -> {camera_url[role]}", flush=True)
+                if sources[role] == 'zwo':               # pick up the new camera on the next launch
+                    restart_cam(role, stop_first=True)
+        elif t == 'rescan_cameras':
+            cams_available[:] = cam_mod.zwo_camera_urls()
+            print(f"[backend] cameras: {cams_available}", flush=True)
 
     start = time.perf_counter()
     last_health = start
@@ -571,11 +610,14 @@ def main(argv=None):
                 'track_roi': ([round(track_target[0]), round(track_target[1]), args.track_roi_size]
                               if tracking and track_target and args.track_roi_size > 0 else None),
                 'sources': dict(sources),
+                'cameras_available': list(cams_available),   # detected ZWO URLs, for the GUI chooser
+                'camera': dict(camera_url),                   # per-role selected camera URL (or null)
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},
                 'cameras': {role: {'frames': followers[role].committed_count()} for role in roles},
                 'optics': {r: {'fov_x_deg': round(fv[0], 4), 'fov_y_deg': round(fv[1], 4)}
                            for r, fv in fov_by_role.items()},
+                'optics_sel': {r: list(sel) for r, sel in optics_sel.items()},   # for the GUI Optics tab
             })
 
             # Per-second health line -- commented out so stdout carries only rare events. Uncomment
