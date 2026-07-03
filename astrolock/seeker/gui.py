@@ -21,6 +21,7 @@ import glob
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 
@@ -28,6 +29,8 @@ import numpy as np
 import torch
 
 from astrolock.seeker import bayer, control, ser
+from astrolock.seeker import optics as optics_db
+from astrolock.seeker import settings as settings_store
 from astrolock.seeker.follower import SerFollower
 from astrolock.seeker.sidecar import JsonlTailer
 
@@ -139,6 +142,47 @@ def _floor_pow2(x):
     if x <= 0:
         return 1.0
     return min(16.0, max(1.0 / 16, 2.0 ** math.floor(math.log2(x))))
+
+
+def _open_folder(path):
+    """Open a folder in the OS file browser (Explorer / Finder / xdg-open)."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        if sys.platform == 'win32':
+            os.startfile(path)                         # noqa: only exists on Windows
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', path])
+        else:
+            subprocess.Popen(['xdg-open', path])
+    except Exception as e:
+        print(f"[gui] could not open {path}: {e}", flush=True)
+
+
+# --- 2D slew pad -------------------------------------------------------------------------
+# A square az/alt rate plane: drag to drive the mount, log-scaled so it's fine near zero and full
+# slew at the edge, with a centre dead-zone that reads as exactly zero.
+SLEW_MAX = 4.0                     # deg/s at the pad edge
+SLEW_RMIN = 0.02                   # deg/s at the dead-zone edge (the log-scale floor)
+SLEW_DEAD = 0.07                   # centre dead-zone as a fraction of the half-size (= zero rate)
+SLEW_GRID = (0.1, 0.5, 1.0, 2.0)   # deg/s gridlines
+
+
+def _u_to_rate(u):
+    """Pad position u in [-1,1] -> axis rate (deg/s): log-scaled, with a centre dead-zone at zero."""
+    au = min(1.0, abs(u))
+    if au <= SLEW_DEAD:
+        return 0.0
+    frac = (au - SLEW_DEAD) / (1.0 - SLEW_DEAD)
+    return math.copysign(SLEW_RMIN * (SLEW_MAX / SLEW_RMIN) ** frac, u)
+
+
+def _rate_to_u(r):
+    """Axis rate (deg/s) -> pad position u in [-1,1] (inverse of _u_to_rate; for gridlines + readout)."""
+    ar = abs(r)
+    if ar <= SLEW_RMIN:
+        return 0.0
+    frac = min(1.0, math.log(ar / SLEW_RMIN) / math.log(SLEW_MAX / SLEW_RMIN))
+    return math.copysign(SLEW_DEAD + (1.0 - SLEW_DEAD) * frac, r)
 
 
 def main(argv=None):
@@ -267,13 +311,13 @@ def main(argv=None):
         cam = cams.get(role)
         if cam is None:
             w, h, _rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
-            tex = f"tex_{role}"
+            tex = f"tex_{role}_0"
             if not dpg.does_item_exist(tex):
                 with dpg.texture_registry():
                     dpg.add_raw_texture(w, h, np.zeros(w * h * 4, dtype=np.float32),
                                         format=dpg.mvFormat_Float_rgba, tag=tex)
             det_path = f.ser_path[:-len('.ser')] + '.detections.jsonl'
-            cam = cams[role] = dict(tex=tex, w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh,
+            cam = cams[role] = dict(tex=tex, texver=0, w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh,
                                     color_id=f.header.color_id, blobs=[], det_idx=-1, last_idx=-1,
                                     peak=0, hist=None, det_tailer=JsonlTailer(det_path), ser_path=f.ser_path)
         # segment rollover / source switch -> re-point the detections tailer
@@ -288,12 +332,15 @@ def main(argv=None):
         if idx == cam['last_idx']:
             return False
         w, h, rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
-        if (w, h) != (cam['w'], cam['h']):          # frame size changed (source switch) -> new texture
-            if dpg.does_item_exist(cam['tex']):
-                dpg.delete_item(cam['tex'])
+        if (w, h) != (cam['w'], cam['h']):          # frame size changed (source/optics switch) -> a
+            old = cam['tex']                          # fresh texture. Use a new tag so the string alias
+            cam['texver'] += 1                        # never collides -- delete_item leaves the alias
+            cam['tex'] = f"tex_{role}_{cam['texver']}"  # registered while a draw_image still references it.
             with dpg.texture_registry():
                 dpg.add_raw_texture(w, h, np.zeros(w * h * 4, dtype=np.float32),
                                     format=dpg.mvFormat_Float_rgba, tag=cam['tex'])
+            if dpg.does_item_exist(old):
+                dpg.delete_item(old)                  # safe: draw_slot re-points its draw_image this frame
             cam.update(w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh, color_id=f.header.color_id)
         dpg.set_value(cam['tex'], rgba.ravel())
         cam['last_idx'], cam['peak'] = idx, int(frame.max())
@@ -515,7 +562,7 @@ def main(argv=None):
             rcx, rcy, rsz = stt['track_roi']
             x0, y0 = T(rcx - rsz / 2.0, rcy - rsz / 2.0)
             x1, y1 = T(rcx + rsz / 2.0, rcy + rsz / 2.0)
-            dpg.draw_rectangle((x0, y0), (x1, y1), color=(255, 95, 95, 130), thickness=1.0, parent=f"L_box_{name}")
+            dpg.draw_rectangle((x0, y0), (x1, y1), color=(70, 230, 100, 150), thickness=1.0, parent=f"L_box_{name}")
 
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
         if dw > SW + 1:
@@ -605,49 +652,237 @@ def main(argv=None):
         dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Right, callback=on_right_click)
 
     # ---- right settings/telemetry panel (docked; retires the old floating Control window) -----
+    def _tip(text, item=None):
+        """Attach a hover tooltip to `item` (default: the item just added)."""
+        with dpg.tooltip(item if item is not None else dpg.last_item()):
+            dpg.add_text(text, wrap=S(240))
+
+    def _combo_row(label, items, tag, cb, parent=None, default='', right=0):
+        """A 'label: <dropdown>' row; the dropdown fills the remaining width (minus `right` px, when a
+        trailing widget follows). parent=None -> the current container."""
+        kw = {'parent': parent} if parent else {}
+        with dpg.group(horizontal=True, **kw):
+            dpg.add_text(f"{label}:")
+            dpg.add_combo(items, tag=tag, default_value=default, width=(-right if right else -1), callback=cb)
+
     def render_camera_settings(role, parent):
-        """One camera's connection/capture/display settings under `parent` -- a standalone helper so
-        the same block could later be dropped into a pane. Widgets are intent; update_control
-        reconciles capture/record to the backend, and the display toggles write view_settings."""
+        """One camera's connection/capture/display settings under `parent`. Widgets are intent;
+        update_control reconciles capture/record to the backend, and the display toggles write
+        view_settings."""
         sset = view_settings.setdefault(role, _default_settings())
-        dpg.add_combo(['synthetic', 'zwo', 'sky'], tag=f"src_{role}", parent=parent, width=S(120),
-                      label="driver",
-                      callback=lambda _s, a, role=role: _send({'type': 'set_source', 'role': role, 'source': a}))
-        dpg.add_combo(['(auto)'], default_value='(auto)', tag=f"chooser_{role}", parent=parent,
-                      width=S(120), label="camera", enabled=False)   # physical-cam chooser: enumeration TBD
+        _combo_row("driver", ['synthetic', 'zwo', 'sky'], f"src_{role}",
+                   lambda _s, a: _send({'type': 'set_source', 'role': role, 'source': a}), parent)
+        _tip("Frame source: 'sky' = the ISS sim, 'synthetic' = a moving blob (no deps), 'zwo' = a real camera.")
+        _combo_row("camera", ['(auto)'], f"chooser_{role}",
+                   lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)')
+        _tip("Which physical ZWO camera to use (by model). '(auto)' = the first one. Press Rescan after plugging in.")
         dpg.add_checkbox(label="Running", tag=f"run_{role}", parent=parent)
+        _tip("Capture on/off for this camera.")
         dpg.add_checkbox(label="Recording", tag=f"rec_{role}", parent=parent)
+        _tip("Keep this camera's frames (mark them important so they aren't auto-deleted).")
         dpg.add_checkbox(label="Auto record", tag=f"autorec_{role}", parent=parent)
+        _tip("Automatically record this camera whenever tracking is engaged.")
         dpg.add_separator(parent=parent)
         dpg.add_text("Display", parent=parent, color=(160, 170, 190))
         dpg.add_checkbox(label="Reticles", tag=f"ret_{role}", parent=parent, default_value=sset['reticles'],
-                         callback=lambda _s, a, role=role: view_settings[role].__setitem__('reticles', a))
+                         callback=lambda _s, a: view_settings[role].__setitem__('reticles', a))
+        _tip("Show the centre crosshairs + the main-cam FoV box on this camera's pane.")
         dpg.add_checkbox(label="Histogram", tag=f"hist_{role}", parent=parent, default_value=sset['histogram'],
-                         callback=lambda _s, a, role=role: view_settings[role].__setitem__('histogram', a))
-        dpg.add_text("zoom: +/- on the pane", parent=parent, color=(120, 122, 132))
+                         callback=lambda _s, a: view_settings[role].__setitem__('histogram', a))
+        _tip("Show a luminance histogram inset on this camera's pane (judge exposure/clipping).")
+
+    # Optics: per-role sensor/optic/reducer pickers driven by the DB. Owned gear is pinned to the top
+    # of each dropdown (before a divider) and remembered in the settings store.
+    _SENS, _OPT, _RED = optics_db.load_db()
+    _GEAR = {'sensor': sorted(_SENS), 'optic': sorted(_OPT), 'reducer': ['(none)'] + sorted(_RED)}
+    owned = {'sensor': set(), 'optic': set(), 'reducer': set()}
+    _DIV = '-' * 14                               # a (non-selectable) divider row in the combos
+
+    def _gear_items(kind):
+        own = [n for n in _GEAR[kind] if n in owned[kind]]
+        rest = [n for n in _GEAR[kind] if n not in owned[kind]]
+        return (own + [_DIV] + rest) if own else rest
+
+    def _rebuild_gear(kind):                           # refresh both roles' combos of this kind, keep selection
+        for r in roles:
+            tag = f"opt_{r}_{kind}"
+            if dpg.does_item_exist(tag):
+                sel = dpg.get_value(tag)
+                dpg.configure_item(tag, items=_gear_items(kind))
+                dpg.set_value(tag, sel)
+
+    def _send_optics(role):
+        sen, opt = dpg.get_value(f"opt_{role}_sensor"), dpg.get_value(f"opt_{role}_optic")
+        red = dpg.get_value(f"opt_{role}_reducer")
+        if _DIV in (sen, opt, red):
+            return
+        _send({'type': 'set_optics', 'role': role, 'sensor': sen or None, 'optic': opt or None,
+               'reducer': None if red in (None, '', '(none)') else red})
+
+    def _on_gear_change(role, kind):
+        tag = f"opt_{role}_{kind}"
+        val = dpg.get_value(tag)
+        if val == _DIV:                                # divider picked -> revert to the last valid choice
+            dpg.set_value(tag, ctrl.get(tag, ''))
+            return
+        ctrl[tag] = val
+        if dpg.does_item_exist(f"own_{role}_{kind}"):
+            dpg.set_value(f"own_{role}_{kind}", val in owned[kind])
+        _send_optics(role)
+
+    def _toggle_owned(role, kind):
+        val = dpg.get_value(f"opt_{role}_{kind}")
+        if not val or val == _DIV:
+            dpg.set_value(f"own_{role}_{kind}", False)
+            return
+        (owned[kind].add if dpg.get_value(f"own_{role}_{kind}") else owned[kind].discard)(val)
+        _rebuild_gear(kind)
+
+    def _automatch_optics(role, url):
+        """When a ZWO camera whose model is a known DB sensor is picked, point this role's Optics
+        sensor at it (so the plate scale matches the actual chip)."""
+        if not (url and url.startswith('zwo:')):
+            return
+        model = url[len('zwo:'):].rsplit('#', 1)[0]
+        if model in _SENS and dpg.does_item_exist(f"opt_{role}_sensor"):
+            dpg.set_value(f"opt_{role}_sensor", model)
+            ctrl[f"opt_{role}_sensor"] = model
+            if dpg.does_item_exist(f"own_{role}_sensor"):
+                dpg.set_value(f"own_{role}_sensor", model in owned['sensor'])
+            _send_optics(role)
+
+    def _on_camera_pick(role, url):
+        _send({'type': 'set_camera', 'role': role, 'url': None if url in (None, '', '(auto)') else url})
+        _automatch_optics(role, url)
+
+    # Settings persistence: gather the current settings into a JSON-able dict / apply a loaded one.
+    # Grows as mount/camera/optics land; today it covers the layout + per-role display + optics prefs.
+    def gather_settings():
+        return {
+            'version': 1,
+            'layout': {k: layout[k] for k in ('panel_w', 'pip_h', 'panel_open', 'pip_open', 'big_role')},
+            'display': {role: dict(view_settings.get(role, _default_settings())) for role in roles},
+            'optics': {
+                'owned': {k: sorted(v) for k, v in owned.items()},
+                'selection': {role: [dpg.get_value(f"opt_{role}_{k}") for k in ('sensor', 'optic', 'reducer')]
+                              for role in roles if dpg.does_item_exist(f"opt_{role}_sensor")},
+            },
+            'cameras': {role: dpg.get_value(f"chooser_{role}")
+                        for role in roles if dpg.does_item_exist(f"chooser_{role}")},
+        }
+
+    def apply_settings(data):
+        for k, v in (data.get('layout') or {}).items():
+            if k in layout:
+                layout[k] = v
+        layout['_sig'] = None                          # force a relayout next frame
+        for role, s in (data.get('display') or {}).items():
+            vs = view_settings.setdefault(role, _default_settings())
+            for k in ('zoom', 'reticles', 'histogram'):
+                if k in s:
+                    vs[k] = s[k]
+            if dpg.does_item_exist(f"ret_{role}"):      # keep the panel checkboxes in sync
+                dpg.set_value(f"ret_{role}", vs['reticles'])
+            if dpg.does_item_exist(f"hist_{role}"):
+                dpg.set_value(f"hist_{role}", vs['histogram'])
+        opt = data.get('optics') or {}
+        for k, names in (opt.get('owned') or {}).items():
+            if k in owned:
+                owned[k] = set(names)
+        for k in owned:
+            _rebuild_gear(k)
+        for role, sel in (opt.get('selection') or {}).items():
+            if not (sel and dpg.does_item_exist(f"opt_{role}_sensor")):
+                continue
+            for k, v in zip(('sensor', 'optic', 'reducer'), sel):
+                if v and dpg.does_item_exist(f"opt_{role}_{k}"):
+                    dpg.set_value(f"opt_{role}_{k}", v)
+                    ctrl[f"opt_{role}_{k}"] = v
+                    if dpg.does_item_exist(f"own_{role}_{k}"):
+                        dpg.set_value(f"own_{role}_{k}", v in owned[k])
+            _send_optics(role)                          # push the loaded optics to the backend
+        for role, url in (data.get('cameras') or {}).items():
+            if url and dpg.does_item_exist(f"chooser_{role}"):
+                dpg.set_value(f"chooser_{role}", url if url in (ctrl.get('cam_items') or ['(auto)']) else '(auto)')
+                _on_camera_pick(role, dpg.get_value(f"chooser_{role}"))   # push the loaded camera to the backend
+
+    def _settings_refresh(select=None):
+        dpg.configure_item('settings_combo', items=settings_store.list_settings())
+        if select is not None:
+            dpg.set_value('settings_combo', select)
+
+    def _settings_save():
+        name = (dpg.get_value('settings_name') or dpg.get_value('settings_combo') or '').strip()
+        if name:
+            _settings_refresh(settings_store.save(name, gather_settings()))
+            dpg.set_value('settings_name', '')
+
+    def _settings_load():
+        if dpg.get_value('settings_combo'):
+            apply_settings(settings_store.load(dpg.get_value('settings_combo')))
+
+    def _settings_delete():
+        if dpg.get_value('settings_combo'):
+            settings_store.delete(dpg.get_value('settings_combo'))
+            _settings_refresh('')
 
     with dpg.window(tag="win_panel", no_title_bar=True, no_move=True, no_resize=True, no_collapse=True):
-        state_text = dpg.add_text("backend: connecting...")
-        dpg.add_separator()
-        dpg.add_text("Cameras", color=(160, 170, 190))
-        for role in roles:
-            with dpg.collapsing_header(label=role.capitalize(), default_open=True) as hdr:
-                pass
-            render_camera_settings(role, hdr)
-        dpg.add_separator()
-        dpg.add_text("Slew", color=(160, 170, 190))
-        with dpg.group(horizontal=True):
-            dpg.add_spacer(width=S(72))
-            btn_alt_up = dpg.add_button(label="Alt +", width=S(64), height=S(40))
-        with dpg.group(horizontal=True):
-            btn_az_dn = dpg.add_button(label="Az -", width=S(64), height=S(40))
-            btn_stop = dpg.add_button(label="Stop", width=S(64), height=S(40))
-            btn_az_up = dpg.add_button(label="Az +", width=S(64), height=S(40))
-        with dpg.group(horizontal=True):
-            dpg.add_spacer(width=S(72))
-            btn_alt_dn = dpg.add_button(label="Alt -", width=S(64), height=S(40))
-        dpg.add_text("hold a direction to slew", color=(150, 150, 150))
-        dpg.add_text("click a pane to track, right-click to stop", color=(150, 150, 150))
+        with dpg.collapsing_header(label="Mount", default_open=True):
+            _combo_row("mount", ['Simulated mount'], 'mount_combo', None, default='Simulated mount')
+            _tip("Which mount to drive. Live connect (real Celestron / Stellarium) is still WIP.")
+            # 2D slew pad: a log-scaled az/alt rate plane. Drag = drive the mount (momentary override
+            # of tracking); the circle shows the current rate (readout in update_control).
+            dpg.add_text("Slew", color=(160, 170, 190))     # a drawlist can't host a tooltip; label it
+            _tip(f"Drag the pad to drive the mount (log scale, max {SLEW_MAX:g} deg/s; Az = right, "
+                 f"Alt = up). Centre = stop. Momentarily overrides tracking, resumes on release.")
+            with dpg.drawlist(width=S(200), height=S(200), tag='slew_pad'):
+                pad_bg = dpg.add_draw_layer()
+                pad_fg = dpg.add_draw_layer()
+            _P, _c, _H = S(200), S(100), S(100)                  # static grid (log scale)
+            dpg.draw_rectangle((1, 1), (_P - 1, _P - 1), color=(80, 86, 100, 220),
+                               fill=(18, 20, 26, 220), parent=pad_bg)     # box; border edge = SLEW_MAX
+            for _g in SLEW_GRID:
+                _d = _rate_to_u(_g) * _H
+                for _s in (-1, 1):
+                    dpg.draw_line((_c + _s * _d, 2), (_c + _s * _d, _P - 2), color=(80, 86, 100, 110), parent=pad_bg)
+                    dpg.draw_line((2, _c + _s * _d), (_P - 2, _c + _s * _d), color=(80, 86, 100, 110), parent=pad_bg)
+            dpg.draw_line((_c, 2), (_c, _P - 2), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # az=0
+            dpg.draw_line((2, _c), (_P - 2, _c), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # alt=0
+        with dpg.collapsing_header(label="Cameras", default_open=True):
+            dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_cameras'}))
+            _tip("Re-enumerate attached ZWO cameras (after plugging one in).")
+            for role in roles:
+                with dpg.collapsing_header(label=role.capitalize(), default_open=True) as hdr:
+                    pass
+                render_camera_settings(role, hdr)
+        with dpg.collapsing_header(label="Optics"):
+            dpg.add_text("Sensor + optic set the pixel scale.", color=(150, 150, 150), wrap=S(210))
+            for role in roles:
+                dpg.add_separator()
+                dpg.add_text(role.capitalize(), color=(160, 170, 190))
+                for kind, has_owned in (('sensor', True), ('optic', True), ('reducer', False)):
+                    with dpg.group(horizontal=True):
+                        dpg.add_text(f"{kind}:")
+                        dpg.add_combo(_gear_items(kind), tag=f"opt_{role}_{kind}",
+                                      width=(-S(30) if has_owned else -1), user_data=(role, kind),
+                                      callback=lambda _s, _a, u: _on_gear_change(u[0], u[1]))
+                        _tip(f"{role.capitalize()} {kind}. Owned gear is pinned to the top of the list.")
+                        if has_owned:
+                            dpg.add_checkbox(tag=f"own_{role}_{kind}", user_data=(role, kind),
+                                             callback=lambda _s, _a, u: _toggle_owned(u[0], u[1]))
+                            _tip("I own this — pin it to the top of the list (in every dropdown).")
+        with dpg.collapsing_header(label="Settings"):
+            dpg.add_combo(settings_store.list_settings(), tag='settings_combo', width=-1)
+            _tip("A saved settings file captures the layout, display prefs, optics + owned gear, and cameras.")
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Load", callback=_settings_load)
+                dpg.add_button(label="Delete", callback=_settings_delete)
+                dpg.add_button(label="Show folder", callback=lambda: _open_folder(settings_store.settings_dir()))
+                _tip("Open the settings folder in the file browser.")
+            dpg.add_spacer(height=S(4))
+            with dpg.group(horizontal=True):
+                dpg.add_input_text(tag='settings_name', hint="save as...", width=-S(56))
+                dpg.add_button(label="Save", callback=_settings_save)
 
     def update_control():
         # Connect to the backend command socket once its port file appears.
@@ -695,28 +930,75 @@ def main(argv=None):
             if want_rec != bool(rec_st.get(role)) and want_rec != rec_sent.get(role):
                 _send({'type': 'record', 'role': role, 'on': want_rec}); rec_sent[role] = want_rec
 
-        if st:
-            caps = ' '.join(f"{r}:{'on' if v else 'off'}" for r, v in cap_st.items())
-            recs = ' '.join(f"{r}:{'on' if v else 'off'}" for r, v in rec_st.items())
-            dpg.set_value(state_text,
-                          f"{st.get('mode', '?')}   az {st.get('enc_az_deg', 0):.2f}   "
-                          f"alt {st.get('enc_alt_deg', 0):.2f}\n"
-                          f"rate {st.get('rate_az_deg_s', 0):.2f}, {st.get('rate_alt_deg_s', 0):.2f} deg/s\n"
-                          f"record [{recs}]   capture [{caps}]")
-        else:
-            dpg.set_value(state_text,
-                          "backend: connecting..." if ctrl['client'] is None else "backend: waiting for state")
+        # One-time init of the Optics tab dropdowns from the backend's current selection.
+        opt_sel = (st or {}).get('optics_sel') or {}
+        opt_init = ctrl.setdefault('opt_init', set())
+        for role in roles:
+            if role in opt_init or role not in opt_sel or not dpg.does_item_exist(f"opt_{role}_sensor"):
+                continue
+            sen, opt_, red = (list(opt_sel[role]) + [None, None, None])[:3]
+            for k, v in (('sensor', sen), ('optic', opt_), ('reducer', red or '(none)')):
+                dpg.set_value(f"opt_{role}_{k}", v or '')
+                ctrl[f"opt_{role}_{k}"] = v or ''
+                if dpg.does_item_exist(f"own_{role}_{k}"):
+                    dpg.set_value(f"own_{role}_{k}", bool(v) and v in owned[k])
+            opt_init.add(role)
 
-        # Press-and-hold slew: send the rate implied by the currently-held buttons, on change.
-        sr = args.slew_rate
-        if dpg.is_item_active(btn_stop):
-            az = alt = 0.0
-        else:
-            az = (sr if dpg.is_item_active(btn_az_up) else 0.0) - (sr if dpg.is_item_active(btn_az_dn) else 0.0)
-            alt = (sr if dpg.is_item_active(btn_alt_up) else 0.0) - (sr if dpg.is_item_active(btn_alt_dn) else 0.0)
-        if ctrl['client'] is not None and (az, alt) != ctrl['last_rate']:
-            ctrl['client'].send({'type': 'set_rate', 'az': az, 'alt': alt})
-            ctrl['last_rate'] = (az, alt)
+        # Camera chooser: keep dropdown items in sync with the detected cameras + init selection once.
+        cam_items = ['(auto)'] + ((st or {}).get('cameras_available') or [])
+        if ctrl.get('cam_items') != cam_items:
+            ctrl['cam_items'] = cam_items
+            for role in roles:
+                if dpg.does_item_exist(f"chooser_{role}"):
+                    sel = dpg.get_value(f"chooser_{role}")
+                    dpg.configure_item(f"chooser_{role}", items=cam_items)
+                    dpg.set_value(f"chooser_{role}", sel if sel in cam_items else '(auto)')
+        cam_sel_st = (st or {}).get('camera') or {}
+        cam_init = ctrl.setdefault('cam_init', set())
+        for role in roles:
+            if role in cam_init or st is None or not dpg.does_item_exist(f"chooser_{role}"):
+                continue
+            val = cam_sel_st.get(role)
+            dpg.set_value(f"chooser_{role}", val if val in cam_items else '(auto)')
+            cam_init.add(role)
+
+        # 2D slew pad: drag inside it to drive the mount at a log-scaled az/alt rate (centre dead-zone
+        # = zero). Momentarily overrides tracking, and resumes it on release. Drag latches, so it
+        # keeps driving even if the cursor leaves the pad (release to stop).
+        pad_rmin, pad_rsz = _item_rect('slew_pad')
+        mx, my = dpg.get_mouse_pos(local=False)
+        over = (pad_rmin is not None and pad_rmin[0] <= mx <= pad_rmin[0] + pad_rsz[0]
+                and pad_rmin[1] <= my <= pad_rmin[1] + pad_rsz[1])
+        if (dpg.is_mouse_button_down(dpg.mvMouseButton_Left) and pad_rmin is not None
+                and (ctrl.get('slew_active') or over)):
+            if not ctrl.get('slew_active'):          # drag start -> remember a track to resume on release
+                ctrl['slew_active'] = True
+                ctrl['slew_resume'] = ((st or {}).get('track_role'), (st or {}).get('target_px')) \
+                    if (st and st.get('tracking')) else None
+            hx, hy = pad_rsz[0] / 2.0, pad_rsz[1] / 2.0
+            az = _u_to_rate((mx - (pad_rmin[0] + hx)) / max(1.0, hx))
+            alt = _u_to_rate(-(my - (pad_rmin[1] + hy)) / max(1.0, hy))       # screen y down -> alt up
+            if ctrl['client'] is not None and (az, alt) != ctrl['last_rate']:
+                ctrl['client'].send({'type': 'set_rate', 'az': az, 'alt': alt})
+                ctrl['last_rate'] = (az, alt)
+        elif ctrl.get('slew_active'):                # released -> stop, then resume any prior track
+            ctrl['slew_active'] = False
+            if ctrl['client'] is not None:
+                ctrl['client'].send({'type': 'stop'})
+                ctrl['last_rate'] = (0.0, 0.0)
+                res = ctrl.get('slew_resume')
+                if res and res[0] and res[1]:
+                    ctrl['client'].send({'type': 'track', 'role': res[0],
+                                         'px': [float(res[1][0]), float(res[1][1])]})
+            ctrl['slew_resume'] = None
+
+        # Current-rate circle on the pad (drawlist-local coords), from telemetry.
+        dpg.delete_item(pad_fg, children_only=True)
+        if st and pad_rsz is not None:
+            hx, hy = pad_rsz[0] / 2.0, pad_rsz[1] / 2.0
+            cxp = hx + _rate_to_u(st.get('rate_az_deg_s', 0.0)) * hx
+            cyp = hy - _rate_to_u(st.get('rate_alt_deg_s', 0.0)) * hy
+            dpg.draw_circle((cxp, cyp), S(6), color=(70, 230, 100, 235), thickness=2.0, parent=pad_fg)
 
     # ---- layout: position everything from the viewport size ------------------------------
     def relayout():
