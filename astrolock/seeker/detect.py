@@ -271,6 +271,13 @@ def _committed(reader, ser_path):
     return min(lines, reader.frames_on_disk())
 
 
+def _segment_ready(ser_path):
+    """A just-created segment's .ser exists a beat before the cam has flushed its header + first
+    frame. Gate on the commit point -- the sidecar's first complete line, which the cam appends only
+    after those bytes are on disk -- so we never open a header-less .ser."""
+    return sidecar.count_complete_lines(ser_path[:-len('.ser')] + '.frames.jsonl') >= 1
+
+
 def _frame_count(ser_path):
     with open(ser_path, 'rb') as f:
         return ser_mod.unpack_header(f.read(ser_mod.HEADER_SIZE)).frame_count
@@ -371,15 +378,18 @@ def main(argv=None):
     args = p.parse_args(argv)
     device = torch.device(args.device)
 
-    # Wait for the first segment to exist.
-    while not _segments(args.session, args.role):
+    # Wait for the first *ready* segment (header + first frame committed via the sidecar), not merely
+    # for the .ser to exist -- the cam creates the file a beat before it writes the header.
+    while True:
         if args.stop_file and os.path.exists(args.stop_file):
             return
+        ready = [s for s in _segments(args.session, args.role) if _segment_ready(s)]
+        if ready:
+            break
         time.sleep(args.poll)
 
     # Live tracks the newest segment; offline starts at the oldest and processes in order.
-    segs = _segments(args.session, args.role)
-    cur = segs[-1] if args.follow else segs[0]
+    cur = ready[-1] if args.follow else ready[0]
 
     def open_segment(ser_path):
         reader = ser_mod.SerReader(ser_path)
@@ -461,8 +471,9 @@ def main(argv=None):
                     next_index += 1
                     avail = _committed(reader, cur)
 
-            # Caught up on the current segment. Roll if a newer one exists.
-            newer = [s for s in _segments(args.session, args.role) if s > cur]
+            # Caught up on the current segment. Roll to a newer one -- but only once it's *ready*
+            # (header + first frame committed), else we'd race the cam and open a header-less .ser.
+            newer = [s for s in _segments(args.session, args.role) if s > cur and _segment_ready(s)]
             if newer:
                 reader.close()
                 writer.close()
