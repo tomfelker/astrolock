@@ -156,6 +156,9 @@ def main(argv=None):
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky source: lens focal length (mm)")
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky source: wavelength for the physically-sized Airy-disc PSF (nm)")
+    p.add_argument('--sky-psf-sigma-px', type=float, default=None,
+                   help="sky source: residual-blur Gaussian on top of the Airy disc, px (default auto: 0 "
+                        "when the aperture is known, else 1.3)")
     p.add_argument('--wb-r', type=float, default=1.24, help="GUI display-only WB gain for red (1 = none)")
     p.add_argument('--wb-b', type=float, default=1.98, help="GUI display-only WB gain for blue (1 = none)")
     p.add_argument('--gui', dest='gui', action='store_true', default=True)
@@ -341,6 +344,8 @@ def main(argv=None):
             per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum),
                             '--sky-aperture-mm', str(aperture_by_role.get(role, 0.0)),
                             '--sky-psf-wavelength-nm', str(args.sky_psf_wavelength_nm)]
+            if args.sky_psf_sigma_px is not None:     # else the cam auto-picks (0 if aperture known, else 1.3)
+                per_role_sky += ['--sky-psf-sigma-px', str(args.sky_psf_sigma_px)]
             if role in fov_by_role:                   # DB optics named -> render at the true sensor
                 per_role_sky += ['--sky-width', str(rx), '--sky-height', str(ry)]   # res, so FoV matches
             if role in roi_window_by_role:            # centered readout window (sensor px) -> frame metadata

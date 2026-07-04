@@ -273,7 +273,8 @@ def _open_sky(args, state_path=None, mount_path=None):
 
     cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
-                       aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm)
+                       aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm,
+                       psf_sigma_px=args.sky_psf_sigma_px)
     sim = SkySim(cfg)                                   # render-only; propagation lives in sky_sim.py
     almanac = SkyAlmanac(args.sky_almanac)              # shared, system-clock-timed source directions
     fov_x = _math.degrees(2 * _math.atan(cfg.width * cfg.pixel_pitch_um * 1e-3 / (2 * cfg.focal_length_mm)))
@@ -436,6 +437,9 @@ def main(argv=None):
                    help="sky: objective aperture (mm); >0 renders a physically-sized Airy-disc PSF")
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky: wavelength for the Airy disc (nm)")
+    p.add_argument('--sky-psf-sigma-px', type=float, default=None,
+                   help="sky: residual-blur Gaussian (seeing/defocus/aberration) on top of the Airy disc, "
+                        "px. Default auto: 0 when the aperture is known (pure diffraction), else 1.3.")
     p.add_argument('--sky-az-deg', type=float, default=None, help="sky: fallback encoder az for scripted (non-follow) runs")
     p.add_argument('--sky-alt-deg', type=float, default=None, help="sky: fallback encoder alt")
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky: scripted az slew (deg/s) for streaks")

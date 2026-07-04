@@ -40,7 +40,9 @@ class SkySimConfig:
     boresight_px: tuple = None                 # (x, y); default = image center
 
     # rendering / noise
-    psf_sigma_px: float = 1.3                 # residual blur (seeing/defocus/aberration) atop the Airy disc
+    psf_sigma_px: float = None                # residual blur (seeing/defocus/aberration) atop the Airy disc,
+                                              # px. None = auto: 0 when the aperture is known (trust the
+                                              # physical diffraction PSF), else 1.3 (the Gaussian IS the PSF).
     aperture_mm: float = 0.0                  # objective aperture; >0 -> physically-sized Airy-disc PSF
     psf_wavelength_nm: float = 550.0          # wavelength for the Airy disc (green mid-band)
     mag_flux_scale: float = 4.0e6             # electrons/s for a mag-0 source
@@ -195,6 +197,8 @@ class SkySim:
         residual-blur Gaussian; otherwise the plain Gaussian (backward-compatible)."""
         c = self.cfg
         sigma = c.psf_sigma_px
+        if sigma is None:                                  # auto: pure Airy when optics are known, else Gaussian
+            sigma = 0.0 if c.aperture_mm > 0 else 1.3
         if c.aperture_mm > 0:
             # First-null radius r = 1.22 * lambda * (f/D), converted from metres to pixels.
             fnum = c.focal_length_mm / c.aperture_mm
