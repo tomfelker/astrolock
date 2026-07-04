@@ -167,6 +167,8 @@ def main(argv=None):
     p.add_argument('--sky-psf-sigma-px', type=float, default=None,
                    help="sky source: residual-blur Gaussian on top of the Airy disc, px (default auto: 0 "
                         "when the aperture is known, else 1.3)")
+    p.add_argument('--sky-seeing-r0-m', type=float, default=0.0,
+                   help="sky source: atmospheric Fried parameter r0 (m); >0 adds a seeing blur to all sim cams")
     p.add_argument('--wb-r', type=float, default=1.24, help="GUI display-only WB gain for red (1 = none)")
     p.add_argument('--wb-b', type=float, default=1.98, help="GUI display-only WB gain for blue (1 = none)")
     p.add_argument('--gui', dest='gui', action='store_true', default=True)
@@ -368,7 +370,8 @@ def main(argv=None):
         if sources[role] == 'sky':
             per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum),
                             '--sky-aperture-mm', str(aperture_by_role.get(role, 0.0)),
-                            '--sky-psf-wavelength-nm', str(args.sky_psf_wavelength_nm)]
+                            '--sky-psf-wavelength-nm', str(args.sky_psf_wavelength_nm),
+                            '--sky-seeing-r0-m', str(args.sky_seeing_r0_m)]
             if args.sky_psf_sigma_px is not None:     # else the cam auto-picks (0 if aperture known, else 1.3)
                 per_role_sky += ['--sky-psf-sigma-px', str(args.sky_psf_sigma_px)]
             if role in fov_by_role:                   # DB optics named -> render at the true sensor

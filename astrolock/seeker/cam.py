@@ -281,7 +281,7 @@ def _open_sky(args, state_path=None, mount_path=None):
     cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
                        aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm,
-                       psf_sigma_px=args.sky_psf_sigma_px)
+                       psf_sigma_px=args.sky_psf_sigma_px, seeing_r0_m=args.sky_seeing_r0_m)
     device = resolve_device(getattr(args, 'device', 'auto'))
     sim = SkySim(cfg, device=device)                   # render-only; propagation lives in sky_sim.py
     almanac = SkyAlmanac(args.sky_almanac)              # shared, system-clock-timed source directions
@@ -345,11 +345,11 @@ def _open_sky(args, state_path=None, mount_path=None):
         return frame, int(now_ns + 0.5 * exp * 1e9), now_ns + int(exp * 1e9)
 
     caps = [{'name': 'exposure', 'label': 'Exposure', 'kind': 'number', 'unit': 'ms', 'scale': 'log',
-             'min': 1.0, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True}]
+             'min': 0.01, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True}]
 
     def set_control(name, value):
         if name == 'exposure':
-            _live['exp'] = max(0.001, value / 1000.0)
+            _live['exp'] = max(1e-5, value / 1000.0)     # down to ~0.01 ms; the sim can render any exposure
             return _live['exp'] * 1000.0
         return None
     controls = {'source': 'sky', 'controls': caps, 'set': set_control}
@@ -449,8 +449,10 @@ def main(argv=None):
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky: wavelength for the Airy disc (nm)")
     p.add_argument('--sky-psf-sigma-px', type=float, default=None,
-                   help="sky: residual-blur Gaussian (seeing/defocus/aberration) on top of the Airy disc, "
-                        "px. Default auto: 0 when the aperture is known (pure diffraction), else 1.3.")
+                   help="sky: residual-blur Gaussian (defocus/aberration) on top of the Airy disc, px. "
+                        "Default auto: 0 when the aperture is known (pure diffraction), else 1.3.")
+    p.add_argument('--sky-seeing-r0-m', type=float, default=0.0,
+                   help="sky: atmospheric Fried parameter r0 (m); >0 adds a seeing blur (FWHM ~0.98*lambda/r0)")
     p.add_argument('--sky-az-deg', type=float, default=None, help="sky: fallback encoder az for scripted (non-follow) runs")
     p.add_argument('--sky-alt-deg', type=float, default=None, help="sky: fallback encoder alt")
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky: scripted az slew (deg/s) for streaks")

@@ -458,11 +458,14 @@ def main(argv=None):
             dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (130, 135, 150, 255), category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0, category=dpg.mvThemeCat_Core)
 
-    with dpg.theme() as stop_theme:                # the Stop button: unmistakably red
-        with dpg.theme_component(dpg.mvButton):
-            dpg.add_theme_color(dpg.mvThemeCol_Button, (170, 40, 40, 255), category=dpg.mvThemeCat_Core)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (205, 55, 55, 255), category=dpg.mvThemeCat_Core)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (235, 75, 75, 255), category=dpg.mvThemeCat_Core)
+    # The thin divider windows have a ~32px ImGui min body that overflows past the 6px handle. Give them
+    # a fully transparent background (+ no padding/border) so that overflow is invisible -- only the button
+    # handle draws, and whatever's behind (the PIP pane / viewport) shows through the rest.
+    with dpg.theme() as splitter_win_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (0, 0, 0, 0), category=dpg.mvThemeCat_Core)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0, category=dpg.mvThemeCat_Core)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 0, category=dpg.mvThemeCat_Core)
 
     make_slot('big')
     # Horizontal divider between the big pane and the PIP strip (drag to resize the strip). Behind
@@ -471,14 +474,14 @@ def main(argv=None):
     with dpg.window(tag="hsplitter", no_title_bar=True, no_move=True, no_resize=True,
                     no_scrollbar=True, no_collapse=True, no_bring_to_front_on_focus=True):
         dpg.add_button(tag="hsplitter_btn", label="", width=S(40), height=S(6))
-    dpg.bind_item_theme("hsplitter", slot_theme)
+    dpg.bind_item_theme("hsplitter", splitter_win_theme)
     dpg.bind_item_theme("hsplitter_btn", splitter_theme)
     make_slot('pipother')
     # Vertical divider between the big+PIP column and the right panel (drag to resize the panel).
     with dpg.window(tag="splitter", no_title_bar=True, no_move=True, no_resize=True,
                     no_scrollbar=True, no_collapse=True, no_bring_to_front_on_focus=True):
         dpg.add_button(tag="splitter_btn", label="", width=S(6), height=S(40))
-    dpg.bind_item_theme("splitter", slot_theme)
+    dpg.bind_item_theme("splitter", splitter_win_theme)
     dpg.bind_item_theme("splitter_btn", splitter_theme)
 
     def _draw_placeholder(name, SW, SH, role):
@@ -497,6 +500,11 @@ def main(argv=None):
             dpg.delete_item(f"L_{L}_{name}", children_only=True)
         _draw_toolbar(name, rmin)              # always available, even before the camera has data
         cam = cams.get(role)
+        # A disconnected (not-capturing) real cam: don't re-draw its stale, possibly-4K texture every
+        # frame -- that per-frame texture sampling is the bulk of the idle GPU. Show a placeholder instead.
+        if role in roles and not bool((ctrl['state'] or {}).get('capturing', {}).get(role)):
+            _draw_placeholder(name, SW, SH, f"{role} — disconnected")
+            return
         if cam is None or not dpg.does_item_exist(cam['tex']):
             _draw_placeholder(name, SW, SH, role)
             return
@@ -636,16 +644,19 @@ def main(argv=None):
             dpg.draw_rectangle((hx0, hy0), (hx1, hy1), color=(180, 180, 180, 200), thickness=1.0,
                                parent=f"L_hist_{name}")
 
-        # Status line (bottom-left) + a blinking NOT RECORDING warning if tracking without recording.
+        # Status line (bottom-left) + a blinking red warning while tracking if this cam is disconnected
+        # (not capturing) or running-but-not-recording.
         st_now = ctrl['state'] or {}
-        recording = bool((st_now.get('recording') or {}).get(role)) and bool(st_now.get('capturing', {}).get(role))
+        capturing = bool(st_now.get('capturing', {}).get(role))
+        recording = bool((st_now.get('recording') or {}).get(role)) and capturing
         status = (f"{role}  f{cam['last_idx']}  {_color_name(cam['color_id'])}  "
                   f"blobs {len(cam['blobs'])}  zoom {_zoom_label(zoom)}" + ("  REC" if recording else ""))
         dpg.draw_text((S(8), SH - S(20)), status, size=S(13), color=(200, 205, 220, 230), parent=f"L_warn_{name}")
-        if st_now.get('tracking') and not recording and int(time.perf_counter() * 1.5) % 2 == 0:
-            msg = "NOT RECORDING"
-            dpg.draw_text((cx - len(msg) * S(40) * 0.30, cy + S(20)), msg, size=S(40),
-                          color=(255, 40, 40, 255), parent=f"L_warn_{name}")
+        if role in roles and st_now.get('tracking') and int(time.perf_counter() * 1.5) % 2 == 0:
+            msg = "NOT CONNECTED" if not capturing else ("NOT RECORDING" if not recording else None)
+            if msg:
+                dpg.draw_text((cx - len(msg) * S(40) * 0.30, cy + S(20)), msg, size=S(40),
+                              color=(255, 40, 40, 255), parent=f"L_warn_{name}")
 
     # ---- click handling ------------------------------------------------------------------
     def _slot_at(mx, my):
@@ -1001,7 +1012,7 @@ def main(argv=None):
             dpg.add_button(label="Connect", tag="mount_conn", callback=lambda: _toggle_mount_connect())
             _tip("Connect to / disconnect from the selected mount. Disconnected = the backend holds the "
                  "last pose and nothing moves.")
-            dpg.add_text("Alt: --   Az: --", tag="mount_pose_txt")               # live encoder pose (deg)
+            dpg.add_text("Az: --   Alt: --", tag="mount_pose_txt")               # live encoder pose (deg)
             dpg.add_text("rate: --", tag="mount_rate_txt", color=(160, 170, 190))   # live axis rates (deg/s)
             # 2D slew pad: a log-scaled az/alt rate plane. Drag = drive the mount (momentary override
             # of tracking); the circle shows the current rate (readout in update_control).
@@ -1021,9 +1032,8 @@ def main(argv=None):
                     dpg.draw_line((2, _c + _s * _d), (_P - 2, _c + _s * _d), color=(80, 86, 100, 110), parent=pad_bg)
             dpg.draw_line((_c, 2), (_c, _P - 2), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # az=0
             dpg.draw_line((2, _c), (_P - 2, _c), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # alt=0
-            dpg.add_button(label="STOP", tag="stop_btn", width=-1, height=S(34),
+            dpg.add_button(label="Stop", tag="stop_btn", width=S(200),
                            callback=lambda: _send({'type': 'stop'}))
-            dpg.bind_item_theme("stop_btn", stop_theme)
             _tip("Immediately stop mount motion and cancel tracking.")
         with dpg.collapsing_header(label="Cameras", default_open=True):
             dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_cameras'}))
@@ -1033,10 +1043,11 @@ def main(argv=None):
                     pass
                 render_camera_settings(role, hdr)
         with dpg.collapsing_header(label="Optics"):
-            dpg.add_text("Sensor + optic set the pixel scale.", color=(150, 150, 150), wrap=S(210))
             for role in roles:
                 dpg.add_separator()
-                dpg.add_text(role.capitalize(), color=(160, 170, 190))
+                with dpg.group(horizontal=True):
+                    dpg.add_text(role.capitalize(), color=(160, 170, 190))
+                    dpg.add_text("", tag=f"opt_info_{role}", color=(150, 155, 170))   # live FoV (from state)
                 for kind, has_owned in (('sensor', True), ('optic', True), ('reducer', False)):
                     with dpg.group(horizontal=True):
                         dpg.add_text(f"{kind}:")
@@ -1049,9 +1060,6 @@ def main(argv=None):
                                              callback=lambda _s, _a, u: _toggle_owned(u[0], u[1]))
                             _tip("I own this — pin it to the top of the list (in every dropdown).")
         with dpg.collapsing_header(label="Boresight"):
-            dpg.add_text("Angle from the guide to the main camera. Centre a bright star in the main view, "
-                         "then nudge until the main-FoV box sits on that star in the guide.",
-                         color=(150, 150, 150), wrap=S(210))
             with dpg.group(horizontal=True):
                 dpg.add_text("X:")
                 dpg.add_input_text(tag='bore_x', width=S(56), on_enter=True, default_value="0",
@@ -1114,15 +1122,22 @@ def main(argv=None):
         tracking_st = bool((st or {}).get('tracking'))
         rec_sent = ctrl.setdefault('rec_sent', {})
         src_init = ctrl.setdefault('src_init', set())
-        autorec_init = ctrl.setdefault('autorec_init', set())
+        src_last = ctrl.setdefault('src_last', {})
         for role in roles:
             if st is None or not dpg.does_item_exist(f"src_{role}"):
                 continue
             # One-time init of the intent widgets from the backend's actual state.
             if role not in src_init and src_st.get(role):
                 dpg.set_value(f"src_{role}", src_st[role]); src_init.add(role)
-            if role not in autorec_init and src_st.get(role):     # default ON for a real cam, off for sim
-                dpg.set_value(f"autorec_{role}", src_st[role] == 'zwo'); autorec_init.add(role)
+            # Auto-record follows the source: switching TO a zwo (real) cam turns it on; first sight of a
+            # sim cam leaves it off. Otherwise it's the user's to toggle.
+            cur_src = src_st.get(role)
+            if cur_src and cur_src != src_last.get(role):
+                if cur_src == 'zwo':
+                    dpg.set_value(f"autorec_{role}", True)
+                elif role not in src_last:
+                    dpg.set_value(f"autorec_{role}", False)
+                src_last[role] = cur_src
             # Connect/Disconnect: the button label just mirrors the backend's actual capture state;
             # the click (in _toggle_connect) starts/stops the cam. Explicit only -- no auto-connect.
             if dpg.does_item_exist(f"conn_{role}"):
@@ -1183,9 +1198,17 @@ def main(argv=None):
             dpg.configure_item('mount_conn', label="Disconnect" if (st or {}).get('mount_connected') else "Connect")
         if st and dpg.does_item_exist('mount_pose_txt'):
             dpg.set_value('mount_pose_txt',
-                          f"Alt: {st.get('enc_alt_deg', 0.0):.3f}   Az: {st.get('enc_az_deg', 0.0):.3f}")
+                          f"Az: {st.get('enc_az_deg', 0.0):8.3f}   Alt: {st.get('enc_alt_deg', 0.0):8.3f}")
             dpg.set_value('mount_rate_txt',
-                          f"Az {st.get('rate_az_deg_s', 0.0):+.3f}   Alt {st.get('rate_alt_deg_s', 0.0):+.3f}  deg/s")
+                          f"Az {st.get('rate_az_deg_s', 0.0):+8.3f}   Alt {st.get('rate_alt_deg_s', 0.0):+8.3f}  deg/s")
+
+        # Optics panel: live field-of-view per role (from the backend's resolved optics).
+        opt_fov = (st or {}).get('optics') or {}
+        for role in roles:
+            if dpg.does_item_exist(f"opt_info_{role}"):
+                fv = opt_fov.get(role)
+                dpg.set_value(f"opt_info_{role}",
+                              f"{fv['fov_x_deg']:.2f}×{fv['fov_y_deg']:.2f}° FoV" if fv else "")
 
         # Caps-driven camera controls: rebuild a role's stepper widgets whenever the *set* of controls
         # changes (source switch -> a different camera's caps). Values track the GUI's own state after that.
@@ -1262,11 +1285,10 @@ def main(argv=None):
         dpg.configure_item("dl_big", width=max(S(40), left_w - inx), height=max(S(40), big_h - iny))
         if layout['pip_open'] and ph > S(20):
             pipw = max(S(80), min(left_w, int(ph * 16 / 9)))
-            # Match the divider's width to the PIP pane below it (as the vertical splitter matches the
-            # panel's height): the thin window's ~32px-min body overflows downward and only the PIP pane
-            # covers it, so a full-width divider would leave that dark overflow showing to the pane's right.
-            dpg.configure_item("hsplitter", show=True, pos=(0, big_h), width=pipw, height=hsp)
-            dpg.configure_item("hsplitter_btn", width=pipw, height=hsp)
+            # Full-width divider (spans the whole left column, up to the vertical splitter). The 6px
+            # window no longer overflows now that WindowMinSize is tiny, so it doesn't cover the PIP.
+            dpg.configure_item("hsplitter", show=True, pos=(0, big_h), width=left_w, height=hsp)
+            dpg.configure_item("hsplitter_btn", width=left_w, height=hsp)
             dpg.configure_item("slot_pipother", show=True, pos=(0, big_h + hsp), width=pipw, height=ph)
             dpg.configure_item("dl_pipother", width=max(S(40), pipw - inx), height=max(S(40), ph - iny))
         else:
@@ -1318,7 +1340,8 @@ def main(argv=None):
 
         dpg.render_dearpygui_frame()
         if not new_work:
-            time.sleep(0.005)            # idle: keep UI responsive without pegging a core
+            time.sleep(0.02)             # ~50 Hz when waiting for a frame -- plenty for video + input,
+            #                              vs the ~200 Hz that 0.005 gave (which pegged a core)
 
     _shutdown()      # belt-and-suspenders: if the exit callback didn't fire, still exit immediately
 

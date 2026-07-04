@@ -45,6 +45,8 @@ class SkySimConfig:
                                               # physical diffraction PSF), else 1.3 (the Gaussian IS the PSF).
     aperture_mm: float = 0.0                  # objective aperture; >0 -> physically-sized Airy-disc PSF
     psf_wavelength_nm: float = 550.0          # wavelength for the Airy disc (green mid-band)
+    seeing_r0_m: float = 0.0                  # atmospheric Fried parameter r0 (m); >0 adds a seeing blur
+                                              # (FWHM ~ 0.98*lambda/r0). Typical: 0.05 poor .. 0.2 excellent
     mag_flux_scale: float = 4.0e6             # electrons/s for a mag-0 source
     sky_bg_rate_e: float = 80.0              # sky background electrons / pixel / s
     read_noise_e: float = 2.0
@@ -169,63 +171,61 @@ class SkySim:
                 continue
             flat.index_add_(0, (yi[ok] * w + xi[ok]), flux[ok] * wgt[ok])
 
-    def _gauss_kernel(self, sigma):
-        rad = max(1, int(round(3 * sigma)))
-        ax = torch.arange(-rad, rad + 1, dtype=torch.float32)
-        k1 = torch.exp(-(ax ** 2) / (2 * sigma ** 2))
-        k1 /= k1.sum()
-        return torch.outer(k1, k1), rad
+    def _centred_offsets(self, sz):
+        """(yy, xx) pixel offsets from the origin over the whole `sz` grid, in FFT (wrapping) order --
+        0,1,..,n/2-1,-n/2,..,-1 -- so a kernel built on them peaks at index (0,0) and the convolution
+        adds no shift."""
+        H, W = sz
+        fy = torch.fft.fftfreq(H, device=self.device) * H
+        fx = torch.fft.fftfreq(W, device=self.device) * W
+        return torch.meshgrid(fy, fx, indexing='ij')
 
-    def _airy_kernel(self, r_null_px):
-        """Pixel-integrated Airy diffraction pattern, intensity I(r) = [2*J1(v)/v]^2 with the first null
-        at ``r_null_px`` (v = 3.8317 * r / r_null_px). Supersampled so a sub-pixel disc (a fast wide
-        lens) integrates correctly into the pixel grid -- which also folds in the pixel aperture MTF."""
-        rad = max(1, min(64, int(math.ceil(3.5 * r_null_px))))
-        ss = 8
-        n = (2 * rad + 1) * ss
-        ax = (torch.arange(n, dtype=torch.float64) - (n - 1) / 2.0) / ss     # px offset per subsample
-        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-        v = (3.831705970 / r_null_px) * torch.sqrt(xx * xx + yy * yy)        # J1's first zero at v=3.8317
-        j1 = torch.special.bessel_j1(v)
-        inten = torch.where(v < 1e-9, torch.ones_like(v), (2.0 * j1 / v) ** 2)
-        inten = inten.reshape(2 * rad + 1, ss, 2 * rad + 1, ss).mean(dim=(1, 3))   # integrate each pixel
-        return inten.to(torch.float32), rad
+    def _airy_otf(self, sz, r_null_px):
+        """rfft2 of the Airy diffraction pattern I(r) = [2 J1(v)/v]^2 (first null at r_null_px) computed
+        over the WHOLE (centred, wrapping) frame -- so there's no small square kernel to leave a faint
+        square halo around bright stars; the pattern just decays to ~0 by the frame edge."""
+        yy, xx = self._centred_offsets(sz)
+        v = (3.831705970 / r_null_px) * torch.sqrt(xx * xx + yy * yy)
+        inten = torch.where(v < 1e-9, torch.ones_like(v), (2.0 * torch.special.bessel_j1(v) / v) ** 2)
+        return torch.fft.rfft2((inten / inten.sum()))
 
-    def _psf_kernel(self):
-        """The PSF kernel + its radius. With a known aperture, a physically-sized Airy disc (the real
-        diffraction pattern for this f-number, wavelength, and pixel pitch), optionally convolved with a
-        residual-blur Gaussian; otherwise the plain Gaussian (backward-compatible)."""
+    def _gauss_otf(self, sz, sigma):
+        """rfft2 of a full-frame centred Gaussian of stddev `sigma` px."""
+        yy, xx = self._centred_offsets(sz)
+        g = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+        return torch.fft.rfft2((g / g.sum()))
+
+    def _seeing_sigma_px(self):
+        """Atmospheric-seeing Gaussian sigma (px) from the Fried parameter r0: FWHM = 0.98*lambda/r0
+        (rad) -> px via the plate scale (f_px = px/rad), /2.3548 to sigma. 0 when r0 is unset."""
         c = self.cfg
-        sigma = c.psf_sigma_px
-        if sigma is None:                                  # auto: pure Airy when optics are known, else Gaussian
-            sigma = 0.0 if c.aperture_mm > 0 else 1.3
-        if c.aperture_mm > 0:
-            # First-null radius r = 1.22 * lambda * (f/D), converted from metres to pixels.
-            fnum = c.focal_length_mm / c.aperture_mm
-            r_null_px = 1.2196699 * (c.psf_wavelength_nm * 1e-9) * fnum / (c.pixel_pitch_um * 1e-6)
-            kern, rad = self._airy_kernel(r_null_px)
-            if sigma > 0:                                   # Airy (X) residual-blur Gaussian, full convolution
-                g, grad = self._gauss_kernel(sigma)
-                kp = torch.nn.functional.pad(kern[None, None], (2 * grad,) * 4)
-                kern = torch.nn.functional.conv2d(kp, g[None, None])[0, 0]
-                rad += grad
-            return (kern / kern.sum()).to(self.device), rad
-        kern, rad = self._gauss_kernel(sigma)
-        return kern.to(self.device), rad
+        if c.seeing_r0_m <= 0:
+            return 0.0
+        fwhm_px = 0.98 * (c.psf_wavelength_nm * 1e-9) / c.seeing_r0_m * self.f_px
+        return fwhm_px / 2.354820045
 
     def _build_otf(self, h, w):
-        # NB: we deliberately DON'T pad by the PSF radius. A padded circular convolution avoids
-        # wrap-around at the frame edges, but the margin pushes the FFT onto an awkwardly-factored
-        # size (e.g. 2160 -> 2205 = 3^2*5*7^2, ~1.6x slower than the 2,3,5-smooth 2160). We only round
-        # up to the next fast length and let a near-edge star's PSF wrap to the opposite edge -- cheap,
-        # and unimportant for a star field. The kernel is centred at the origin (roll by -rad) so the
-        # convolution introduces no shift, and we just crop the top-left h x w.
-        kern, rad = self._psf_kernel()
+        # Build the PSF transfer function once (per frame size). We DON'T pad by a kernel radius: the
+        # kernels are built full-frame and centred at the origin, so there's no shift and no square kernel
+        # boundary, and a near-edge star's PSF just wraps to the opposite edge (cheap, fine for a star
+        # field). sz only rounds up to the next 2,3,5,7-smooth length (2160 stays 2160, not a slow 2205).
+        c = self.cfg
         sz = (_next_fast_len(h), _next_fast_len(w))
-        full = torch.zeros(sz, dtype=torch.float32, device=self.device)
-        full[:2 * rad + 1, :2 * rad + 1] = kern
-        full = torch.roll(full, shifts=(-rad, -rad), dims=(0, 1))     # kernel centre -> origin (no shift)
-        self._otf = torch.fft.rfft2(full)
+        # Residual Gaussian blur = aberration/defocus (psf_sigma_px, auto per policy) + atmospheric
+        # seeing (from r0), added in quadrature.
+        sigma = c.psf_sigma_px
+        if sigma is None:                              # auto: pure diffraction when optics are known
+            sigma = 0.0 if c.aperture_mm > 0 else 1.3
+        sigma = math.hypot(sigma, self._seeing_sigma_px())
+        if c.aperture_mm > 0:                          # physically-sized Airy disc, optionally blurred
+            fnum = c.focal_length_mm / c.aperture_mm
+            r_null_px = 1.2196699 * (c.psf_wavelength_nm * 1e-9) * fnum / (c.pixel_pitch_um * 1e-6)
+            otf = self._airy_otf(sz, r_null_px)
+            if sigma > 0:
+                otf = otf * self._gauss_otf(sz, sigma)  # convolution = product in the frequency domain
+        else:                                          # unknown optics: the Gaussian IS the PSF
+            otf = self._gauss_otf(sz, max(sigma, 1e-3))
+        self._otf = otf
         self._otf_sz, self._otf_hw = sz, (h, w)
 
     def _psf(self, fb):
