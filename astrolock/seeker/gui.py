@@ -458,6 +458,12 @@ def main(argv=None):
             dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (130, 135, 150, 255), category=dpg.mvThemeCat_Core)
             dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0, category=dpg.mvThemeCat_Core)
 
+    with dpg.theme() as stop_theme:                # the Stop button: unmistakably red
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (170, 40, 40, 255), category=dpg.mvThemeCat_Core)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (205, 55, 55, 255), category=dpg.mvThemeCat_Core)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (235, 75, 75, 255), category=dpg.mvThemeCat_Core)
+
     make_slot('big')
     # Horizontal divider between the big pane and the PIP strip (drag to resize the strip). Behind
     # the PIP so its 32px-min body is hidden there; this lives only in the left column, so the
@@ -714,6 +720,10 @@ def main(argv=None):
         'intent' to get out of sync -- and connecting is always an explicit user action."""
         on = bool(((ctrl['state'] or {}).get('capturing') or {}).get(role))
         _send({'type': 'capture', 'role': role, 'on': not on})
+
+    def _toggle_mount_connect():
+        on = bool((ctrl['state'] or {}).get('mount_connected'))
+        _send({'type': 'mount_connect', 'on': not on})
 
     def render_camera_settings(role, parent):
         """One camera's connection/capture/display settings under `parent`. Widgets are intent;
@@ -980,9 +990,21 @@ def main(argv=None):
         _bore_set(_f('bore_x', boresight_ui['x']), _f('bore_y', boresight_ui['y']))
 
     with dpg.window(tag="win_panel", no_title_bar=True, no_move=True, no_resize=True, no_collapse=True):
+        dpg.add_button(label="STOP", tag="stop_btn", width=-1, height=S(34),
+                       callback=lambda: _send({'type': 'stop'}))
+        dpg.bind_item_theme("stop_btn", stop_theme)
+        _tip("Immediately stop mount motion and cancel tracking.")
         with dpg.collapsing_header(label="Mount", default_open=True):
-            _combo_row("mount", ['Simulated mount'], 'mount_combo', None, default='Simulated mount')
-            _tip("Which mount to drive. Live connect (real Celestron / Stellarium) is still WIP.")
+            with dpg.group(horizontal=True):
+                dpg.add_text("mount:")
+                dpg.add_combo(['sim'], tag='mount_combo', default_value='sim', width=-S(66),
+                              callback=lambda _s, a: _send({'type': 'set_mount', 'url': a}))
+                dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_mounts'}))
+            _tip("Which mount to drive: 'sim', or a detected Celestron on a COM port. Rescan after "
+                 "plugging one in.")
+            dpg.add_button(label="Connect", tag="mount_conn", callback=lambda: _toggle_mount_connect())
+            _tip("Connect to / disconnect from the selected mount. Disconnected = the backend holds the "
+                 "last pose and nothing moves.")
             # 2D slew pad: a log-scaled az/alt rate plane. Drag = drive the mount (momentary override
             # of tracking); the circle shows the current rate (readout in update_control).
             dpg.add_text("Slew", color=(160, 170, 190))     # a drawlist can't host a tooltip; label it
@@ -1143,6 +1165,20 @@ def main(argv=None):
             val = cam_sel_st.get(role)
             dpg.set_value(f"chooser_{role}", val if val in cam_items else '(auto)')
             cam_init.add(role)
+
+        # Mount chooser + connect state (mirrors the camera chooser): keep the dropdown in sync with the
+        # detected mounts, init the selection once, and label the button from the backend's connect state.
+        mount_items = ['sim'] + [u for u in ((st or {}).get('mounts_available') or []) if u != 'sim']
+        if ctrl.get('mount_items') != mount_items and dpg.does_item_exist('mount_combo'):
+            ctrl['mount_items'] = mount_items
+            sel = dpg.get_value('mount_combo')
+            dpg.configure_item('mount_combo', items=mount_items)
+            dpg.set_value('mount_combo', sel if sel in mount_items else 'sim')
+        if st is not None and 'mount_init' not in ctrl and st.get('mount_url') and dpg.does_item_exist('mount_combo'):
+            dpg.set_value('mount_combo', st['mount_url'] if st['mount_url'] in mount_items else 'sim')
+            ctrl['mount_init'] = True
+        if dpg.does_item_exist('mount_conn'):
+            dpg.configure_item('mount_conn', label="Disconnect" if (st or {}).get('mount_connected') else "Connect")
 
         # Caps-driven camera controls: rebuild a role's stepper widgets whenever the *set* of controls
         # changes (source switch -> a different camera's caps). Values track the GUI's own state after that.

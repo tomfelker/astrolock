@@ -211,6 +211,37 @@ class CelestronMount(Mount):
         self._thread.join(timeout=2.0)
 
 
+class NullMount(Mount):
+    """Disconnected placeholder: holds its last pose, ignores rate commands, reports a site. Lets the
+    backend's control loop keep running with no mount attached -- nothing moves."""
+
+    def __init__(self, az0_rad=0.0, alt0_rad=0.0, site=None):
+        self._az, self._alt = az0_rad, alt0_rad
+        self._site = dict(site) if site else {}
+        self._t_ns = time.perf_counter_ns()
+
+    def set_rates(self, az_rad_s, alt_rad_s):
+        pass
+
+    def get_state(self):
+        return {'az_rad': self._az, 'alt_rad': self._alt, 'rate_az_rad_s': 0.0,
+                'rate_alt_rad_s': 0.0, 't_mono_ns': self._t_ns}
+
+    def get_site(self):
+        return dict(self._site)
+
+
+def available_mount_urls():
+    """Best-effort list of connectable real-mount URLs (Celestron on detected COM ports); [] if the
+    driver import or serial enumeration fails (e.g. no serial devices / no pyserial)."""
+    try:
+        from astrolock.model.telescope_connections.celestron_nexstar_hc import CelestronNexstarHCConnection
+        return list(CelestronNexstarHCConnection.get_urls())
+    except Exception as e:
+        print(f"[mount] could not enumerate mounts: {e}", flush=True)
+        return []
+
+
 def make_mount(kind, az0_rad, alt0_rad, site, max_rate_rad_s=math.radians(8.0),
                accel_rad_s2=math.radians(20.0), update_hz=10.0, url=None, sidecar_path=None):
     if kind == 'celestron':

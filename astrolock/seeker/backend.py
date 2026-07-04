@@ -204,6 +204,12 @@ def main(argv=None):
         site=site, max_rate_rad_s=max_rate, accel_rad_s2=math.radians(args.mount_accel_deg_s2),
         update_hz=args.mount_update_hz, url=args.mount_url, sidecar_path=sim_mount_path)
     msite = mount.get_site()        # GPS/site comes from the mount; it drives the sky-sim camera
+    # Mount lifecycle (GUI connect/disconnect). The site is captured here from the startup mount and
+    # feeds the sky-sim once; switching mounts later doesn't re-derive it (fine -- the sky sim is the
+    # sim workflow, and a real mount's site is a TODO fallback anyway).
+    mount_desired_url = 'sim' if args.mount == 'sim' else (args.mount_url or 'sim')
+    mount_connected = True                                  # the CLI-selected mount is live at startup
+    mounts_available = mount_mod.available_mount_urls()     # detected Celestron COM ports (GUI chooser)
 
     sky_args = []
     almanac_path = os.path.join(session_dir, f"{ts}_almanac.jsonl")       # sky_sim publishes here
@@ -541,9 +547,49 @@ def main(argv=None):
                         except OSError:
                             pass
 
+    def connect_mount(url):
+        """Replace the current mount driver with a fresh one for `url` ('sim' or a celestron URL),
+        continuing from the current pose. On failure, keep the current mount."""
+        nonlocal mount, mount_connected, mount_desired_url, tracking, coasting
+        mount_desired_url = url
+        st = mount.get_state()
+        try:
+            if url == 'sim':
+                new = mount_mod.make_mount(
+                    'sim', az0_rad=st['az_rad'], alt0_rad=st['alt_rad'], site=site, max_rate_rad_s=max_rate,
+                    accel_rad_s2=math.radians(args.mount_accel_deg_s2), update_hz=args.mount_update_hz,
+                    sidecar_path=sim_mount_path)
+            else:
+                new = mount_mod.make_mount('celestron', az0_rad=st['az_rad'], alt0_rad=st['alt_rad'],
+                                           site=site, max_rate_rad_s=max_rate, url=url)
+        except Exception as e:
+            print(f"[backend] mount connect failed ({url}): {e}", flush=True)
+            return
+        old, mount = mount, new
+        mount_connected = True
+        tracking = coasting = False                        # a fresh mount -> drop any active track
+        try:
+            old.close()
+        except Exception:
+            pass
+        print(f"[backend] mount connected: {url}", flush=True)
+
+    def disconnect_mount():
+        """Stop + close the current mount and leave a NullMount (holds pose, ignores commands)."""
+        nonlocal mount, mount_connected, tracking, coasting
+        st = mount.get_state()
+        old, mount = mount, mount_mod.NullMount(st['az_rad'], st['alt_rad'], site=mount.get_site())
+        mount_connected = False
+        tracking = coasting = False
+        try:
+            old.close()
+        except Exception:
+            pass
+        print("[backend] mount disconnected", flush=True)
+
     def apply_command(cmd):
         nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
-        nonlocal track_center
+        nonlocal track_center, mount_desired_url
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -661,6 +707,21 @@ def main(argv=None):
         elif t == 'rescan_cameras':
             cams_available[:] = cam_mod.zwo_camera_urls()
             print(f"[backend] cameras: {cams_available}", flush=True)
+        elif t == 'set_mount':
+            url = cmd.get('url')
+            if url:
+                mount_desired_url = url
+                if mount_connected:            # don't jump the gun: reselect -> disconnect, then Connect
+                    disconnect_mount()
+                print(f"[backend] mount selected: {url} (press Connect)", flush=True)
+        elif t == 'mount_connect':
+            if cmd.get('on', True):
+                connect_mount(mount_desired_url)
+            else:
+                disconnect_mount()
+        elif t == 'rescan_mounts':
+            mounts_available[:] = mount_mod.available_mount_urls()
+            print(f"[backend] mounts: {mounts_available}", flush=True)
         elif t == 'set_cam_control':
             role, name, value = cmd.get('role'), cmd.get('name'), cmd.get('value')
             if role in roles and name == 'bin':                        # geometry: recompute render (+ relaunch)
@@ -764,6 +825,9 @@ def main(argv=None):
                               if tracking and track_target and args.track_roi_size > 0 else None),
                 'sources': dict(sources),
                 'cameras_available': list(cams_available),   # detected ZWO URLs, for the GUI chooser
+                'mounts_available': list(mounts_available),   # detected mount URLs, for the GUI chooser
+                'mount_url': mount_desired_url,               # selected mount ('sim' or a celestron URL)
+                'mount_connected': mount_connected,           # is a real/sim mount driving (vs disconnected)
                 'camera': dict(camera_url),                   # per-role selected camera URL (or null)
                 'camera_caps': {r: published_caps(r) for r in roles},   # live camera controls for the GUI
                 'debug_ser': bool(args.debug_detect_ser),      # detectors are writing <role>_debug.ser streams
