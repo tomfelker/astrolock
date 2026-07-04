@@ -8,6 +8,28 @@ import numpy as np
 from astrolock.model.util import *
 
 
+_connections_loaded = False
+
+
+def _load_connection_subclasses():
+    """Import the connection submodules so ``TelescopeConnection.__subclasses__()`` sees them.
+
+    Done lazily (called from the factory methods) rather than as a bottom-of-file ``import *``, to
+    break a circular import: importing a connection submodule pulls in ``threaded`` ->
+    ``telescope_connection`` -> (the old bottom-line import) -> the submodules again, and a submodule's
+    ``class X(threaded.ThreadedConnection)`` then runs before ``threaded`` has finished defining
+    ``ThreadedConnection``. Deferring to first factory use means threaded is fully loaded by then.
+    """
+    global _connections_loaded
+    if _connections_loaded:
+        return
+    _connections_loaded = True
+    import importlib
+    from astrolock.model import telescope_connections as pkg
+    for name in getattr(pkg, '__all__', []):
+        importlib.import_module(f'{pkg.__name__}.{name}')
+
+
 class TelescopeConnection(object):
     def __init__(self, url, tracker):
         self.tracker = tracker
@@ -54,6 +76,7 @@ class TelescopeConnection(object):
 
     @classmethod
     def get_connection_class(cls, url):
+        _load_connection_subclasses()          # ensure every connection type is registered as a subclass
         try:
             if url.startswith(cls.get_url_scheme()):
                 return cls
@@ -70,6 +93,7 @@ class TelescopeConnection(object):
 
     @classmethod
     def get_urls_for_subclasses(cls):
+        _load_connection_subclasses()          # ensure every connection type is registered as a subclass
         connections = []
         for subclass in cls.__subclasses__():
             try:                
@@ -146,6 +170,3 @@ class TelescopeConnection(object):
 
 
 
-
-
-from astrolock.model.telescope_connections import *
