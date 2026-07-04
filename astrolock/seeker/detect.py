@@ -271,8 +271,14 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
     win = torch.where(valid, bp[yy, xx], torch.zeros((), device=dev))  # (K, t, t)
     peak = vals[:, None, None]
 
-    n_above = (win >= 0.5 * peak).sum(dim=(1, 2))                      # (K,)
-    wsub = (win - 0.5 * peak).clamp(min=0.0)
+    n_above = (win >= 0.5 * peak).sum(dim=(1, 2))                      # size proxy: area above half-max
+    # Background-subtracted intensity-weighted centroid over the WHOLE window. Subtract the window mean
+    # (removes any DC pedestal -- e.g. the DoH surface's positive floor -- that would otherwise drag the
+    # centroid toward the window centre; the star is a few of ~t^2 pixels so it barely inflates the mean),
+    # then clamp and take the true first moment. (The old (win - 0.5*peak) core threshold discarded
+    # everything but the peak pixel for a tight/undersampled star, collapsing onto the integer peak.)
+    bg = win.mean(dim=(1, 2), keepdim=True)
+    wsub = (win - bg).clamp(min=0.0)
     tot = wsub.sum(dim=(1, 2)).clamp(min=1e-6)
     cxf = (xx * wsub).sum(dim=(1, 2)) / tot                            # sub-pixel centroid
     cyf = (yy * wsub).sum(dim=(1, 2)) / tot
@@ -322,7 +328,7 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
     mv = (diff[cy[final], cx[final]] > moving_frac * vals[final]).tolist() if diff is not None else None
     return [{
         'id': i,
-        'px': [round(px[i], 2), round(py[i], 2)],            # [x, y] in the work image
+        'px': [px[i], py[i]],                                # [x, y] in the work image (full sub-pixel)
         'score': round(sc[i], 4),                            # absolute brightness 0..1
         'size_px': round(sz[i], 1),
         'pointlike': round(pt[i], 3),
