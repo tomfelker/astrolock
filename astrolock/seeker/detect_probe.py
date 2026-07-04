@@ -110,7 +110,7 @@ def cmd_detect(args):
             surf = surprise.update(work)
         else:
             surf = det.detection_surface(work, detector=args.detector, bg_radius=args.bg_radius,
-                                         psf_px=args.psf_px, doh_sigma=args.doh_sigma)
+                                         psf_px=args.psf_px, doh_sigma=args.doh_sigma, compiled=True)
         blobs = det.detect_blobs(
             surf, work, (None if surprise is not None else prev_bp),
             threshold_rel=args.threshold, max_candidates=args.max_candidates,

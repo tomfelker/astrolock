@@ -29,6 +29,22 @@ from astrolock.seeker.sidecar import JsonlWriter
 
 _DEVICE = torch.device('cpu')        # switch to 'cuda' once a CUDA torch is installed
 
+# The hot per-frame surfaces are torch.compile'd into single fused kernels where a C++ compiler is
+# present (a real win on the live detector -- DoH ~85->66ms, surprise ~17->8ms at 1080p); suppress_errors
+# falls back to eager otherwise, so it's seamless -- no flag. (TORCHDYNAMO_DISABLE=1 forces eager.)
+# Compiled lazily + cached, and only ever applied to fixed-shape *full-frame* inputs -- never the
+# variable-size track ROI -- so each compiles exactly once.
+_compiled = {}
+
+
+def _compiled_fn(fn):
+    c = _compiled.get(fn)
+    if c is None:
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+        c = _compiled[fn] = torch.compile(fn)
+    return c
+
 
 def work_image(frame, color_id, device=None):
     """The grayscale image we analyze: Bayer -> sensitive half-res mono sum; else as-is. All torch
@@ -125,12 +141,14 @@ def det_of_hessian(work, sigma):
     return torch.sqrt(torch.clamp(doh, min=0.0))          # linearize in contrast; keeps edge rejection
 
 
-def detection_surface(work, *, detector, bg_radius, psf_px, doh_sigma):
+def detection_surface(work, *, detector, bg_radius, psf_px, doh_sigma, compiled=False):
     """The 2-D map detect_blobs picks peaks from: band-pass (default) or determinant-of-Hessian.
-    (The stateful 'surprise' detector is produced by SurpriseModel, not here.)"""
+    (The stateful 'surprise' detector is produced by SurpriseModel, not here.) Pass compiled=True on the
+    full-frame acquisition path to fuse the DoH surface via torch.compile -- NOT from the track ROI,
+    whose window size varies (that would recompile every frame)."""
     if detector == 'doh':
         sigma = doh_sigma if doh_sigma > 0 else psf_px
-        return det_of_hessian(work, sigma)
+        return (_compiled_fn(det_of_hessian) if compiled else det_of_hessian)(work, sigma)
     return band_pass(work, bg_radius)
 
 
@@ -157,7 +175,8 @@ class SurpriseModel:
 
     var_floor_frac ties the noise floor to the typical per-pixel temporal variance (its median across
     the frame), so no absolute-DN tuning is needed. Needs ~1/alpha frames of warm-up before the
-    variance estimate settles. See astrolock_seeker.md."""
+    variance estimate settles. The per-pixel elementwise step (_surprise_step) is torch.compile'd into
+    one fused kernel (see _compiled_fn). See astrolock_seeker.md."""
 
     def __init__(self, alpha_mean=0.15, alpha_var=0.08, decay=0.85, var_floor_frac=0.5):
         self.a_m, self.a_v, self.decay, self.vff = alpha_mean, alpha_var, decay, var_floor_frac
@@ -170,13 +189,18 @@ class SurpriseModel:
             self.var = torch.full_like(work, float(work.var()) + 1.0)
             self.trail = torch.zeros_like(work)
             return self.trail
-        floor = self.vff * float(torch.median(self.var)) + 1e-6
-        d = work - self.mu
-        z = (d / torch.sqrt(self.var + floor)).clamp(min=0.0)
-        self.trail = torch.maximum(self.decay * self.trail, z)
-        self.mu = self.mu + self.a_m * d                      # EMA mean (tracks slow drift)
-        self.var = (1.0 - self.a_v) * self.var + self.a_v * d * d   # EMA variance
+        floor = self.vff * torch.median(self.var) + 1e-6      # 0-d tensor (dynamic; no per-frame recompile)
+        self.trail, self.mu, self.var = _compiled_fn(_surprise_step)(
+            work, self.mu, self.var, self.trail, floor, self.a_m, self.a_v, self.decay)
         return self.trail
+
+
+def _surprise_step(work, mu, var, trail, floor, a_m, a_v, decay):
+    """One SurpriseModel step, elementwise -> one fused kernel: surprise z-score + decaying peak-hold
+    trail + EMA mean/variance updates. Returns (trail, mu, var)."""
+    d = work - mu
+    z = (d / torch.sqrt(var + floor)).clamp(min=0.0)
+    return torch.maximum(decay * trail, z), mu + a_m * d, (1.0 - a_v) * var + a_v * d * d
 
 
 def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_radius,
@@ -512,7 +536,7 @@ def main(argv=None):
         else:                                                      # acquisition: full-frame multi-blob
             bp = trail if surprise is not None else detection_surface(
                 work, detector=args.detector, bg_radius=args.bg_radius,
-                psf_px=args.psf_px, doh_sigma=args.doh_sigma)
+                psf_px=args.psf_px, doh_sigma=args.doh_sigma, compiled=True)   # fixed full-frame shape
             debug_surface = bp
             blobs = detect_blobs(
                 bp, work, (None if surprise is not None else prev),
