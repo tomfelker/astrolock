@@ -699,9 +699,9 @@ def main(argv=None):
         update_control reconciles capture/record to the backend, and the display toggles write
         view_settings."""
         sset = view_settings.setdefault(role, _default_settings())
-        _combo_row("driver", ['synthetic', 'zwo', 'sky'], f"src_{role}",
+        _combo_row("driver", ['zwo', 'sky'], f"src_{role}",
                    lambda _s, a: _send({'type': 'set_source', 'role': role, 'source': a}), parent)
-        _tip("Frame source: 'sky' = the ISS sim, 'synthetic' = a moving blob (no deps), 'zwo' = a real camera.")
+        _tip("Frame source: 'zwo' = a real camera, 'sky' = the ISS simulator.")
         _combo_row("camera", ['(auto)'], f"chooser_{role}",
                    lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)',
                    group_tag=f"camrow_{role}")
@@ -1131,9 +1131,12 @@ def main(argv=None):
         dpg.configure_item("slot_big", pos=(0, 0), width=left_w, height=big_h)
         dpg.configure_item("dl_big", width=max(S(40), left_w - inx), height=max(S(40), big_h - iny))
         if layout['pip_open'] and ph > S(20):
-            dpg.configure_item("hsplitter", show=True, pos=(0, big_h), width=left_w, height=hsp)
-            dpg.configure_item("hsplitter_btn", width=left_w, height=hsp)
             pipw = max(S(80), min(left_w, int(ph * 16 / 9)))
+            # Match the divider's width to the PIP pane below it (as the vertical splitter matches the
+            # panel's height): the thin window's ~32px-min body overflows downward and only the PIP pane
+            # covers it, so a full-width divider would leave that dark overflow showing to the pane's right.
+            dpg.configure_item("hsplitter", show=True, pos=(0, big_h), width=pipw, height=hsp)
+            dpg.configure_item("hsplitter_btn", width=pipw, height=hsp)
             dpg.configure_item("slot_pipother", show=True, pos=(0, big_h + hsp), width=pipw, height=ph)
             dpg.configure_item("dl_pipother", width=max(S(40), pipw - inx), height=max(S(40), ph - iny))
         else:
