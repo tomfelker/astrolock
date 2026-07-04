@@ -474,17 +474,20 @@ def main(argv=None):
 
     def geometry_caps(role):
         """Backend-owned geometry controls (binning, ROI). Unlike exposure/gain -- which the cam owns,
-        having the device open -- the backend owns render size, so it publishes these. Relaunch-tier
-        (they change frame geometry), presented as choices so one pick = one relaunch. Sky only for
-        now (the render *is* the crop); zwo hardware bin/ROI is a follow-up."""
-        if sources.get(role) != 'sky':
-            return []
-        return [
-            {'name': 'bin', 'label': 'Binning', 'kind': 'choice', 'choices': ['1', '2', '3', '4'],
-             'value': str(bin_by_role.get(role, 1)), 'live': False},
-            {'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': ['100%', '75%', '50%', '25%'],
-             'value': f"{round(roi_frac_by_role.get(role, 1.0) * 100)}%", 'live': False},
-        ]
+        having the device open -- the backend owns render/readout geometry, so it publishes these.
+        Relaunch-tier (they change frame geometry), presented as choices so one pick = one relaunch.
+        Binning is real on both sky (render downscale) and zwo (hardware NxN bin -- a color cam binned
+        >=2 reads out mono); ROI is sky-only for now (the sim render *is* the crop -- zwo hardware ROI
+        is a follow-up)."""
+        src = sources.get(role)
+        caps = []
+        if src in ('sky', 'zwo', 'synthetic'):
+            caps.append({'name': 'bin', 'label': 'Binning', 'kind': 'choice', 'choices': ['1', '2', '3', '4'],
+                         'value': str(bin_by_role.get(role, 1)), 'live': False})
+        if src == 'sky':
+            caps.append({'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': ['100%', '75%', '50%', '25%'],
+                         'value': f"{round(roi_frac_by_role.get(role, 1.0) * 100)}%", 'live': False})
+        return caps
 
     def published_caps(role):
         """The role's caps with each control's value overridden by the live user setting (so the GUI
@@ -495,6 +498,10 @@ def main(argv=None):
         vals = cam_control_vals.get(role, {})
         ctrls = [{**c, 'value': vals.get(c['name'], c.get('value'))} for c in caps.get('controls', [])]
         return {'source': caps.get('source'), 'controls': ctrls + geometry_caps(role)}
+
+    def is_connected(role):
+        """True if this role's cam process is currently running (its capture is live)."""
+        return role in cam_procs and cam_procs[role].poll() is None
 
     def restart_cam(role, stop_first):
         if stop_first:
@@ -603,37 +610,43 @@ def main(argv=None):
             src = cmd.get('source')
             if role in roles and src in ('synthetic', 'zwo', 'sky'):
                 sources[role] = src
-                restart_cam(role, stop_first=True)       # swap sim <-> real live
-                print(f"[backend] {role} source -> {src}", flush=True)
+                # Don't jump the gun: a driver change never auto-connects. Stop any running cam and
+                # wait for an explicit Connect, so the user can pick which camera first -- two roles
+                # both left on '(auto)' zwo would otherwise open one camera twice and wedge the USB bus.
+                if is_connected(role):
+                    control_write(role, {'stop': True})
+                print(f"[backend] {role} source -> {src} (disconnected; press Connect)", flush=True)
         elif t == 'set_optics':
             role = cmd.get('role')
             if role in roles:
                 ok = resolve_optics(role, cmd.get('sensor'), cmd.get('optic'), cmd.get('reducer'))
                 print(f"[backend] {role} optics -> {optics_sel[role]} ({'ok' if ok else 'fallback'})", flush=True)
-                if ok and sources[role] == 'sky':        # sim FoV changed -> relaunch to render at it
+                if ok and sources[role] == 'sky' and is_connected(role):   # sim FoV changed -> relaunch live
                     restart_cam(role, stop_first=True)
         elif t == 'set_camera':
             role = cmd.get('role')
             if role in roles:
                 camera_url[role] = cmd.get('url') or None
                 print(f"[backend] {role} camera -> {camera_url[role]}", flush=True)
-                if sources[role] == 'zwo':               # pick up the new camera on the next launch
-                    restart_cam(role, stop_first=True)
+                if sources[role] == 'zwo' and is_connected(role):   # live swap only if already connected
+                    restart_cam(role, stop_first=True)              # else it's picked up on Connect
         elif t == 'rescan_cameras':
             cams_available[:] = cam_mod.zwo_camera_urls()
             print(f"[backend] cameras: {cams_available}", flush=True)
         elif t == 'set_cam_control':
             role, name, value = cmd.get('role'), cmd.get('name'), cmd.get('value')
-            if role in roles and name == 'bin':                        # geometry: recompute render + relaunch
+            if role in roles and name == 'bin':                        # geometry: recompute render (+ relaunch)
                 bin_by_role[role] = max(1, int(round(float(value))))
                 recompute_render(role)
-                restart_cam(role, stop_first=True)
-                print(f"[backend] {role} bin = {bin_by_role[role]} (relaunch)", flush=True)
+                if is_connected(role):                                 # live relaunch; else applied on Connect
+                    restart_cam(role, stop_first=True)
+                print(f"[backend] {role} bin = {bin_by_role[role]}", flush=True)
             elif role in roles and name == 'roi':
                 roi_frac_by_role[role] = min(1.0, max(0.05, float(str(value).rstrip('%')) / 100.0))
                 recompute_render(role)
-                restart_cam(role, stop_first=True)
-                print(f"[backend] {role} roi = {round(roi_frac_by_role[role] * 100)}% (relaunch)", flush=True)
+                if is_connected(role):
+                    restart_cam(role, stop_first=True)
+                print(f"[backend] {role} roi = {round(roi_frac_by_role[role] * 100)}%", flush=True)
             elif role in roles and name is not None:
                 cam_control_vals[role][name] = value
                 live = next((c.get('live', True) for c in (cam_caps.get(role) or {}).get('controls', [])

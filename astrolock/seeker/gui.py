@@ -333,7 +333,7 @@ def main(argv=None):
             det_path = f.ser_path[:-len('.ser')] + '.detections.jsonl'
             cam = cams[role] = dict(tex=tex, texver=0, w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh,
                                     color_id=f.header.color_id, blobs=[], det_idx=-1, last_idx=-1,
-                                    peak=0, hist=None, det_tailer=JsonlTailer(det_path), ser_path=f.ser_path)
+                                    hist=None, det_tailer=JsonlTailer(det_path), ser_path=f.ser_path)
         # segment rollover / source switch -> re-point the detections tailer
         if f.ser_path != cam['ser_path']:
             cam['det_tailer'].close()
@@ -357,12 +357,16 @@ def main(argv=None):
                 dpg.delete_item(old)                  # safe: draw_slot re-points its draw_image this frame
             cam.update(w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh, color_id=f.header.color_id)
         dpg.set_value(cam['tex'], rgba.ravel())
-        cam['last_idx'], cam['peak'] = idx, int(frame.max())
-        # Luminance histogram of the *displayed* image (WYSIWYG); subsampled + sqrt-scaled.
-        samp = rgba[::4, ::4, :3].mean(axis=2)
-        counts, _ = np.histogram(samp, bins=64, range=(0.0, 1.0))
-        m = counts.max()
-        cam['hist'] = np.sqrt(counts / m) if m > 0 else None
+        cam['last_idx'] = idx
+        # The histogram inset is off by default; only pay for it (a full-frame subsample + np.histogram
+        # every frame) when it's actually enabled for this role. Otherwise skip it entirely.
+        if view_settings.get(role, {}).get('histogram'):
+            samp = rgba[::4, ::4, :3].mean(axis=2)        # luminance of the *displayed* image (WYSIWYG)
+            counts, _ = np.histogram(samp, bins=64, range=(0.0, 1.0))
+            m = counts.max()
+            cam['hist'] = np.sqrt(counts / m) if m > 0 else None
+        else:
+            cam['hist'] = None
         return True
 
     # ---- slots (fixed camera panes) ------------------------------------------------------
@@ -608,7 +612,7 @@ def main(argv=None):
         # Status line (bottom-left) + a blinking NOT RECORDING warning if tracking without recording.
         st_now = ctrl['state'] or {}
         recording = bool((st_now.get('recording') or {}).get(role)) and bool(st_now.get('capturing', {}).get(role))
-        status = (f"{role}  f{cam['last_idx']}  {_color_name(cam['color_id'])}  peak {cam['peak']}  "
+        status = (f"{role}  f{cam['last_idx']}  {_color_name(cam['color_id'])}  "
                   f"blobs {len(cam['blobs'])}  zoom {_zoom_label(zoom)}" + ("  REC" if recording else ""))
         dpg.draw_text((S(8), SH - S(20)), status, size=S(13), color=(200, 205, 220, 230), parent=f"L_warn_{name}")
         if st_now.get('tracking') and not recording and int(time.perf_counter() * 1.5) % 2 == 0:
@@ -672,13 +676,23 @@ def main(argv=None):
         with dpg.tooltip(item if item is not None else dpg.last_item()):
             dpg.add_text(text, wrap=S(240))
 
-    def _combo_row(label, items, tag, cb, parent=None, default='', right=0):
+    def _combo_row(label, items, tag, cb, parent=None, default='', right=0, group_tag=None):
         """A 'label: <dropdown>' row; the dropdown fills the remaining width (minus `right` px, when a
-        trailing widget follows). parent=None -> the current container."""
+        trailing widget follows). parent=None -> the current container. group_tag tags the row's group
+        so a caller can show/hide the whole row (label + dropdown together)."""
         kw = {'parent': parent} if parent else {}
+        if group_tag:
+            kw['tag'] = group_tag
         with dpg.group(horizontal=True, **kw):
             dpg.add_text(f"{label}:")
             dpg.add_combo(items, tag=tag, default_value=default, width=(-right if right else -1), callback=cb)
+
+    def _toggle_connect(role):
+        """Connect/Disconnect: fully start or stop this role's cam process. We drive it off the
+        backend's actual capture state (telemetry), so the button is a plain toggle -- no local
+        'intent' to get out of sync -- and connecting is always an explicit user action."""
+        on = bool(((ctrl['state'] or {}).get('capturing') or {}).get(role))
+        _send({'type': 'capture', 'role': role, 'on': not on})
 
     def render_camera_settings(role, parent):
         """One camera's connection/capture/display settings under `parent`. Widgets are intent;
@@ -689,11 +703,15 @@ def main(argv=None):
                    lambda _s, a: _send({'type': 'set_source', 'role': role, 'source': a}), parent)
         _tip("Frame source: 'sky' = the ISS sim, 'synthetic' = a moving blob (no deps), 'zwo' = a real camera.")
         _combo_row("camera", ['(auto)'], f"chooser_{role}",
-                   lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)')
+                   lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)',
+                   group_tag=f"camrow_{role}")
         _tip("Which physical ZWO camera to use (by model). '(auto)' = the first one. Press Rescan after plugging in.")
         dpg.add_group(tag=f"ctrls_{role}", parent=parent)   # caps-driven controls (exposure/gain/...), filled live
-        dpg.add_checkbox(label="Running", tag=f"run_{role}", parent=parent)
-        _tip("Capture on/off for this camera.")
+        dpg.add_button(label="Connect", tag=f"conn_{role}", parent=parent, user_data=role,
+                       callback=lambda _s, _a, r: _toggle_connect(r))
+        _tip("Start/stop this camera's capture process. Nothing connects until you press this -- pick "
+             "the driver and (for zwo) the camera first, so two roles don't both grab '(auto)' and "
+             "wedge the USB bus.")
         dpg.add_checkbox(label="Recording", tag=f"rec_{role}", parent=parent)
         _tip("Keep this camera's frames (mark them important so they aren't auto-deleted).")
         dpg.add_checkbox(label="Auto record", tag=f"autorec_{role}", parent=parent)
@@ -989,10 +1007,8 @@ def main(argv=None):
         cap_st = (st or {}).get('capturing') or {}
         src_st = (st or {}).get('sources') or {}
         tracking_st = bool((st or {}).get('tracking'))
-        cap_sent = ctrl.setdefault('cap_sent', {})
         rec_sent = ctrl.setdefault('rec_sent', {})
         src_init = ctrl.setdefault('src_init', set())
-        run_init = ctrl.setdefault('run_init', set())
         autorec_init = ctrl.setdefault('autorec_init', set())
         for role in roles:
             if st is None or not dpg.does_item_exist(f"src_{role}"):
@@ -1000,14 +1016,16 @@ def main(argv=None):
             # One-time init of the intent widgets from the backend's actual state.
             if role not in src_init and src_st.get(role):
                 dpg.set_value(f"src_{role}", src_st[role]); src_init.add(role)
-            if role not in run_init and role in cap_st:
-                dpg.set_value(f"run_{role}", bool(cap_st[role])); run_init.add(role)
             if role not in autorec_init and src_st.get(role):     # default ON for a real cam, off for sim
                 dpg.set_value(f"autorec_{role}", src_st[role] == 'zwo'); autorec_init.add(role)
-            # Running = capture on/off; reconcile the checkbox intent (debounced) to the backend.
-            want_run = bool(dpg.get_value(f"run_{role}"))
-            if want_run != bool(cap_st.get(role)) and want_run != cap_sent.get(role):
-                _send({'type': 'capture', 'role': role, 'on': want_run}); cap_sent[role] = want_run
+            # Connect/Disconnect: the button label just mirrors the backend's actual capture state;
+            # the click (in _toggle_connect) starts/stops the cam. Explicit only -- no auto-connect.
+            if dpg.does_item_exist(f"conn_{role}"):
+                dpg.configure_item(f"conn_{role}", label="Disconnect" if cap_st.get(role) else "Connect")
+            # The camera chooser only applies to the zwo driver; hide the whole row otherwise (it lists
+            # the attached ZWO cameras, which mean nothing for the sim / synthetic sources).
+            if dpg.does_item_exist(f"camrow_{role}"):
+                dpg.configure_item(f"camrow_{role}", show=(dpg.get_value(f"src_{role}") == 'zwo'))
             # Recording = the manual box OR (Auto-record AND tracking), per camera.
             want_rec = bool(dpg.get_value(f"rec_{role}")) or (bool(dpg.get_value(f"autorec_{role}")) and tracking_st)
             if want_rec != bool(rec_st.get(role)) and want_rec != rec_sent.get(role):
