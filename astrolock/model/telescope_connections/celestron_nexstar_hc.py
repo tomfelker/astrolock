@@ -35,7 +35,9 @@ class CelestronNexstarDeviceIds(enum.IntEnum):
     def MC_for_axis(cls, axis):
         assert(axis >= 0)
         assert(axis < 2)
-        return cls.DEV_ID_MC_AZM + axis
+        # IntEnum + int returns a plain int (dropping the enum), which later breaks dest_id.name in the
+        # diagnostic prints -- wrap it back into the enum (0x10 -> AZM, 0x11 -> ALT).
+        return cls(cls.DEV_ID_MC_AZM + axis)
 
 class CelestronNexstarResponseCodes(enum.IntEnum):
     HC_OK = 0x23 # '#'
