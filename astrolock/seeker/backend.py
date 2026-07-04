@@ -214,13 +214,20 @@ def main(argv=None):
     sky_args = []
     almanac_path = os.path.join(session_dir, f"{ts}_almanac.jsonl")       # sky_sim publishes here
     if args.source == 'sky':
-        # Sim cams follow the mount's true trajectory; with a real mount (no sidecar) fall back to
-        # the backend's published estimate. Sky *positions* come from the shared sky_sim almanac
-        # (one propagator, one system clock) -- not from each cam, which used to drift apart.
-        follow = '--sky-follow-mount' if args.mount == 'sim' else '--sky-follow-state'
+        # Sky *positions* come from the shared sky_sim almanac (one propagator, one system clock) -- not
+        # from each cam, which used to drift apart. The follow flag (which mount trajectory to render
+        # from) is added per-launch by sky_follow_flag(), so switching mounts in the GUI re-points them.
         sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                     '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
-                    '--sky-almanac', almanac_path, follow]
+                    '--sky-almanac', almanac_path]
+
+    def sky_follow_flag():
+        """Which mount trajectory a sky-sim cam renders from, chosen per-launch from the CURRENT mount:
+        a SimMount publishes an exact ground-truth sidecar (--sky-follow-mount); a real or disconnected
+        mount has none, so follow the backend's published encoder estimate (--sky-follow-state). Evaluated
+        at each (re)launch so connecting the real mount in the GUI re-points the sky cams -- otherwise a
+        run started on the sim keeps following the now-stale sim sidecar and the sky freezes."""
+        return '--sky-follow-mount' if isinstance(mount, mount_mod.SimMount) else '--sky-follow-state'
     playback_args = (['--playback-ser', args.playback_ser, '--playback-speed', str(args.playback_speed)]
                      + (['--playback-loop'] if args.playback_loop else [])
                      if args.source == 'playback' and args.playback_ser else [])
@@ -368,6 +375,7 @@ def main(argv=None):
                 per_role_sky += ['--sky-width', str(rx), '--sky-height', str(ry)]   # res, so FoV matches
             if role in roi_window_by_role:            # centered readout window (sensor px) -> frame metadata
                 per_role_sky += ['--roi', ','.join(str(v) for v in roi_window_by_role[role])]
+            per_role_sky += [sky_follow_flag()]       # follow the current mount (re-evaluated each launch)
         cam_sel = ['--camera-url', camera_url[role]] if (sources[role] == 'zwo' and camera_url[role]) else []
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
@@ -572,6 +580,9 @@ def main(argv=None):
             old.close()
         except Exception:
             pass
+        for r in roles:                                    # re-point sky-sim cams at the new mount
+            if sources.get(r) == 'sky':
+                restart_cam(r, stop_first=True)
         print(f"[backend] mount connected: {url}", flush=True)
 
     def disconnect_mount():
@@ -585,6 +596,9 @@ def main(argv=None):
             old.close()
         except Exception:
             pass
+        for r in roles:                                    # sky-sim cams now follow the frozen state pose
+            if sources.get(r) == 'sky':
+                restart_cam(r, stop_first=True)
         print("[backend] mount disconnected", flush=True)
 
     def apply_command(cmd):
