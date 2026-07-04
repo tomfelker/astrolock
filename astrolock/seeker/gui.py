@@ -47,8 +47,15 @@ def _color_name(cid):
         return str(cid)
 
 
-_DEVICE = torch.device('cpu')        # switch to 'cuda' once a CUDA torch is installed
+_DEVICE = torch.device('cpu')        # fallback for direct library calls; the CLI picks via --device
 _LUT_CACHE = {}
+
+
+def resolve_device(name):
+    """Map a --device string to a torch.device. 'auto' (the default) -> cuda when present, else cpu."""
+    if name in (None, '', 'auto'):
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device(name)
 
 
 def _gamma_lut(white_int, gain, gamma, device):
@@ -197,10 +204,13 @@ def main(argv=None):
     p.add_argument('--slew-rate', type=float, default=3.0, help="slew rate while a button is held (deg/s)")
     p.add_argument('--ui-scale', type=float, default=0.0,
                    help="UI/DPI scale factor (0 = auto-detect from the OS; e.g. 1.5 for a 150%% display)")
-    p.add_argument('--device', default='cpu', help="torch device for image processing (cpu / cuda)")
+    p.add_argument('--device', default='auto',
+                   help="torch device for image processing: 'auto' (default) = cuda if present else cpu, "
+                        "or force 'cpu' / 'cuda'")
     args = p.parse_args(argv)
     wb = (args.wb_r, args.wb_b)
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
+    print(f"[gui] compute device: {device}", flush=True)
 
     import dearpygui.dearpygui as dpg
 

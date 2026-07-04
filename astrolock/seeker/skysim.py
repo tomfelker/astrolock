@@ -240,8 +240,10 @@ class SkySim:
         first frame). suppress_errors degrades that to eager wherever no C++ compiler is present, so it's
         seamless -- no flag. (Force plain eager with the env var TORCHDYNAMO_DISABLE=1.)"""
         if self._tail is None:
+            import logging
             import torch._dynamo
-            torch._dynamo.config.suppress_errors = True
+            torch._dynamo.config.suppress_errors = True    # compile is best-effort; fall back to eager...
+            logging.getLogger("torch._dynamo").setLevel(logging.ERROR)   # ...quietly (no cl.exe / no Triton)
             self._tail = torch.compile(_render_tail)
         return self._tail(*args)
 

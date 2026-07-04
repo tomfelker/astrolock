@@ -27,7 +27,14 @@ import torch
 from astrolock.seeker import bayer, ser as ser_mod, sidecar
 from astrolock.seeker.sidecar import JsonlWriter
 
-_DEVICE = torch.device('cpu')        # switch to 'cuda' once a CUDA torch is installed
+_DEVICE = torch.device('cpu')        # fallback for direct library calls; the CLI picks via --device
+
+
+def resolve_device(name):
+    """Map a --device string to a torch.device. 'auto' (the default) -> cuda when present, else cpu."""
+    if name in (None, '', 'auto'):
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device(name)
 
 # The hot per-frame surfaces are torch.compile'd into single fused kernels where a C++ compiler is
 # present (a real win on the live detector -- DoH ~85->66ms, surprise ~17->8ms at 1080p); suppress_errors
@@ -40,8 +47,10 @@ _compiled = {}
 def _compiled_fn(fn):
     c = _compiled.get(fn)
     if c is None:
+        import logging
         import torch._dynamo
-        torch._dynamo.config.suppress_errors = True
+        torch._dynamo.config.suppress_errors = True    # compile is best-effort; fall back to eager...
+        logging.getLogger("torch._dynamo").setLevel(logging.ERROR)   # ...quietly (e.g. no Triton on Win+CUDA)
         c = _compiled[fn] = torch.compile(fn)
     return c
 
@@ -89,9 +98,10 @@ def band_pass(work, bg_radius):
     return work - box_blur(work, bg_radius)
 
 
-def gaussian_deriv_kernels(sigma, radius):
-    """1-D Gaussian and its 1st/2nd derivatives, sampled on [-radius, radius] (torch)."""
-    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+def gaussian_deriv_kernels(sigma, radius, device=None):
+    """1-D Gaussian and its 1st/2nd derivatives, sampled on [-radius, radius] (torch). Built on
+    ``device`` so the conv kernels land where the image is (else a CUDA image + CPU kernel mismatch)."""
+    x = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
     g = torch.exp(-0.5 * (x / sigma) ** 2)
     g = g / g.sum()
     g1 = -(x / sigma ** 2) * g                           # d/dx of the (normalized) Gaussian
@@ -133,7 +143,7 @@ def det_of_hessian(work, sigma):
     work = torch.as_tensor(work, dtype=torch.float32)
     h, w = work.shape
     radius = max(1, min(int(4.0 * sigma + 0.5), (min(h, w) - 1) // 2))
-    g, g1, g2 = gaussian_deriv_kernels(sigma, radius)
+    g, g1, g2 = gaussian_deriv_kernels(sigma, radius, device=work.device)
     lxx = _conv1d_axis(_conv1d_axis(work, g2, 1), g, 0)
     lyy = _conv1d_axis(_conv1d_axis(work, g, 1), g2, 0)
     lxy = _conv1d_axis(_conv1d_axis(work, g1, 1), g1, 0)
@@ -465,9 +475,12 @@ def main(argv=None):
                    help="frame-diff at the peak must exceed this fraction of the peak to be 'moving'")
     p.add_argument('--poll', type=float, default=0.02, help="seconds between polls when caught up (live)")
     p.add_argument('--stop-file', default=None, help="stop when this file appears")
-    p.add_argument('--device', default='cpu', help="torch device for detection (cpu / cuda)")
+    p.add_argument('--device', default='auto',
+                   help="torch device for detection: 'auto' (default) = cuda if present else cpu, "
+                        "or force 'cpu' / 'cuda'")
     args = p.parse_args(argv)
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
+    print(f"[detect:{args.role}] compute device: {device}", flush=True)
 
     # Wait for the first *ready* segment (header + first frame committed via the sidecar), not merely
     # for the .ser to exist -- the cam creates the file a beat before it writes the header.

@@ -30,6 +30,13 @@ from astrolock.seeker import sidecar
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
 
+def resolve_device(name):
+    """Map a --device string to a torch.device. 'auto' (the default) -> cuda when present, else cpu."""
+    if name in (None, '', 'auto'):
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device(name)
+
+
 def make_synthetic_frame(width, height, t, max_val=65535):
     """A faint-noise background with one bright Gaussian blob moving in a Lissajous path (torch;
     uint16 numpy only at the SER-writer boundary)."""
@@ -275,7 +282,8 @@ def _open_sky(args, state_path=None, mount_path=None):
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
                        aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm,
                        psf_sigma_px=args.sky_psf_sigma_px)
-    sim = SkySim(cfg)                                   # render-only; propagation lives in sky_sim.py
+    device = resolve_device(getattr(args, 'device', 'auto'))
+    sim = SkySim(cfg, device=device)                   # render-only; propagation lives in sky_sim.py
     almanac = SkyAlmanac(args.sky_almanac)              # shared, system-clock-timed source directions
     fov_x = _math.degrees(2 * _math.atan(cfg.width * cfg.pixel_pitch_um * 1e-3 / (2 * cfg.focal_length_mm)))
 
@@ -284,7 +292,7 @@ def _open_sky(args, state_path=None, mount_path=None):
     alt0 = _math.radians(args.sky_alt_deg) if args.sky_alt_deg is not None else _math.radians(45.0)
     rate_az, rate_alt = _math.radians(args.sky_rate_az), _math.radians(args.sky_rate_alt)
     print(f"[cam] sky sim {cfg.width}x{cfg.height} FoV {fov_x:.1f}deg almanac={args.sky_almanac} "
-          f"exp={args.sky_exposure_s}s substeps={args.sky_substeps}", flush=True)
+          f"exp={args.sky_exposure_s}s substeps={args.sky_substeps} device={device}", flush=True)
 
     # Prefer the sim mount's ground-truth trajectory (piecewise-linear, exact) over the backend's
     # reconstructed estimate. The mount sidecar uses 'az_deg'/'t_mono_ns'; the legacy state file
@@ -412,6 +420,9 @@ def main(argv=None):
                    help="centered readout window 'x0,y0,w,h' in native sensor px, recorded in the frame "
                         "metadata (the render is already cropped to it via --width/--height).")
     p.add_argument('--fps', type=float, default=15.0)
+    p.add_argument('--device', default='auto',
+                   help="torch device for the sky-sim render: 'auto' (default) = cuda if present else "
+                        "cpu, or force 'cpu' / 'cuda'. (zwo / synthetic / playback ignore it.)")
     p.add_argument('--frame-limit', type=int, default=-1,
                    help="frames for the current file before rolling over (-1 = unlimited)")
     p.add_argument('--file-limit', type=int, default=1,

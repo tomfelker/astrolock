@@ -75,7 +75,9 @@ def main(argv=None):
                    help="detect density cap: tiles across the frame (0 = off); keeps targets from "
                         "a dense bright region from starving the rest of the frame")
     p.add_argument('--per-tile', type=int, default=2, help="detect density cap: max blobs per tile")
-    p.add_argument('--device', default='cpu', help="torch device for detect + gui (cpu / cuda)")
+    p.add_argument('--device', default='auto',
+                   help="torch device for detect + gui: 'auto' (default) = cuda if present else cpu, "
+                        "or force 'cpu' / 'cuda' (passed through to both child processes)")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--fps', type=float, default=30.0)
@@ -354,6 +356,7 @@ def main(argv=None):
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
             '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
+            '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
             '--important', '1' if recording[role] else '0', '--control-file', cf,
