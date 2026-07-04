@@ -146,6 +146,12 @@ def main(argv=None):
                         "target so detect can work just that window instead of the whole frame. 0 = full-frame.")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
+    p.add_argument('--boresight-x-mrad', type=float, default=0.0,
+                   help="main-vs-guide boresight X offset (mrad, guide image right): where the main cam "
+                        "points relative to the guide, so a guide-tracked target is centred in the main "
+                        "cam. Tune live in the GUI (Boresight).")
+    p.add_argument('--boresight-y-mrad', type=float, default=0.0,
+                   help="boresight Y offset (mrad, guide image down)")
     p.add_argument('--track-debug', action='store_true',
                    help="print per-frame commanded vs measured axis rates and target offset")
     p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
@@ -223,6 +229,10 @@ def main(argv=None):
     track_role = None
     track_target = None
     track_seen_index = -1
+    track_center = None       # (cx, cy) true frame centre at lock time, for live boresight re-offset
+    # Boresight: where the main cam points relative to the guide, as an image-frame angular offset
+    # (x right, y down), radians. Offsets the guide tracker's hold point so the target lands in the main.
+    boresight = {'x': args.boresight_x_mrad * 1e-3, 'y': args.boresight_y_mrad * 1e-3}
     rad_per_px = (math.radians(args.arcsec_per_px / 3600.0) if args.arcsec_per_px > 0
                   else args.sky_pixel_um * 1e-3 / args.sky_focal_mm)
     # Per-role plate scale from the optics DB if a sensor+optic is named for that role; else the
@@ -533,6 +543,7 @@ def main(argv=None):
 
     def apply_command(cmd):
         nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
+        nonlocal track_center
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -562,7 +573,12 @@ def main(argv=None):
                 if ft is not None:
                     from astrolock.seeker.skytracker import SkyTracker
                     from astrolock.seeker.target_model import EmaAngularVelModel
-                    tracker = SkyTracker(hdr.image_width / 2.0, hdr.image_height / 2.0, rpp,
+                    cx0, cy0 = hdr.image_width / 2.0, hdr.image_height / 2.0
+                    track_center = (cx0, cy0)                 # true optical centre (for live re-offset)
+                    if role == 'guide':                       # aim so the target lands in the main cam:
+                        cx0 += boresight['x'] / rpp           # hold it at the main's boresight pixel, not
+                        cy0 += boresight['y'] / rpp           # the guide centre (used for recon + setpoint)
+                    tracker = SkyTracker(cx0, cy0, rpp,
                                          max_rate_rad_s=max_rate,
                                          model=EmaAngularVelModel(smoothing_s=args.track_rate_smoothing_s),
                                          min_intercept_s=args.track_min_intercept_s,
@@ -584,6 +600,15 @@ def main(argv=None):
                         print(f"[backend] track {role}: {ln}", flush=True)
                     for w in warns:
                         print(f"[backend] WARNING (track {role}): {w}", flush=True)
+        elif t == 'set_boresight':
+            boresight['x'] = float(cmd.get('x_mrad', 0.0)) * 1e-3
+            boresight['y'] = float(cmd.get('y_mrad', 0.0)) * 1e-3
+            if tracker is not None and track_center is not None and track_role == 'guide':
+                rpp = rad_per_px_by_role.get(track_role, rad_per_px) * frame_binning(track_role)
+                tracker.cx = track_center[0] + boresight['x'] / rpp   # re-aim the live hold point
+                tracker.cy = track_center[1] + boresight['y'] / rpp
+            print(f"[backend] boresight -> ({boresight['x'] * 1e3:.3f}, {boresight['y'] * 1e3:.3f}) mrad",
+                  flush=True)
         elif t == 'untrack':
             tracking = coasting = False
             mount.set_rates(0.0, 0.0)
@@ -748,6 +773,7 @@ def main(argv=None):
                 'optics': {r: {'fov_x_deg': round(fv[0], 4), 'fov_y_deg': round(fv[1], 4)}
                            for r, fv in fov_by_role.items()},
                 'optics_sel': {r: list(sel) for r, sel in optics_sel.items()},   # for the GUI Optics tab
+                'boresight_mrad': [round(boresight['x'] * 1e3, 4), round(boresight['y'] * 1e3, 4)],
             })
 
             # Per-second health line -- commented out so stdout carries only rare events. Uncomment

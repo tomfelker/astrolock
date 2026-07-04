@@ -245,6 +245,7 @@ def main(argv=None):
     cam_ctrl_val = {}         # (role, control name) -> current value; the GUI owns it once a control is shown
     layout = {'panel_open': True, 'pip_open': True, 'pip_debug': False, 'panel_w': S(PANEL_W),
               'pip_h': S(200), 'big_role': ROLES[0], '_sig': None}
+    boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
 
     dpg.create_context()
     dpg.set_global_font_scale(ui_scale)   # crisp text at the right size (ImGui 1.92 re-rasterizes)
@@ -519,6 +520,8 @@ def main(argv=None):
         # --- Reticles + target pipper (alpha'd red unless noted; all FoV via the pinhole tan-ratio) ---
         RED = (255, 70, 70, 160)                  # alpha'd red (the default for reticle geometry)
         il, ir, it, ib = offx, offx + dw, offy, offy + dh   # image edges (not the letterbox bars)
+        bmr = (ctrl['state'] or {}).get('boresight_mrad') or (0.0, 0.0)   # main-vs-guide offset (mrad)
+        bore_x_rad, bore_y_rad = bmr[0] * 1e-3, bmr[1] * 1e-3
         if sset['reticles']:
             optx = (ctrl['state'] or {}).get('optics', {})
             me = optx.get(role)
@@ -535,7 +538,12 @@ def main(argv=None):
                     math.tan(math.radians(me['fov_x_deg'] / 2)) * (dw / 2.0)
                 hh = math.tan(math.radians(inner['fov_y_deg'] / 2)) / \
                     math.tan(math.radians(me['fov_y_deg'] / 2)) * (dh / 2.0)
-                mrcx, mrcy = cx, cy               # main-rect centre = boresight; centre until configurable
+                # Main-rect centre = where the main cam points, offset from the guide centre by the
+                # boresight (pinhole: screen offset = f_px * tan(angle)). The centre crosshairs below stay
+                # at the guide centre, so a nonzero boresight shows as a break between them and the stubs.
+                fpx = (dw / 2.0) / math.tan(math.radians(me['fov_x_deg'] / 2.0))
+                fpy = (dh / 2.0) / math.tan(math.radians(me['fov_y_deg'] / 2.0))
+                mrcx, mrcy = cx + fpx * math.tan(bore_x_rad), cy + fpy * math.tan(bore_y_rad)
                 gh, gv = dw / 2.0 - hw, dh / 2.0 - hh   # image-edge -> centred-rect-edge gaps
                 # Centre crosshairs: from each image edge, 90% of the way to the *centred* rect edge.
                 dpg.draw_line((il, cy), (il + 0.9 * gh, cy), color=RED, thickness=1.0, parent=f"L_ret_{name}")
@@ -577,8 +585,11 @@ def main(argv=None):
                     sfy = (src['h'] / 2.0) / math.tan(math.radians(sf['fov_y_deg'] / 2.0))
                     mfx = (cam['w'] / 2.0) / math.tan(math.radians(mf['fov_x_deg'] / 2.0))
                     mfy = (cam['h'] / 2.0) / math.tan(math.radians(mf['fov_y_deg'] / 2.0))
-                    mtx = cam['w'] / 2.0 + (gtx - src['w'] / 2.0) / sfx * mfx     # tan(angle) preserved across cams
-                    mty = cam['h'] / 2.0 + (gty - src['h'] / 2.0) / sfy * mfy
+                    # tan(angle) preserved across cams, shifted by the boresight: main = guide - boresight,
+                    # so guide->main subtracts it and main->guide adds it (keyed on which src is wider).
+                    bsign = -1.0 if sf['fov_x_deg'] >= mf['fov_x_deg'] else 1.0
+                    mtx = cam['w'] / 2.0 + ((gtx - src['w'] / 2.0) / sfx + bsign * math.tan(bore_x_rad)) * mfx
+                    mty = cam['h'] / 2.0 + ((gty - src['h'] / 2.0) / sfy + bsign * math.tan(bore_y_rad)) * mfy
                     pip, pcol = (offx + mtx * scale, offy + mty * scale), (255, 80, 80, 195)
         if pip is not None:
             # Clamp box = the visible camera view (image ∩ pane): the letterboxed image when zoomed
@@ -880,6 +891,7 @@ def main(argv=None):
             },
             'cameras': {role: dpg.get_value(f"chooser_{role}")
                         for role in roles if dpg.does_item_exist(f"chooser_{role}")},
+            'boresight': [boresight_ui['x'], boresight_ui['y']],
         }
 
     def apply_settings(data):
@@ -916,6 +928,10 @@ def main(argv=None):
             if url and dpg.does_item_exist(f"chooser_{role}"):
                 dpg.set_value(f"chooser_{role}", url if url in (ctrl.get('cam_items') or ['(auto)']) else '(auto)')
                 _on_camera_pick(role, dpg.get_value(f"chooser_{role}"))   # push the loaded camera to the backend
+        b = data.get('boresight')
+        if b and len(b) >= 2:
+            _bore_set(b[0], b[1])                       # updates the widgets + pushes to the backend
+            ctrl['bore_init'] = True                    # ...and don't let the state-init clobber it
 
     def _settings_refresh(select=None):
         dpg.configure_item('settings_combo', items=settings_store.list_settings())
@@ -936,6 +952,32 @@ def main(argv=None):
         if dpg.get_value('settings_combo'):
             settings_store.delete(dpg.get_value('settings_combo'))
             _settings_refresh('')
+
+    # Boresight editor: the panel's local copy of the main-vs-guide offset (mrad). The backend owns the
+    # value (echoed in state -> the reticle overlay); these widgets edit it and push set_boresight.
+    def _bore_send():
+        _send({'type': 'set_boresight', 'x_mrad': boresight_ui['x'], 'y_mrad': boresight_ui['y']})
+
+    def _bore_set(x, y, send=True):
+        boresight_ui['x'], boresight_ui['y'] = float(x), float(y)
+        if dpg.does_item_exist('bore_x'):
+            dpg.set_value('bore_x', f"{boresight_ui['x']:.4g}")
+        if dpg.does_item_exist('bore_y'):
+            dpg.set_value('bore_y', f"{boresight_ui['y']:.4g}")
+        if send:
+            _bore_send()
+
+    def _bore_nudge(dx, dy):
+        s = boresight_ui['step']
+        _bore_set(boresight_ui['x'] + dx * s, boresight_ui['y'] + dy * s)
+
+    def _bore_input():
+        def _f(tag, cur):
+            try:
+                return float(dpg.get_value(tag))
+            except (ValueError, TypeError):
+                return cur
+        _bore_set(_f('bore_x', boresight_ui['x']), _f('bore_y', boresight_ui['y']))
 
     with dpg.window(tag="win_panel", no_title_bar=True, no_move=True, no_resize=True, no_collapse=True):
         with dpg.collapsing_header(label="Mount", default_open=True):
@@ -982,9 +1024,38 @@ def main(argv=None):
                             dpg.add_checkbox(tag=f"own_{role}_{kind}", user_data=(role, kind),
                                              callback=lambda _s, _a, u: _toggle_owned(u[0], u[1]))
                             _tip("I own this — pin it to the top of the list (in every dropdown).")
+        with dpg.collapsing_header(label="Boresight"):
+            dpg.add_text("Angle from the guide to the main camera. Centre a bright star in the main view, "
+                         "then nudge until the main-FoV box sits on that star in the guide.",
+                         color=(150, 150, 150), wrap=S(210))
+            with dpg.group(horizontal=True):
+                dpg.add_text("X:")
+                dpg.add_input_text(tag='bore_x', width=S(56), on_enter=True, default_value="0",
+                                   callback=lambda *_: _bore_input())
+                dpg.add_text("Y:")
+                dpg.add_input_text(tag='bore_y', width=S(56), on_enter=True, default_value="0",
+                                   callback=lambda *_: _bore_input())
+                dpg.add_text("mrad", color=(140, 145, 160))
+            with dpg.group(horizontal=True):
+                dpg.add_text("step:")
+                dpg.add_combo(['0.01', '0.1', '1', '10'], tag='bore_step', default_value='0.1', width=S(64),
+                              callback=lambda _s, a: boresight_ui.__setitem__('step', float(a)))
+                dpg.add_text("mrad", color=(140, 145, 160))
+            # 3x3 nudge grid (image frame: N=up=-y, S=down=+y, E=right=+x, W=left=-x); centre resets to 0.
+            for rowdefs in ((('NW', -1, -1), ('N', 0, -1), ('NE', 1, -1)),
+                            (('W', -1, 0), ('0', 0, 0), ('E', 1, 0)),
+                            (('SW', -1, 1), ('S', 0, 1), ('SE', 1, 1))):
+                with dpg.group(horizontal=True):
+                    for lbl, dx, dy in rowdefs:
+                        if (dx, dy) == (0, 0):
+                            dpg.add_button(label=lbl, width=S(30), callback=lambda *_: _bore_set(0.0, 0.0))
+                        else:
+                            dpg.add_button(label=lbl, width=S(30), user_data=(dx, dy),
+                                           callback=lambda _s, _a, u: _bore_nudge(u[0], u[1]))
         with dpg.collapsing_header(label="Settings"):
             dpg.add_combo(settings_store.list_settings(), tag='settings_combo', width=-1)
-            _tip("A saved settings file captures the layout, display prefs, optics + owned gear, and cameras.")
+            _tip("A saved settings file captures the layout, display prefs, optics + owned gear, cameras, "
+                 "and boresight.")
             with dpg.group(horizontal=True):
                 dpg.add_button(label="Load", callback=_settings_load)
                 dpg.add_button(label="Delete", callback=_settings_delete)
@@ -1083,6 +1154,12 @@ def main(argv=None):
             if sig != ctrl_sig.get(role) and dpg.does_item_exist(f"ctrls_{role}"):
                 build_cam_controls(role, caps)
                 ctrl_sig[role] = sig
+
+        # One-time init of the boresight editor from the backend's value (settings load may override).
+        if 'bore_init' not in ctrl and st and st.get('boresight_mrad') is not None and dpg.does_item_exist('bore_x'):
+            bx, by = (list(st['boresight_mrad']) + [0.0, 0.0])[:2]
+            _bore_set(bx, by, send=False)              # reflect the backend's value; don't echo it back
+            ctrl['bore_init'] = True
 
         # 2D slew pad: drag inside it to drive the mount at a log-scaled az/alt rate (centre dead-zone
         # = zero). Momentarily overrides tracking, and resumes it on release. Drag latches, so it
