@@ -990,10 +990,6 @@ def main(argv=None):
         _bore_set(_f('bore_x', boresight_ui['x']), _f('bore_y', boresight_ui['y']))
 
     with dpg.window(tag="win_panel", no_title_bar=True, no_move=True, no_resize=True, no_collapse=True):
-        dpg.add_button(label="STOP", tag="stop_btn", width=-1, height=S(34),
-                       callback=lambda: _send({'type': 'stop'}))
-        dpg.bind_item_theme("stop_btn", stop_theme)
-        _tip("Immediately stop mount motion and cancel tracking.")
         with dpg.collapsing_header(label="Mount", default_open=True):
             with dpg.group(horizontal=True):
                 dpg.add_text("mount:")
@@ -1005,6 +1001,8 @@ def main(argv=None):
             dpg.add_button(label="Connect", tag="mount_conn", callback=lambda: _toggle_mount_connect())
             _tip("Connect to / disconnect from the selected mount. Disconnected = the backend holds the "
                  "last pose and nothing moves.")
+            dpg.add_text("Alt: --   Az: --", tag="mount_pose_txt")               # live encoder pose (deg)
+            dpg.add_text("rate: --", tag="mount_rate_txt", color=(160, 170, 190))   # live axis rates (deg/s)
             # 2D slew pad: a log-scaled az/alt rate plane. Drag = drive the mount (momentary override
             # of tracking); the circle shows the current rate (readout in update_control).
             dpg.add_text("Slew", color=(160, 170, 190))     # a drawlist can't host a tooltip; label it
@@ -1023,6 +1021,10 @@ def main(argv=None):
                     dpg.draw_line((2, _c + _s * _d), (_P - 2, _c + _s * _d), color=(80, 86, 100, 110), parent=pad_bg)
             dpg.draw_line((_c, 2), (_c, _P - 2), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # az=0
             dpg.draw_line((2, _c), (_P - 2, _c), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # alt=0
+            dpg.add_button(label="STOP", tag="stop_btn", width=-1, height=S(34),
+                           callback=lambda: _send({'type': 'stop'}))
+            dpg.bind_item_theme("stop_btn", stop_theme)
+            _tip("Immediately stop mount motion and cancel tracking.")
         with dpg.collapsing_header(label="Cameras", default_open=True):
             dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_cameras'}))
             _tip("Re-enumerate attached ZWO cameras (after plugging one in).")
@@ -1179,6 +1181,11 @@ def main(argv=None):
             ctrl['mount_init'] = True
         if dpg.does_item_exist('mount_conn'):
             dpg.configure_item('mount_conn', label="Disconnect" if (st or {}).get('mount_connected') else "Connect")
+        if st and dpg.does_item_exist('mount_pose_txt'):
+            dpg.set_value('mount_pose_txt',
+                          f"Alt: {st.get('enc_alt_deg', 0.0):.3f}   Az: {st.get('enc_az_deg', 0.0):.3f}")
+            dpg.set_value('mount_rate_txt',
+                          f"Az {st.get('rate_az_deg_s', 0.0):+.3f}   Alt {st.get('rate_alt_deg_s', 0.0):+.3f}  deg/s")
 
         # Caps-driven camera controls: rebuild a role's stepper widgets whenever the *set* of controls
         # changes (source switch -> a different camera's caps). Values track the GUI's own state after that.
