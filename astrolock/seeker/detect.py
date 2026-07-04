@@ -126,11 +126,57 @@ def det_of_hessian(work, sigma):
 
 
 def detection_surface(work, *, detector, bg_radius, psf_px, doh_sigma):
-    """The 2-D map detect_blobs picks peaks from: band-pass (default) or determinant-of-Hessian."""
+    """The 2-D map detect_blobs picks peaks from: band-pass (default) or determinant-of-Hessian.
+    (The stateful 'surprise' detector is produced by SurpriseModel, not here.)"""
     if detector == 'doh':
         sigma = doh_sigma if doh_sigma > 0 else psf_px
         return det_of_hessian(work, sigma)
     return band_pass(work, bg_radius)
+
+
+class SurpriseModel:
+    """Per-pixel temporal detector for faint fast movers (satellite trails) that a single-frame blob
+    detector misses -- because a trail spreads its light along many pixels (so each is far dimmer than
+    a star) and a determinant-of-Hessian surface actively suppresses lines. Two per-pixel EMAs plus a
+    decaying peak-hold, all stateful (call update(work) once per frame, in order):
+
+      surprise:  z = max(0, (x - mean) / sqrt(var + floor)), where mean/var are the pixel's own EMAs.
+                 How surprising this frame's value is given the pixel's history. Static terrain never
+                 deviates; a twinkling/drifting STAR has high variance so its wiggles aren't surprising;
+                 a dark sky pixel suddenly lit by a mover spikes. The mean's time constant also
+                 separates a fast mover (a 1-frame spike) from slow star drift (tracked + absorbed by
+                 the mean). This alone removes stars + terrain -- the surprise map is nearly black.
+
+      trail:     trail = max(decay * trail, z) -- a decaying peak-hold of the surprise. A mover paints
+                 its recent path as a bright comet: each pixel keeps the FULL spike height as the object
+                 passes, fading over ~1/(1-decay) frames, so a per-frame few-sigma spike becomes a
+                 spatially extended, connected feature that detect_blobs can catch (same block-max /
+                 density-cap path as the other detectors), while isolated noise just decays. `decay`
+                 trades latency for sensitivity: ~0 = single-frame, ->1 = long integration for the
+                 faintest trails.
+
+    var_floor_frac ties the noise floor to the typical per-pixel temporal variance (its median across
+    the frame), so no absolute-DN tuning is needed. Needs ~1/alpha frames of warm-up before the
+    variance estimate settles. See astrolock_seeker.md."""
+
+    def __init__(self, alpha_mean=0.15, alpha_var=0.08, decay=0.85, var_floor_frac=0.5):
+        self.a_m, self.a_v, self.decay, self.vff = alpha_mean, alpha_var, decay, var_floor_frac
+        self.mu = self.var = self.trail = None
+
+    def update(self, work):
+        work = torch.as_tensor(work, dtype=torch.float32)
+        if self.mu is None:                                   # first frame: seed, emit nothing
+            self.mu = work.clone()
+            self.var = torch.full_like(work, float(work.var()) + 1.0)
+            self.trail = torch.zeros_like(work)
+            return self.trail
+        floor = self.vff * float(torch.median(self.var)) + 1e-6
+        d = work - self.mu
+        z = (d / torch.sqrt(self.var + floor)).clamp(min=0.0)
+        self.trail = torch.maximum(self.decay * self.trail, z)
+        self.mu = self.mu + self.a_m * d                      # EMA mean (tracks slow drift)
+        self.var = (1.0 - self.a_v) * self.var + self.a_v * d * d   # EMA variance
+        return self.trail
 
 
 def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_radius,
@@ -349,10 +395,25 @@ def main(argv=None):
                    help="detect peaks this many sigma above the band-passed background")
     p.add_argument('--threshold', type=float, default=0.0,
                    help="optional relative floor: fraction of the brightest band-passed pixel (0 = off)")
-    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh'],
+    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise'],
                    help="detection surface: 'doh' (default) = determinant of the Hessian "
                         "(Gaussian-derivative blob detector; rejects edges/lines by construction), "
-                        "or 'bandpass' (the older local-background subtraction)")
+                        "'bandpass' (the older local-background subtraction), or 'surprise' = per-pixel "
+                        "temporal surprise + decaying peak-hold (finds faint fast movers / satellite "
+                        "trails that the single-frame surfaces miss; see SurpriseModel)")
+    p.add_argument('--surprise-alpha-mean', type=float, default=0.15,
+                   help="surprise: EMA rate for the per-pixel mean (bigger = adapts faster to drift)")
+    p.add_argument('--surprise-alpha-var', type=float, default=0.08,
+                   help="surprise: EMA rate for the per-pixel variance")
+    p.add_argument('--surprise-decay', type=float, default=0.85,
+                   help="surprise: trail peak-hold decay per frame (~0 = single-frame; ->1 integrates "
+                        "longer for the faintest trails, at more latency)")
+    p.add_argument('--surprise-var-floor-frac', type=float, default=0.5,
+                   help="surprise: noise floor as this fraction of the median per-pixel variance")
+    p.add_argument('--debug-ser', action='store_true',
+                   help="also write the detection surface as <seg>_<role>_debug.ser (+ .frames.jsonl), a "
+                        "normalized greyscale movie of exactly what the detector 'sees' -- follow it in "
+                        "the GUI or any SER viewer to tune (esp. the surprise trail).")
     p.add_argument('--bg-radius', type=int, default=12,
                    help="bandpass: local-background blur radius (px); larger = pass bigger features")
     p.add_argument('--doh-sigma', type=float, default=0.0,
@@ -397,11 +458,24 @@ def main(argv=None):
         print(f"[detect:{args.role}] {os.path.basename(ser_path)}", flush=True)
         return reader, writer
 
+    def new_surprise():                                # per-pixel temporal detector (stateful), or None
+        if args.detector != 'surprise':
+            return None
+        return SurpriseModel(args.surprise_alpha_mean, args.surprise_alpha_var,
+                             args.surprise_decay, args.surprise_var_floor_frac)
+
     reader, writer = open_segment(cur)
     prev = None
+    surprise = new_surprise()
+    dbg = {'writer': None, 'sidecar': None}            # debug detection-surface .ser (lazy, per segment)
     next_index = 0
     scale = None
     total = 0
+
+    def close_debug():
+        if dbg['writer'] is not None:
+            dbg['writer'].close(); dbg['sidecar'].close()
+            dbg['writer'] = dbg['sidecar'] = None
 
     # Track-mode: tail the backend state for a predicted ROI around the target. When present (this
     # role is being tracked), detect just that small window with a single-peak/centroid pass instead
@@ -425,16 +499,23 @@ def main(argv=None):
             scale = full_scale(cid, reader.header.pixel_depth_per_plane)
         work = work_image(frame, cid, device=device)
         coord_scale = reader.header.image_width / work.shape[1]    # frame px per (maybe half-res) work px
+        # Keep the temporal model current every frame (even in track mode) so its state never goes stale.
+        trail = surprise.update(work) if surprise is not None else None
         if state['roi'] is not None:                               # track mode: single peak in the ROI
-            blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=args.detector,
+            # ROI-peak needs a single-frame surface; 'surprise' is full-frame temporal, so fall back.
+            roi_detector = 'bandpass' if args.detector == 'surprise' else args.detector
+            blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=roi_detector,
                                     bg_radius=args.bg_radius, psf_px=args.psf_px,
                                     doh_sigma=args.doh_sigma, snr=args.snr)   # already frame coords
             prev = None                                            # frame-diff not used in ROI mode
+            debug_surface = trail                                  # in ROI mode the only surface we have
         else:                                                      # acquisition: full-frame multi-blob
-            bp = detection_surface(work, detector=args.detector, bg_radius=args.bg_radius,
-                                   psf_px=args.psf_px, doh_sigma=args.doh_sigma)
+            bp = trail if surprise is not None else detection_surface(
+                work, detector=args.detector, bg_radius=args.bg_radius,
+                psf_px=args.psf_px, doh_sigma=args.doh_sigma)
+            debug_surface = bp
             blobs = detect_blobs(
-                bp, work, prev,
+                bp, work, (None if surprise is not None else prev),
                 threshold_rel=args.threshold, max_candidates=args.max_candidates,
                 suppress_radius=args.suppress_radius, min_blob_px=args.min_blob_px,
                 max_size_px=args.max_size_px, psf_px=args.psf_px,
@@ -450,6 +531,16 @@ def main(argv=None):
                         b['size_px'] = b['size_px'] * coord_scale
             prev = bp
         writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(), 'blobs': blobs})
+        # Debug movie of the detection surface: a parallel .ser + commit spine the GUI can follow.
+        if args.debug_ser and debug_surface is not None:
+            if dbg['writer'] is None:
+                dpath = cur[:-len('.ser')] + '_debug.ser'
+                dh, dw = debug_surface.shape
+                dbg['writer'] = ser_mod.SerWriter(dpath, dw, dh, color_id=ser_mod.ColorId.MONO,
+                                                  pixel_depth_per_plane=16)
+                dbg['sidecar'] = JsonlWriter(dpath[:-len('.ser')] + '.frames.jsonl')
+            dbg['writer'].write_frame(debug_frame_u16(debug_surface))
+            dbg['sidecar'].append({'t_mono_ns': time.perf_counter_ns(), 'index': i})
         total += 1
 
     try:
@@ -478,8 +569,10 @@ def main(argv=None):
                 reader.close()
                 writer.close()
                 cur = newer[-1] if args.follow else newer[0]   # live: jump to newest
+                close_debug()                          # finalize this segment's debug .ser
                 reader, writer = open_segment(cur)
                 prev = None
+                surprise = new_surprise()              # fresh temporal state for the new segment
                 next_index = 0
                 scale = None
                 continue
@@ -494,6 +587,7 @@ def main(argv=None):
     finally:
         reader.close()
         writer.close()
+        close_debug()
         print(f"[detect:{args.role}] processed {total} frames", flush=True)
 
 
@@ -501,6 +595,19 @@ def full_scale(color_id, pixel_depth):
     """Max possible value of work_image, for an absolute 0..1 brightness score."""
     base = ser_mod.container_max(pixel_depth)
     return base * (4 if bayer.is_bayer(color_id) else 1)
+
+
+def debug_frame_u16(surf):
+    """Normalize a detection surface (float, possibly negative) to a uint16 greyscale image for the
+    debug .ser: clamp to >=0, scale so the 99.5th percentile hits full white (robust to outliers).
+    16-bit (not 8) -- the surface is *linear*, and the viewer applies gamma, which would band an 8-bit
+    linear image badly."""
+    a = torch.as_tensor(surf, dtype=torch.float32).clamp(min=0)
+    flat = a.reshape(-1)
+    sub = flat[:: max(1, flat.numel() // 100000)]                # subsample for a cheap robust high
+    hi = float(torch.quantile(sub, 0.995)) if sub.numel() else 1.0
+    img = (a / max(hi, 1e-6)).clamp(0, 1) * 65535.0
+    return img.round().cpu().numpy()                             # SerWriter casts to uint16
 
 
 if __name__ == '__main__':

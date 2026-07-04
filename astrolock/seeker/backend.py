@@ -58,9 +58,16 @@ def main(argv=None):
     p.add_argument('--detect-roles', default='guide',
                    help="comma-separated roles to run blob detection on (default: guide only -- the "
                         "main cam is narrow-field and will get centroid tracking later, not blob detect)")
-    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh'],
-                   help="detection surface: 'doh' (default) = determinant of the Hessian, or 'bandpass'")
+    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise'],
+                   help="detection surface: 'doh' (default) = determinant of the Hessian, 'bandpass', or "
+                        "'surprise' (per-pixel temporal surprise + decaying peak-hold; finds faint fast "
+                        "movers / satellite trails)")
     p.add_argument('--doh-sigma', type=float, default=0.0, help="doh detector: Gaussian scale px (0 = psf default)")
+    p.add_argument('--surprise-decay', type=float, default=0.85,
+                   help="surprise detector: trail peak-hold decay (->1 integrates longer for fainter trails)")
+    p.add_argument('--debug-detect-ser', action='store_true',
+                   help="have each detector also write <seg>_<role>_debug.ser -- a movie of its detection "
+                        "surface, followable in the GUI/any SER viewer for tuning")
     p.add_argument('--snr', type=float, default=6.0, help="detect: report peaks this many sigma above background")
     p.add_argument('--max-candidates', type=int, default=16, help="detect: max blobs reported per frame")
     p.add_argument('--min-blob-px', type=int, default=2, help="detect: ignore peaks smaller than this")
@@ -351,10 +358,12 @@ def main(argv=None):
                                     ['--session', session_dir, '--role', role, '--follow',
                                      '--stop-file', stop_file,
                                      '--detector', args.detector, '--doh-sigma', str(args.doh_sigma),
+                                     '--surprise-decay', str(args.surprise_decay),
                                      '--snr', str(args.snr), '--max-candidates', str(args.max_candidates),
                                      '--min-blob-px', str(args.min_blob_px),
                                      '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile),
-                                     '--device', args.device])
+                                     '--device', args.device]
+                                    + (['--debug-ser'] if args.debug_detect_ser else []))
 
     # Pre-warm the skyfield ephemeris/star cache once, serially. Two sky cams starting together
     # otherwise race to download de421.bsp / hipparcos into the shared cache and one loses the
@@ -704,6 +713,7 @@ def main(argv=None):
                 'cameras_available': list(cams_available),   # detected ZWO URLs, for the GUI chooser
                 'camera': dict(camera_url),                   # per-role selected camera URL (or null)
                 'camera_caps': {r: published_caps(r) for r in roles},   # live camera controls for the GUI
+                'debug_ser': bool(args.debug_detect_ser),      # detectors are writing <role>_debug.ser streams
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},
                 'cameras': {role: {'frames': followers[role].committed_count()} for role in roles},

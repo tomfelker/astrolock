@@ -233,8 +233,8 @@ def main(argv=None):
     cams = {}                 # role -> live camera data (texture + frames + detections); lazily created
     view_settings = {}        # role -> display prefs {zoom, reticles, histogram}; persists across cams
     cam_ctrl_val = {}         # (role, control name) -> current value; the GUI owns it once a control is shown
-    layout = {'panel_open': True, 'pip_open': True, 'panel_w': S(PANEL_W), 'pip_h': S(200),
-              'big_role': ROLES[0], '_sig': None}
+    layout = {'panel_open': True, 'pip_open': True, 'pip_debug': False, 'panel_w': S(PANEL_W),
+              'pip_h': S(200), 'big_role': ROLES[0], '_sig': None}
 
     dpg.create_context()
     dpg.set_global_font_scale(ui_scale)   # crisp text at the right size (ImGui 1.92 re-rasterizes)
@@ -266,6 +266,19 @@ def main(argv=None):
 
     def _slot_role(name):
         return layout['big_role'] if name == 'big' else _other(layout['big_role'])
+
+    def _slot_stream(name):
+        """The stream a slot DISPLAYS -- normally its role, but with Dbg on the pip shows the big pane's
+        detector debug surface (<role>_debug.ser, written when the backend has --debug-detect-ser). Only
+        the display + follower path uses this; toolbar/target-pick actions keep the real role."""
+        if name == 'pipother' and layout.get('pip_debug'):
+            return layout['big_role'] + '_debug'
+        return _slot_role(name)
+
+    def _toggle_dbg():
+        layout['pip_debug'] = not layout['pip_debug']
+        if layout['pip_debug']:
+            layout['pip_open'] = True                    # no point showing the debug surface with the pip hidden
 
     def _active_slots():
         return ['big'] + (['pipother'] if layout['pip_open'] else [])
@@ -371,6 +384,7 @@ def main(argv=None):
             return [('Panel', lambda: layout.__setitem__('panel_open', not layout['panel_open'])),
                     ('Swap',  lambda: layout.__setitem__('big_role', _other(layout['big_role']))),
                     ('PIP',   lambda: layout.__setitem__('pip_open', not layout['pip_open'])),
+                    ('Dbg',   _toggle_dbg),               # pip shows this pane's detector surface
                     ('-',     lambda: _zoom_step(_slot_role('big'), -1)),
                     ('+',     lambda: _zoom_step(_slot_role('big'), +1))]
         return [('Swap', lambda n=name: layout.__setitem__('big_role', _slot_role(n))),
@@ -452,8 +466,8 @@ def main(argv=None):
                       color=(140, 145, 160, 255), parent=f"L_warn_{name}")
 
     def draw_slot(name):
-        """Draw the slot's assigned role letterboxed + centred, with overlays, at the pane's size."""
-        role = _slot_role(name)
+        """Draw the slot's assigned stream letterboxed + centred, with overlays, at the pane's size."""
+        role = _slot_stream(name)                        # display stream (may be the <role>_debug surface)
         rmin, dlsz = _item_rect(f"dl_{name}")
         if dlsz is None:                       # not laid out / rendered yet -> next frame
             return
@@ -829,7 +843,7 @@ def main(argv=None):
     def gather_settings():
         return {
             'version': 1,
-            'layout': {k: layout[k] for k in ('panel_w', 'pip_h', 'panel_open', 'pip_open', 'big_role')},
+            'layout': {k: layout[k] for k in ('panel_w', 'pip_h', 'panel_open', 'pip_open', 'pip_debug', 'big_role')},
             'display': {role: dict(view_settings.get(role, _default_settings())) for role in roles},
             'optics': {
                 'owned': {k: sorted(v) for k, v in owned.items()},
@@ -1143,6 +1157,10 @@ def main(argv=None):
         new_work = False
         for role in roles:
             if update_cam(role):
+                new_work = True
+        for name in _active_slots():                     # advance any debug surface a pip is showing
+            stream = _slot_stream(name)
+            if stream not in roles and update_cam(stream):
                 new_work = True
         for name in _active_slots():
             draw_slot(name)
