@@ -154,6 +154,8 @@ def main(argv=None):
     p.add_argument('--sky-substeps', type=int, default=6, help="sky source: substeps per exposure")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky source: simulated exposure (s)")
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky source: lens focal length (mm)")
+    p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
+                   help="sky source: wavelength for the physically-sized Airy-disc PSF (nm)")
     p.add_argument('--wb-r', type=float, default=1.24, help="GUI display-only WB gain for red (1 = none)")
     p.add_argument('--wb-b', type=float, default=1.98, help="GUI display-only WB gain for blue (1 = none)")
     p.add_argument('--gui', dest='gui', action='store_true', default=True)
@@ -231,9 +233,11 @@ def main(argv=None):
     bin_by_role = {}           # role -> physical NxN bin (recorded in frame metadata; scales plate scale)
     roi_frac_by_role = {role: 1.0 for role in roles}    # role -> centered readout window, fraction of sensor
     roi_window_by_role = {}    # role -> [x0, y0, w, h] in native sensor px (provenance -> frame metadata)
+    aperture_by_role = {role: 0.0 for role in roles}    # role -> objective aperture mm (sim Airy-disc PSF)
     optics_sel = {role: [None, None, None] for role in roles}   # role -> [sensor, optic, reducer] in effect
 
-    def _geom(role, s, feff):
+    def _geom(role, s, feff, aperture_mm=0.0):
+        aperture_by_role[role] = aperture_mm            # objective aperture -> physically-sized Airy PSF
         """The one place geometry is computed: render size / plate scale / FoV / readout window for a
         role from its binning (bin_by_role) and ROI fraction (roi_frac_by_role), given DB sensor `s`
         at effective focal length `feff`. Startup and every live bin/ROI/optics change call this.
@@ -269,7 +273,7 @@ def main(argv=None):
                 mult = _reducers[rname] if rname else 1.0
                 feff = o.focal_length_mm * mult
                 optics_sel[role] = [sname, oname, rname]
-                rx, ry = _geom(role, s, feff)
+                rx, ry = _geom(role, s, feff, o.aperture_mm)
                 fx, fy = fov_by_role[role]
                 extra = f" (bin {b}x{b})" if b > 1 else ""
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
@@ -300,7 +304,7 @@ def main(argv=None):
             return False
         o = _optics[oname]
         mult = _reducers.get(rname, 1.0) if rname else 1.0
-        _geom(role, _sensors[sname], o.focal_length_mm * mult)
+        _geom(role, _sensors[sname], o.focal_length_mm * mult, o.aperture_mm)
         return True
 
     def recompute_render(role):
@@ -311,6 +315,7 @@ def main(argv=None):
             render_by_role[role] = (max(1, args.width // b), max(1, args.height // b),
                                     args.sky_pixel_um * b, args.sky_focal_mm)
             roi_window_by_role.pop(role, None)
+            aperture_by_role[role] = 0.0
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
     camera_url = {role: None for role in roles}           # per-role selected ZWO camera URL (None = default)
@@ -333,7 +338,9 @@ def main(argv=None):
         rx, ry, pum, fmm = render_by_role[role]       # per-role render size + sky optics (from the DB)
         per_role_sky = []
         if sources[role] == 'sky':
-            per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum)]
+            per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum),
+                            '--sky-aperture-mm', str(aperture_by_role.get(role, 0.0)),
+                            '--sky-psf-wavelength-nm', str(args.sky_psf_wavelength_nm)]
             if role in fov_by_role:                   # DB optics named -> render at the true sensor
                 per_role_sky += ['--sky-width', str(rx), '--sky-height', str(ry)]   # res, so FoV matches
             if role in roi_window_by_role:            # centered readout window (sensor px) -> frame metadata
