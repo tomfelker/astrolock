@@ -1339,9 +1339,22 @@ def main(argv=None):
             draw_slot(name)
 
         dpg.render_dearpygui_frame()
-        if not new_work:
-            time.sleep(0.02)             # ~50 Hz when waiting for a frame -- plenty for video + input,
-            #                              vs the ~200 Hz that 0.005 gave (which pegged a core)
+
+        # Adaptive rate: idle at ~5 Hz, but jump to ~60 Hz for 5 s after any activity -- a fresh camera
+        # frame, a mouse move/click, or the mount tracking/slewing. Keeps idle CPU tiny while staying
+        # snappy whenever anything happens. (Trade-off: up to ~200ms latency on the *first* input after
+        # going idle; then it's smooth. The backend's ~20Hz state heartbeat deliberately does NOT count as
+        # activity -- only its content, tracking/rates, does -- so a parked mount really goes idle.)
+        mpos = dpg.get_mouse_pos(local=False)
+        moved = mpos != ctrl.get('_mpos'); ctrl['_mpos'] = mpos
+        busy = dpg.is_mouse_button_down(dpg.mvMouseButton_Left)
+        st_cur = ctrl['state'] or {}
+        active_mount = (bool(st_cur.get('tracking'))
+                        or abs(st_cur.get('rate_az_deg_s', 0.0)) > 1e-6
+                        or abs(st_cur.get('rate_alt_deg_s', 0.0)) > 1e-6)
+        if new_work or moved or busy or active_mount:
+            ctrl['_active_until'] = time.perf_counter() + 5.0
+        time.sleep(0.016 if time.perf_counter() < ctrl.get('_active_until', 0.0) else 0.2)
 
     _shutdown()      # belt-and-suspenders: if the exit callback didn't fire, still exit immediately
 
