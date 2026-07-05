@@ -40,6 +40,25 @@ def _newest(session_dir, suffix):
     return matches[-1] if matches else None
 
 
+class _Meter:
+    """Rolling events-per-second: hit() as events happen, sample(now) each loop; `rate` refreshes ~1/s."""
+    def __init__(self):
+        self._n = 0
+        self._t = None
+        self.rate = 0.0
+
+    def hit(self, n=1):
+        self._n += n
+
+    def sample(self, now):
+        if self._t is None:
+            self._t = now
+        elif now - self._t >= 1.0:
+            self.rate = self._n / (now - self._t)
+            self._n = 0
+            self._t = now
+
+
 def _color_name(cid):
     try:
         return ser.ColorId(int(cid)).name
@@ -241,6 +260,10 @@ def main(argv=None):
     roles = ([r.strip() for r in args.roles.split(',') if r.strip()] if args.roles else list(ROLES))
     followers = {}
     cams = {}                 # role -> live camera data (texture + frames + detections); lazily created
+    perf = {'gui': _Meter(), 'frame': 0,                          # GUI loop rate + spinner counter
+            'cam': {r: _Meter() for r in roles},                  # per-role frames *produced* / s
+            'det': {r: _Meter() for r in roles},                  # per-role detector frames processed / s
+            'idx': {}}                                            # role -> last committed frame index seen
     view_settings = {}        # role -> display prefs {zoom, reticles, histogram}; persists across cams
     cam_ctrl_val = {}         # (role, control name) -> current value; the GUI owns it once a control is shown
     layout = {'panel_open': True, 'pip_open': True, 'pip_debug': False, 'panel_w': S(PANEL_W),
@@ -332,6 +355,9 @@ def main(argv=None):
         if res is None or f.header is None:
             return False
         idx, frame = res
+        if role in perf['cam']:                          # frames the cam *produced* since we last looked
+            perf['cam'][role].hit(max(0, idx - perf['idx'].get(role, idx)))
+            perf['idx'][role] = idx
         fh, fw = frame.shape[0], frame.shape[1]
         cam = cams.get(role)
         if cam is None:
@@ -354,6 +380,8 @@ def main(argv=None):
         for rec in cam['det_tailer'].poll():
             cam['blobs'] = rec.get('blobs', [])
             cam['det_idx'] = rec.get('index', cam['det_idx'])
+            if role in perf['det']:                      # a detection record = one frame the detector ran
+                perf['det'][role].hit()
         if idx == cam['last_idx']:
             return False
         w, h, rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
@@ -1014,6 +1042,7 @@ def main(argv=None):
                  "last pose and nothing moves.")
             dpg.add_text("Az: --   Alt: --", tag="mount_pose_txt")               # live encoder pose (deg)
             dpg.add_text("rate: --", tag="mount_rate_txt", color=(160, 170, 190))   # live axis rates (deg/s)
+            dpg.add_text("", tag="perf_txt", color=(150, 160, 180))              # GUI/cam/tracker rates + spinner
             # 2D slew pad: a log-scaled az/alt rate plane. Drag = drive the mount (momentary override
             # of tracking); the circle shows the current rate (readout in update_control).
             dpg.add_text("Slew", color=(160, 170, 190))     # a drawlist can't host a tooltip; label it
@@ -1098,7 +1127,28 @@ def main(argv=None):
                 dpg.add_input_text(tag='settings_name', hint="save as...", width=-S(56))
                 dpg.add_button(label="Save", callback=_settings_save)
 
+    def _perf_text():
+        spin = "|/-\\"[perf['frame'] % 4]                 # advances every GUI frame -> a live "alive" spinner
+        lines = [f"{'GUI':>9}: {perf['gui'].rate:3.0f} fps {spin}"]
+        for r in roles:
+            lines.append(f"{(r.capitalize() + ' Cam'):>9}: {perf['cam'][r].rate:3.0f} fps")
+        dr = roles[0]                                     # the detector runs on the guide by default
+        cam_fps, det_fps = perf['cam'][dr].rate, perf['det'][dr].rate
+        skips = 0.0 if cam_fps < 1e-6 else max(0.0, 100.0 * (1.0 - det_fps / cam_fps))
+        lines.append(f"{'Tracker':>9}: {skips:3.0f}% skips")
+        return "\n".join(lines)
+
     def update_control():
+        # Frame-rate meters (GUI loop rate + spinner; per-cam produced fps + tracker skip% are hit in
+        # update_cam). Sampling here runs once per loop.
+        perf['frame'] += 1
+        perf['gui'].hit()
+        now = time.perf_counter()
+        for _m in (perf['gui'], *perf['cam'].values(), *perf['det'].values()):
+            _m.sample(now)
+        if dpg.does_item_exist('perf_txt'):
+            dpg.set_value('perf_txt', _perf_text())
+
         # Connect to the backend command socket once its port file appears.
         if ctrl['client'] is None:
             bj = _newest(args.session, '_backend.json')
