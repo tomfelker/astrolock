@@ -11,11 +11,18 @@ Rollover/successor chaining across multiple .ser segments is not needed for the 
 (one segment per session); locating the current segment is by newest timestamp.
 """
 
+import collections
 import glob
 import os
 
 from astrolock.seeker import ser as ser_mod
 from astrolock.seeker import sidecar
+
+
+# A frame index is only meaningful against the .ser segment it was taken from: index N in one segment
+# is a different frame than index N in the next. So a frame is named by (segment path, index) together,
+# never a bare int -- read_frame refuses a ref whose segment we've already rolled past.
+FrameRef = collections.namedtuple('FrameRef', ['ser_path', 'index'])
 
 
 class SerFollower:
@@ -64,29 +71,36 @@ class SerFollower:
         on_disk = self._reader.frames_on_disk()
         return min(sidecar_lines, on_disk)
 
-    def latest_index(self):
-        return self.committed_count() - 1
+    def latest_ref(self):
+        """FrameRef of the newest committed frame (or None), without reading its pixels."""
+        n = self.committed_count()
+        return FrameRef(self._ser_path, n - 1) if n > 0 else None
 
-    def read_frame(self, index, to_float=False):
+    def read_frame(self, ref, to_float=False):
+        """Read the frame named by a FrameRef. Refuses (IndexError) a ref for a segment we've rolled
+        past -- an index is only valid against the file it was taken from, so we never silently read
+        the wrong frame out of a fresher segment."""
         if not self._resolve():
             raise IndexError("no capture available yet")
-        return self._reader.read_frame(index, to_float=to_float)
+        if ref.ser_path != self._ser_path:
+            raise IndexError(f"frame {ref.index} is from {ref.ser_path}; current segment is {self._ser_path}")
+        return self._reader.read_frame(ref.index, to_float=to_float)
 
     def read_latest(self, to_float=False):
         """
-        Return (index, frame) for the newest committed frame, or None if none yet.
+        Return (FrameRef, frame) for the newest committed frame, or None if none yet.
 
         Resolves the current segment exactly once and reads the count + frame from that same
         reader, so a rollover between resolving and reading can't ask a freshly-created (empty)
         segment for a stale index (the previous version resolved twice and could race at the
-        300-frame rollover boundary).
+        300-frame rollover boundary). The returned ref carries the segment its index belongs to.
         """
         if not self._resolve():
             return None
         n = min(sidecar.count_complete_lines(self._frames_path), self._reader.frames_on_disk())
         if n <= 0:
             return None
-        return n - 1, self._reader.read_frame(n - 1, to_float=to_float)
+        return FrameRef(self._ser_path, n - 1), self._reader.read_frame(n - 1, to_float=to_float)
 
     @property
     def header(self):

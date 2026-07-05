@@ -25,8 +25,9 @@ def test_cam_to_follower():
 
     res = f.read_latest()
     assert res is not None
-    idx, frame = res
-    assert idx == 19
+    ref, frame = res
+    assert ref.index == 19
+    assert ref.ser_path.endswith('_guide.ser')     # the index carries the segment it indexes into
     assert frame.shape == (240, 320) and frame.dtype == np.uint16
     assert frame.max() > 50000, f"synthetic blob should be bright, got {frame.max()}"
 

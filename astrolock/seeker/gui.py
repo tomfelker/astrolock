@@ -17,12 +17,14 @@ Requires `dearpygui` (pip install dearpygui).
 """
 
 import argparse
+import ctypes
 import glob
 import json
 import math
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -31,7 +33,7 @@ import torch
 from astrolock.seeker import bayer, control, ser
 from astrolock.seeker import optics as optics_db
 from astrolock.seeker import settings as settings_store
-from astrolock.seeker.follower import SerFollower
+from astrolock.seeker.follower import FrameRef, SerFollower
 from astrolock.seeker.sidecar import JsonlTailer
 
 
@@ -211,6 +213,66 @@ def _rate_to_u(r):
     return math.copysign(SLEW_DEAD + (1.0 - SLEW_DEAD) * frac, r)
 
 
+def _waker(gui_tid, wake, stop):
+    """Watch the sidecars the GUI renders from and poke the GUI thread awake ONLY when something it
+    actually draws has changed -- so the main loop can block in wait-for-input (0% idle) while the
+    fps/spinner readout stays honest: it advances once per real render, never on a made-up heartbeat.
+    Two signals, both self-gating -- a parked, not-tracking, not-capturing rig emits neither:
+      * frame/detection files -- a path that grew, OR one we've not seen yet (a cam just connected /
+        a segment rolled over), means new pixels to draw;
+      * state file -- only a *meaningful* field change wakes us. The backend rewrites state at ~20 Hz
+        even when parked, so we diff with the volatile fields stripped, else the GUI would never idle.
+    Windows-only: wakes GLFW's WaitMessage via PostThreadMessageW(WM_NULL)."""
+    post = ctypes.windll.user32.PostThreadMessageW
+    WM_NULL = 0x0000
+    sizes = {}
+    cur_sp = None
+    state_pos = 0
+    last_state = None
+    while not stop.is_set():
+        dirty = False
+        paths = wake.get('paths') or ()
+        for pth in paths:                         # unseen path (sizes.get -> None) or a grown one = new data
+            try:
+                sz = os.path.getsize(pth)
+            except OSError:
+                continue
+            if sizes.get(pth) != sz:
+                sizes[pth] = sz
+                dirty = True
+        for stale in [k for k in sizes if k not in paths]:
+            del sizes[stale]                      # forget rolled-over segments so the dict stays bounded
+        sp = wake.get('state_path')
+        if sp != cur_sp:                          # new backend session -> re-point, skip existing history
+            cur_sp = sp
+            last_state = None
+            try:
+                state_pos = os.path.getsize(sp) if sp else 0
+            except OSError:
+                state_pos = 0
+        if cur_sp:
+            try:
+                with open(cur_sp, 'rb') as f:
+                    f.seek(state_pos)
+                    data = f.read()
+                    state_pos = f.tell()
+            except OSError:
+                data = b''
+            for line in data.splitlines():
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                for k in ('t_mono_ns', 't_utc', 'enc_t_mono_ns', 'cameras'):
+                    rec.pop(k, None)              # volatile fields the GUI doesn't draw (frame counts
+                if rec != last_state:             # arrive via .ser growth) -- exclude from the wake test
+                    last_state = rec
+                    dirty = True
+        if dirty:
+            post(gui_tid, WM_NULL, 0, 0)
+        stop.wait(0.02)                           # cheap: a few os.stat + one small read per tick
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker GUI viewer")
     p.add_argument('--session', required=True, help="session directory to view")
@@ -347,44 +409,60 @@ def main(argv=None):
 
     # ---- per-role camera data (textures + frames + detections) ---------------------------
     def update_cam(role):
-        """Advance a role's follower: upload the newest frame to its texture, poll detections, and
-        refresh the histogram. Textures/data are per-role (a slot draws whichever role it shows).
-        Returns True if a new frame was uploaded."""
+        """Advance a role's follower: upload a frame to its texture, poll detections, and refresh the
+        histogram. Textures/data are per-role (a slot draws whichever role it shows). When a detector is
+        producing records for this role we display the exact frame it last processed (not the newest),
+        so the boxes sit on the object instead of lagging a fresher frame -- otherwise old boxes drawn on
+        new frames make the overlay jitter. Returns True if a new frame was uploaded."""
         f = followers.get(role) or followers.setdefault(role, SerFollower(args.session, role))
         res = f.read_latest()
         if res is None or f.header is None:
             return False
-        idx, frame = res
-        if role in perf['cam']:                          # frames the cam *produced* since we last looked
-            perf['cam'][role].hit(max(0, idx - perf['idx'].get(role, idx)))
-            perf['idx'][role] = idx
-        fh, fw = frame.shape[0], frame.shape[1]
+        ref, frame = res                                 # ref = (segment, index) of the newest committed frame
+        seg, idx = ref.ser_path, ref.index               # every index below is an index into `seg`
+        if role in perf['cam']:                          # production rate = newest-index delta *within* a segment
+            pseg, pidx = perf['idx'].get(role, (seg, idx))
+            perf['cam'][role].hit(idx - pidx if (pseg == seg and idx >= pidx) else 0)
+            perf['idx'][role] = (seg, idx)
         cam = cams.get(role)
         if cam is None:
+            fh0, fw0 = frame.shape[0], frame.shape[1]
             w, h, _rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
             tex = f"tex_{role}_0"
             if not dpg.does_item_exist(tex):
                 with dpg.texture_registry():
                     dpg.add_raw_texture(w, h, np.zeros(w * h * 4, dtype=np.float32),
                                         format=dpg.mvFormat_Float_rgba, tag=tex)
-            det_path = f.ser_path[:-len('.ser')] + '.detections.jsonl'
-            cam = cams[role] = dict(tex=tex, texver=0, w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh,
+            det_path = seg[:-len('.ser')] + '.detections.jsonl'
+            cam = cams[role] = dict(tex=tex, texver=0, w=w, h=h, fw=fw0, fh=fh0, ox=w / fw0, oy=h / fh0,
                                     color_id=f.header.color_id, blobs=[], det_idx=-1, last_idx=-1,
-                                    hist=None, det_tailer=JsonlTailer(det_path), ser_path=f.ser_path)
-        # segment rollover / source switch -> re-point the detections tailer
-        if f.ser_path != cam['ser_path']:
+                                    hist=None, det_tailer=JsonlTailer(det_path), ser_path=seg)
+        # segment rollover / source switch -> re-point the detections tailer. det_idx/last_idx are indices
+        # into cam['ser_path'], so reset them: index N in the old segment is a different frame than in the new.
+        if seg != cam['ser_path']:
             cam['det_tailer'].close()
-            cam['det_tailer'] = JsonlTailer(f.ser_path[:-len('.ser')] + '.detections.jsonl')
-            cam['ser_path'] = f.ser_path
+            cam['det_tailer'] = JsonlTailer(seg[:-len('.ser')] + '.detections.jsonl')
+            cam['ser_path'] = seg
             cam['last_idx'] = cam['det_idx'] = -1
         for rec in cam['det_tailer'].poll():
             cam['blobs'] = rec.get('blobs', [])
-            cam['det_idx'] = rec.get('index', cam['det_idx'])
+            cam['det_idx'] = rec.get('index', cam['det_idx'])   # an index into cam['ser_path'] (== seg)
             if role in perf['det']:                      # a detection record = one frame the detector ran
                 perf['det'][role].hit()
-        if idx == cam['last_idx']:
+        # Pick the frame to show, as an index into `seg`. If a detector is running on this role, show the
+        # frame it last processed (clamped, never ahead) so its boxes match the pixels. Else show newest.
+        show_idx = cam['det_idx'] if 0 <= cam['det_idx'] <= idx else idx
+        if show_idx == cam['last_idx']:
             return False
-        w, h, rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
+        if show_idx == idx:
+            disp = frame                                 # already have the newest frame in hand
+        else:
+            try:
+                disp = f.read_frame(FrameRef(seg, show_idx))    # refuses (-> retry) if we've since rolled past seg
+            except (IndexError, ValueError):
+                return False                             # rollover race / not yet readable -- retry next tick
+        fh, fw = disp.shape[0], disp.shape[1]
+        w, h, rgba = prepare_rgba(disp, f.header.color_id, args.gamma, wb, device=device)
         if (w, h) != (cam['w'], cam['h']):          # frame size changed (source/optics switch) -> a
             old = cam['tex']                          # fresh texture. Use a new tag so the string alias
             cam['texver'] += 1                        # never collides -- delete_item leaves the alias
@@ -396,7 +474,7 @@ def main(argv=None):
                 dpg.delete_item(old)                  # safe: draw_slot re-points its draw_image this frame
             cam.update(w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh, color_id=f.header.color_id)
         dpg.set_value(cam['tex'], rgba.ravel())
-        cam['last_idx'] = idx
+        cam['last_idx'] = show_idx
         # The histogram inset is off by default; only pay for it (a full-frame subsample + np.histogram
         # every frame) when it's actually enabled for this role. Otherwise skip it entirely.
         if view_settings.get(role, {}).get('histogram'):
@@ -1352,6 +1430,21 @@ def main(argv=None):
             dpg.configure_item("win_panel", show=False)
             dpg.configure_item("splitter", show=False)
 
+    # Event-driven idle: block the render call in GLFW's WaitMessage until an OS event *or* a wake the
+    # watcher thread posts when a sidecar changes. A parked, not-tracking, not-capturing rig produces
+    # neither, so the GUI sleeps at 0% GPU until the user acts. Windows-only (PostThreadMessageW wakes
+    # WaitMessage); elsewhere we keep the polling loop below. configure_app must precede setup.
+    wake = {'paths': (), 'state_path': None}
+    waker_stop = threading.Event()
+    event_driven = False
+    if sys.platform == 'win32':
+        try:
+            gui_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            dpg.configure_app(wait_for_input=True)
+            event_driven = True
+        except Exception:
+            event_driven = False
+
     dpg.create_viewport(title="AstroLock Seeker", width=S(1400), height=S(900))
     dpg.setup_dearpygui()
     try:
@@ -1359,6 +1452,9 @@ def main(argv=None):
     except Exception:
         pass                                # older dpg: fall back to the loop-end + poll paths
     dpg.show_viewport()
+
+    if event_driven:
+        threading.Thread(target=_waker, args=(gui_tid, wake, waker_stop), daemon=True).start()
 
     while dpg.is_dearpygui_running():
         vw = max(S(200), dpg.get_viewport_client_width())
@@ -1388,13 +1484,22 @@ def main(argv=None):
         for name in _active_slots():
             draw_slot(name)
 
+        if event_driven:
+            # Tell the watcher which files to watch (the currently-followed .ser + detection sidecars +
+            # the backend state file), then block in render until it (or an OS event) wakes us.
+            paths = [fo.ser_path for fo in followers.values() if fo.ser_path]
+            paths += [c['det_tailer'].path for c in cams.values()]
+            wake['paths'] = paths
+            wake['state_path'] = ctrl['tailer'].path if ctrl['tailer'] is not None else None
+            dpg.render_dearpygui_frame()
+            continue
+
         dpg.render_dearpygui_frame()
 
-        # Adaptive rate: idle at ~5 Hz, but jump to ~60 Hz for 5 s after any activity -- a fresh camera
-        # frame, a mouse move/click, or the mount tracking/slewing. Keeps idle CPU tiny while staying
-        # snappy whenever anything happens. (Trade-off: up to ~200ms latency on the *first* input after
-        # going idle; then it's smooth. The backend's ~20Hz state heartbeat deliberately does NOT count as
-        # activity -- only its content, tracking/rates, does -- so a parked mount really goes idle.)
+        # Fallback (non-Windows) adaptive rate: idle at ~5 Hz, but jump to ~60 Hz for 5 s after any
+        # activity -- a fresh camera frame, a mouse move/click, or the mount tracking/slewing. Keeps idle
+        # CPU tiny while staying snappy. (The backend's ~20Hz state heartbeat deliberately does NOT count
+        # as activity -- only its content, tracking/rates, does -- so a parked mount really goes idle.)
         mpos = dpg.get_mouse_pos(local=False)
         moved = mpos != ctrl.get('_mpos'); ctrl['_mpos'] = mpos
         busy = dpg.is_mouse_button_down(dpg.mvMouseButton_Left)
