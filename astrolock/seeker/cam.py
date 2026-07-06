@@ -52,22 +52,28 @@ def make_synthetic_frame(width, height, t, max_val=65535):
     return (img * max_val).to(torch.int32).numpy().astype(np.uint16)
 
 
+_zwo = None
+
+
 def _zwo_module():
-    """Import + init the zwoasi library (idempotent), with friendly errors."""
-    try:
-        import zwoasi
-    except ImportError as e:
-        raise RuntimeError("zwoasi is not installed (pip install zwoasi)") from e
+    """Import zwoasi with its SDK library loaded from the path we choose (ZWO_ASI_LIB or the ASIStudio
+    default). zwoasi loads the DLL at *import* time by bare name, so we add its directory to the DLL
+    search path first with os.add_dll_directory (the sanctioned Py3.8+ way -- no PATH mutation); the
+    import then loads it cleanly, no spurious 'library not found' warning. If the dir didn't hold the
+    DLL (zwolib still None), we init() from the explicit path so a real misconfig points at the file.
+    Cached, so the setup runs once."""
+    global _zwo
+    if _zwo is not None:
+        return _zwo
     lib = os.getenv('ZWO_ASI_LIB') or 'C:/Program Files/ASIStudio/ASICamera2.dll'
-    try:
+    sdk_dir = os.path.dirname(lib)
+    if os.path.isdir(sdk_dir) and hasattr(os, 'add_dll_directory'):
+        os.add_dll_directory(sdk_dir)
+    import zwoasi
+    if zwoasi.zwolib is None:
         zwoasi.init(lib)
-    except Exception as e:
-        # init() raises if called a second time in a process; tolerate that only.
-        if 'already' not in str(e).lower():
-            raise RuntimeError(
-                f"could not load the ASI SDK from {lib!r}; set ZWO_ASI_LIB to ASICamera2.dll"
-            ) from e
-    return zwoasi
+    _zwo = zwoasi
+    return _zwo
 
 
 def list_zwo_cameras():
@@ -83,13 +89,23 @@ def list_zwo_cameras():
     return out
 
 
+def _zwo_available():
+    """True if the zwoasi *module* is installed -- checked WITHOUT importing it, because importing
+    triggers zwoasi's load-the-DLL-on-import side effect, which must wait until _zwo_module() has put
+    the SDK dir on the search path. A missing/broken DLL is deliberately NOT hidden here; it surfaces
+    loudly when we actually init/use the library, not as a silent 'no cameras'."""
+    import importlib.util
+    return importlib.util.find_spec('zwoasi') is not None
+
+
 def list_zwo_camera_names():
     """ZWO camera model names in enumeration order. Safe to call while a camera is in use -- it only
-    *lists* (never opens one). Returns [] if zwoasi / the ASI SDK is missing or none are attached."""
-    try:
-        return list(_zwo_module().list_cameras())
-    except Exception:
+    *lists* (never opens one). Returns [] ONLY when the zwoasi module isn't installed (sim-only rig);
+    a missing/broken SDK DLL or a driver error propagates loudly instead of masquerading as 'no cameras'.
+    None attached is not an error -- list_cameras() just returns []."""
+    if not _zwo_available():
         return []
+    return list(_zwo_module().list_cameras())
 
 
 def zwo_camera_urls(names=None):
