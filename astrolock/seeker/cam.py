@@ -56,21 +56,24 @@ _zwo = None
 
 
 def _zwo_module():
-    """Import zwoasi with its SDK library loaded from the path we choose (ZWO_ASI_LIB or the ASIStudio
-    default). zwoasi loads the DLL at *import* time by bare name, so we add its directory to the DLL
-    search path first with os.add_dll_directory (the sanctioned Py3.8+ way -- no PATH mutation); the
-    import then loads it cleanly, no spurious 'library not found' warning. If the dir didn't hold the
-    DLL (zwolib still None), we init() from the explicit path so a real misconfig points at the file.
-    Cached, so the setup runs once."""
+    """Import zwoasi and load its SDK library from the path we choose (ZWO_ASI_LIB or the ASIStudio
+    default). zwoasi resolves the DLL at import via find_library('ASICamera2'), which on Windows searches
+    only PATH -- so we make the SDK dir findable there first (appended, so it never shadows a system
+    copy), and the import loads it cleanly. We also add_dll_directory(sdk_dir) (covers the WinAPI
+    LoadLibrary search + the DLL's dependencies) and, if the import still didn't load it, init() from the
+    explicit path -- which then raises loudly on a genuinely bad path. Cached, so the setup runs once."""
     global _zwo
     if _zwo is not None:
         return _zwo
     lib = os.getenv('ZWO_ASI_LIB') or 'C:/Program Files/ASIStudio/ASICamera2.dll'
     sdk_dir = os.path.dirname(lib)
-    if os.path.isdir(sdk_dir) and hasattr(os, 'add_dll_directory'):
-        os.add_dll_directory(sdk_dir)
+    if os.path.isdir(sdk_dir):
+        if sdk_dir not in os.environ.get('PATH', '').split(os.pathsep):
+            os.environ['PATH'] = os.environ.get('PATH', '') + os.pathsep + sdk_dir   # find_library reads PATH
+        if hasattr(os, 'add_dll_directory'):
+            os.add_dll_directory(sdk_dir)                # WinAPI LoadLibrary search + the DLL's deps
     import zwoasi
-    if zwoasi.zwolib is None:
+    if zwoasi.zwolib is None:                            # import didn't load it -> load from the exact path
         zwoasi.init(lib)
     _zwo = zwoasi
     return _zwo
