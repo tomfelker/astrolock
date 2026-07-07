@@ -820,16 +820,19 @@ def main(argv=None):
         with dpg.tooltip(item if item is not None else dpg.last_item()):
             dpg.add_text(text, wrap=S(240))
 
-    def _combo_row(label, items, tag, cb, parent=None, default='', right=0, group_tag=None):
+    def _combo_row(label, items, tag, cb, parent=None, default='', right=0, group_tag=None, tip=None):
         """A 'label: <dropdown>' row; the dropdown fills the remaining width (minus `right` px, when a
         trailing widget follows). parent=None -> the current container. group_tag tags the row's group
-        so a caller can show/hide the whole row (label + dropdown together)."""
+        so a caller can show/hide the whole row (label + dropdown together). tip -> hover text attached
+        to the *label* (clearer than tipping the dropdown itself)."""
         kw = {'parent': parent} if parent else {}
         if group_tag:
             kw['tag'] = group_tag
         with dpg.group(horizontal=True, **kw):
-            dpg.add_text(f"{label}:")
+            lbl = dpg.add_text(f"{label}:")
             dpg.add_combo(items, tag=tag, default_value=default, width=(-right if right else -1), callback=cb)
+        if tip:
+            _tip(tip, item=lbl)
 
     def _toggle_connect(role):
         """Connect/Disconnect: fully start or stop this role's cam process. We drive it off the
@@ -848,12 +851,12 @@ def main(argv=None):
         view_settings."""
         sset = view_settings.setdefault(role, _default_settings())
         _combo_row("driver", ['zwo', 'sky'], f"src_{role}",
-                   lambda _s, a: _send({'type': 'set_source', 'role': role, 'source': a}), parent)
-        _tip("Frame source: 'zwo' = a real camera, 'sky' = the ISS simulator.")
+                   lambda _s, a: _send({'type': 'set_source', 'role': role, 'source': a}), parent,
+                   tip="Frame source: 'zwo' = a real camera, 'sky' = the ISS simulator.")
         _combo_row("camera", ['(auto)'], f"chooser_{role}",
                    lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)',
-                   group_tag=f"camrow_{role}")
-        _tip("Which physical ZWO camera to use (by model). '(auto)' = the first one. Press Rescan after plugging in.")
+                   group_tag=f"camrow_{role}",
+                   tip="Which physical ZWO camera to use (by model). '(auto)' = the first one. Press Rescan after plugging in.")
         dpg.add_group(tag=f"ctrls_{role}", parent=parent)   # caps-driven controls (exposure/gain/...), filled live
         dpg.add_button(label="Connect", tag=f"conn_{role}", parent=parent, user_data=role,
                        callback=lambda _s, _a, r: _toggle_connect(r))
@@ -1118,12 +1121,12 @@ def main(argv=None):
             dpg.add_text("", tag="perf_txt", color=_READOUT)   # GUI/cam/mount/tracker rates + spinner
         with dpg.collapsing_header(label="Mount", default_open=True):
             with dpg.group(horizontal=True):
-                dpg.add_text("Mount:")
+                _mlbl = dpg.add_text("Mount:")
+                _tip("Which mount to drive: 'sim', or a detected Celestron on a COM port. Rescan after "
+                     "plugging one in.", item=_mlbl)
                 dpg.add_combo(['sim'], tag='mount_combo', default_value='sim', width=-S(66),
                               callback=lambda _s, a: _send({'type': 'set_mount', 'url': a}))
                 dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_mounts'}))
-            _tip("Which mount to drive: 'sim', or a detected Celestron on a COM port. Rescan after "
-                 "plugging one in.")
             dpg.add_button(label="Connect", tag="mount_conn", callback=lambda: _toggle_mount_connect())
             _tip("Connect to / disconnect from the selected mount. Disconnected = the backend holds the "
                  "last pose and nothing moves.")
@@ -1165,11 +1168,11 @@ def main(argv=None):
                     dpg.add_text("", tag=f"opt_info_{role}", color=(150, 155, 170))   # live FoV (from state)
                 for kind, has_owned in (('sensor', True), ('optic', True), ('reducer', False)):
                     with dpg.group(horizontal=True):
-                        dpg.add_text(f"{kind}:")
+                        _glbl = dpg.add_text(f"{kind}:")
+                        _tip(f"{role.capitalize()} {kind}. Owned gear is pinned to the top of the list.", item=_glbl)
                         dpg.add_combo(_gear_items(kind), tag=f"opt_{role}_{kind}",
                                       width=(-S(30) if has_owned else -1), user_data=(role, kind),
                                       callback=lambda _s, _a, u: _on_gear_change(u[0], u[1]))
-                        _tip(f"{role.capitalize()} {kind}. Owned gear is pinned to the top of the list.")
                         if has_owned:
                             dpg.add_checkbox(tag=f"own_{role}_{kind}", user_data=(role, kind),
                                              callback=lambda _s, _a, u: _toggle_owned(u[0], u[1]))
