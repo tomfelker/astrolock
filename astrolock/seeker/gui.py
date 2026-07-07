@@ -322,7 +322,7 @@ def main(argv=None):
     roles = ([r.strip() for r in args.roles.split(',') if r.strip()] if args.roles else list(ROLES))
     followers = {}
     cams = {}                 # role -> live camera data (texture + frames + detections); lazily created
-    perf = {'gui': _Meter(), 'frame': 0,                          # GUI loop rate + spinner counter
+    perf = {'gui': _Meter(), 'mount': _Meter(), 'frame': 0,       # GUI loop rate + spinner; mount state rate
             'cam': {r: _Meter() for r in roles},                  # per-role frames *produced* / s
             'det': {r: _Meter() for r in roles},                  # per-role detector frames processed / s
             'idx': {}}                                            # role -> last committed frame index seen
@@ -1106,10 +1106,19 @@ def main(argv=None):
                 return cur
         _bore_set(_f('bore_x', boresight_ui['x']), _f('bore_y', boresight_ui['y']))
 
+    _READOUT = (205, 210, 222)                            # one consistent tone for the numeric readouts
+    mono_font = None                                      # monospace, so the aligned readouts actually line up
+    _mono_path = "C:/Windows/Fonts/consola.ttf"
+    if os.path.exists(_mono_path):
+        with dpg.font_registry():
+            mono_font = dpg.add_font(_mono_path, 13)       # base size -- set_global_font_scale handles DPI
+
     with dpg.window(tag="win_panel", no_title_bar=True, no_move=True, no_resize=True, no_collapse=True):
+        with dpg.collapsing_header(label="Status", default_open=True):
+            dpg.add_text("", tag="perf_txt", color=_READOUT)   # GUI/cam/mount/tracker rates + spinner
         with dpg.collapsing_header(label="Mount", default_open=True):
             with dpg.group(horizontal=True):
-                dpg.add_text("mount:")
+                dpg.add_text("Mount:")
                 dpg.add_combo(['sim'], tag='mount_combo', default_value='sim', width=-S(66),
                               callback=lambda _s, a: _send({'type': 'set_mount', 'url': a}))
                 dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_mounts'}))
@@ -1118,9 +1127,8 @@ def main(argv=None):
             dpg.add_button(label="Connect", tag="mount_conn", callback=lambda: _toggle_mount_connect())
             _tip("Connect to / disconnect from the selected mount. Disconnected = the backend holds the "
                  "last pose and nothing moves.")
-            dpg.add_text("Az: --   Alt: --", tag="mount_pose_txt")               # live encoder pose (deg)
-            dpg.add_text("rate: --", tag="mount_rate_txt", color=(160, 170, 190))   # live axis rates (deg/s)
-            dpg.add_text("", tag="perf_txt", color=(150, 160, 180))              # GUI/cam/tracker rates + spinner
+            dpg.add_text("Az:     ---  Alt:     --- deg", tag="mount_pose_txt", color=_READOUT)   # pose (deg)
+            dpg.add_text("        ---          --- deg/s", tag="mount_rate_txt", color=_READOUT)   # rate (deg/s)
             # 2D slew pad: a log-scaled az/alt rate plane. Drag = drive the mount (momentary override
             # of tracking); the circle shows the current rate (readout in update_control).
             dpg.add_text("Slew", color=(160, 170, 190))     # a drawlist can't host a tooltip; label it
@@ -1205,15 +1213,22 @@ def main(argv=None):
                 dpg.add_input_text(tag='settings_name', hint="save as...", width=-S(56))
                 dpg.add_button(label="Save", callback=_settings_save)
 
+    if mono_font:                                        # so the space-padded numeric readouts line up
+        for _t in ('perf_txt', 'mount_pose_txt', 'mount_rate_txt'):
+            dpg.bind_item_font(_t, mono_font)
+
     def _perf_text():
         spin = "|/-\\"[perf['frame'] % 4]                 # advances every GUI frame -> a live "alive" spinner
-        lines = [f"{'GUI':>9}: {perf['gui'].rate:3.0f} fps {spin}"]
+        def row(pre, label, val, unit):                   # pre = spinner (GUI) or a space, so columns align
+            return f"{pre} {label:>9}: {val:5.1f} {unit}"
+        lines = [row(spin, 'GUI', perf['gui'].rate, 'fps')]
         for r in roles:
-            lines.append(f"{(r.capitalize() + ' Cam'):>9}: {perf['cam'][r].rate:3.0f} fps")
+            lines.append(row(' ', r.capitalize() + ' Cam', perf['cam'][r].rate, 'fps'))
+        lines.append(row(' ', 'Mount', perf['mount'].rate, 'fps'))
         dr = roles[0]                                     # the detector runs on the guide by default
         cam_fps, det_fps = perf['cam'][dr].rate, perf['det'][dr].rate
         skips = 0.0 if cam_fps < 1e-6 else max(0.0, 100.0 * (1.0 - det_fps / cam_fps))
-        lines.append(f"{'Tracker':>9}: {skips:3.0f}% skips")
+        lines.append(row(' ', 'Tracker', skips, '% skips'))
         return "\n".join(lines)
 
     def update_control():
@@ -1222,7 +1237,7 @@ def main(argv=None):
         perf['frame'] += 1
         perf['gui'].hit()
         now = time.perf_counter()
-        for _m in (perf['gui'], *perf['cam'].values(), *perf['det'].values()):
+        for _m in (perf['gui'], perf['mount'], *perf['cam'].values(), *perf['det'].values()):
             _m.sample(now)
         if dpg.does_item_exist('perf_txt'):
             dpg.set_value('perf_txt', _perf_text())
@@ -1243,6 +1258,7 @@ def main(argv=None):
         if ctrl['tailer'] is not None:
             for rec in ctrl['tailer'].poll():
                 ctrl['state'] = rec
+                perf['mount'].hit()                       # each state record = one mount/backend update
         st = ctrl['state']
         rec_st = (st or {}).get('recording') or {}     # per-role: {role: bool}
         cap_st = (st or {}).get('capturing') or {}
@@ -1325,10 +1341,13 @@ def main(argv=None):
         if dpg.does_item_exist('mount_conn'):
             dpg.configure_item('mount_conn', label="Disconnect" if (st or {}).get('mount_connected') else "Connect")
         if st and dpg.does_item_exist('mount_pose_txt'):
+            # Two aligned lines (monospace): rate values sit directly under the pose values.
+            #   Az: 123.456  Alt: 123.456 deg
+            #        +1.234        -5.678 deg/s
             dpg.set_value('mount_pose_txt',
-                          f"Az: {st.get('enc_az_deg', 0.0):8.3f}   Alt: {st.get('enc_alt_deg', 0.0):8.3f}")
+                          f"Az: {st.get('enc_az_deg', 0.0):7.3f}  Alt: {st.get('enc_alt_deg', 0.0):7.3f} deg")
             dpg.set_value('mount_rate_txt',
-                          f"Az {st.get('rate_az_deg_s', 0.0):+8.3f}   Alt {st.get('rate_alt_deg_s', 0.0):+8.3f}  deg/s")
+                          f"    {st.get('rate_az_deg_s', 0.0):+7.3f}       {st.get('rate_alt_deg_s', 0.0):+7.3f} deg/s")
 
         # Optics panel: live field-of-view per role (from the backend's resolved optics).
         opt_fov = (st or {}).get('optics') or {}

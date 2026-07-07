@@ -644,7 +644,6 @@ def main(argv=None):
             finally:
                 writer.close()
                 sidecar.close()
-            print(f"[cam:{args.role}] segment {os.path.basename(ser_path)}: {frames_in_file} frames", flush=True)
             if rolled and not stop and cfg['file_limit'] != -1:
                 cfg['file_limit'] -= 1                 # consumed one of our file budget
     except KeyboardInterrupt:
