@@ -503,12 +503,12 @@ def main(argv=None):
         child-window buttons don't reliably capture clicks over the drawlist)."""
         if name == 'big':
             return [('Panel', lambda: layout.__setitem__('panel_open', not layout['panel_open'])),
-                    ('Swap',  lambda: layout.__setitem__('big_role', _other(layout['big_role']))),
                     ('PIP',   lambda: layout.__setitem__('pip_open', not layout['pip_open'])),
                     ('Dbg',   _toggle_dbg),               # pip shows this pane's detector surface
                     ('-',     lambda: _zoom_step(_slot_role('big'), -1)),
                     ('+',     lambda: _zoom_step(_slot_role('big'), +1))]
-        return [('Swap', lambda n=name: layout.__setitem__('big_role', _slot_role(n))),
+        # PIP panes: '^' promotes this pane to the main view (each PIP has its own, vs one global Swap).
+        return [('^', lambda n=name: layout.__setitem__('big_role', _slot_role(n))),
                 ('-',    lambda n=name: _zoom_step(_slot_role(n), -1)),
                 ('+',    lambda n=name: _zoom_step(_slot_role(n), +1))]
 
@@ -590,10 +590,14 @@ def main(argv=None):
     dpg.bind_item_theme("splitter", splitter_win_theme)
     dpg.bind_item_theme("splitter_btn", splitter_theme)
 
-    def _draw_placeholder(name, SW, SH, role):
-        msg = f"{role} — no data"
-        dpg.draw_text((SW / 2.0 - S(70), SH / 2.0 - S(10)), msg, size=S(18),
-                      color=(140, 145, 160, 255), parent=f"L_warn_{name}")
+    def _draw_placeholder(name, SW, SH, lines):
+        """Centred multi-line placeholder text (a str is treated as one line)."""
+        if isinstance(lines, str):
+            lines = [lines]
+        cy = SH / 2.0 - S(11) * (len(lines) - 1)          # vertically centre the block
+        for i, ln in enumerate(lines):
+            dpg.draw_text((SW / 2.0 - S(4) * len(ln), cy + i * S(22)), ln, size=S(18),
+                          color=(150, 155, 170, 255), parent=f"L_warn_{name}")
 
     def draw_slot(name):
         """Draw the slot's assigned stream letterboxed + centred, with overlays, at the pane's size."""
@@ -609,10 +613,15 @@ def main(argv=None):
         # A disconnected (not-capturing) real cam: don't re-draw its stale, possibly-4K texture every
         # frame -- that per-frame texture sampling is the bulk of the idle GPU. Show a placeholder instead.
         if role in roles and not bool((ctrl['state'] or {}).get('capturing', {}).get(role)):
-            _draw_placeholder(name, SW, SH, f"{role} — disconnected")
+            st = ctrl['state'] or {}
+            src = (st.get('sources') or {}).get(role)
+            camsel = (st.get('camera') or {}).get(role)
+            who = camsel or ('the simulator' if src == 'sky' else (src or 'a camera'))
+            _draw_placeholder(name, SW, SH, [f"{role.capitalize()} Camera", "No Data",
+                                             f"Click to connect to {who}"])
             return
         if cam is None or not dpg.does_item_exist(cam['tex']):
-            _draw_placeholder(name, SW, SH, role)
+            _draw_placeholder(name, SW, SH, [f"{str(role).capitalize()} Camera", "No Data"])
             return
         w, h = cam['w'], cam['h']
         sset = view_settings.setdefault(role, _default_settings())
@@ -756,7 +765,7 @@ def main(argv=None):
         capturing = bool(st_now.get('capturing', {}).get(role))
         recording = bool((st_now.get('recording') or {}).get(role)) and capturing
         status = (f"{role}  f{cam['last_idx']}  {_color_name(cam['color_id'])}  "
-                  f"blobs {len(cam['blobs'])}  zoom {_zoom_label(zoom)}" + ("  REC" if recording else ""))
+                  f"blobs {len(cam['blobs'])}  zoom {round(scale * 100)}%" + ("  REC" if recording else ""))
         dpg.draw_text((S(8), SH - S(20)), status, size=S(13), color=(200, 205, 220, 230), parent=f"L_warn_{name}")
         if role in roles and st_now.get('tracking') and int(time.perf_counter() * 1.5) % 2 == 0:
             msg = "NOT CONNECTED" if not capturing else ("NOT RECORDING" if not recording else None)
@@ -789,6 +798,9 @@ def main(argv=None):
                 action()
                 return
         role = _slot_role(name)
+        if role in roles and not bool((ctrl['state'] or {}).get('capturing', {}).get(role)):
+            _toggle_connect(role)                          # disconnected pane body -> "Click to connect"
+            return
         cam = cams.get(role)
         if cam is None:
             return
