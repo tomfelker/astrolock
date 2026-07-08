@@ -386,6 +386,8 @@ def main(argv=None):
             if role in roi_window_by_role:            # centered readout window (sensor px) -> frame metadata
                 per_role_sky += ['--roi', ','.join(str(v) for v in roi_window_by_role[role])]
             per_role_sky += [sky_follow_flag()]       # follow the current mount (re-evaluated each launch)
+        if sources[role] == 'zwo' and roi_by_role.get(role) and role in roi_window_by_role:
+            per_role_sky += ['--roi', ','.join(str(v) for v in roi_window_by_role[role])]   # crop in hardware
         cam_sel = ['--camera-url', camera_url[role]] if (sources[role] == 'zwo' and camera_url[role]) else []
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
@@ -530,14 +532,14 @@ def main(argv=None):
         having the device open -- the backend owns render/readout geometry, so it publishes these.
         Relaunch-tier (they change frame geometry), presented as choices so one pick = one relaunch.
         Binning is real on both sky (render downscale) and zwo (hardware NxN bin -- a color cam binned
-        >=2 reads out mono); ROI is sky-only for now (the sim render *is* the crop -- zwo hardware ROI
-        is a follow-up)."""
+        >=2 reads out mono); ROI applies to both -- the sim render *is* the crop, and zwo crops in
+        hardware (SetROIFormat, output px snapped to width%8 / height%2 / even start)."""
         src = sources.get(role)
         caps = []
         if src in ('sky', 'zwo', 'synthetic'):
             caps.append({'name': 'bin', 'label': 'Binning', 'kind': 'choice', 'choices': ['1', '2', '3', '4'],
                          'value': str(bin_by_role.get(role, 1)), 'live': False})
-        if src == 'sky':
+        if src in ('sky', 'zwo'):                          # sim crops the render; zwo crops in hardware
             caps.append({'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': _roi_choices(role),
                          'value': _roi_value(role), 'live': False})
         return caps

@@ -153,7 +153,7 @@ _ASI_BAYER_TO_COLOR_ID = {
 
 def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
               auto=False, auto_max_exp_ms=200, auto_max_gain=400, auto_target=100,
-              neutral_wb=True, bin=1, camera_url=None):
+              neutral_wb=True, bin=1, camera_url=None, roi=None):
     """
     Open a ZWO camera for RAW16 full-frame video capture.
     Returns (capture, width, height, color_id, get_settings).
@@ -199,7 +199,20 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         if 'HardwareBin' in ctrls:
             _set(z.ASI_HARDWARE_BIN, 0)        # software bin: required for the cross-color merge
         _set(z.ASI_MONO_BIN, 1)                # merge the Bayer cell -> mono
-    cam.set_roi(bins=bin, image_type=z.ASI_IMG_RAW16)   # full frame, 16-bit raw, NxN binned
+    roi_win = None
+    if roi:
+        try:
+            roi_win = [int(v) for v in str(roi).split(',')]   # backend's native centered window [x0,y0,w,h]
+        except ValueError:
+            roi_win = None
+    if roi_win:
+        _x0, _y0, _w, _h = roi_win
+        out_w = max(8, (_w // bin) // 8 * 8)            # ASI ROI is in output px: width % 8, height % 2,
+        out_h = max(2, (_h // bin) // 2 * 2)            # start even to keep the Bayer phase on color cams
+        cam.set_roi(start_x=(_x0 // bin) & ~1, start_y=(_y0 // bin) & ~1,
+                    width=out_w, height=out_h, bins=bin, image_type=z.ASI_IMG_RAW16)
+    else:
+        cam.set_roi(bins=bin, image_type=z.ASI_IMG_RAW16)   # full frame, 16-bit raw, NxN binned
     width, height, bins, img_type = cam.get_roi_format()
 
     if auto:
@@ -522,7 +535,7 @@ def main(argv=None):
             args.camera_index, args.exposure_us, args.gain, force_mono=args.mono,
             auto=args.auto, auto_max_exp_ms=args.auto_max_exp_ms,
             auto_max_gain=args.auto_max_gain, auto_target=args.auto_target,
-            neutral_wb=not args.camera_wb, bin=args.bin, camera_url=args.camera_url)
+            neutral_wb=not args.camera_wb, bin=args.bin, camera_url=args.camera_url, roi=args.roi)
     elif args.source == 'sky':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta, controls = _open_sky(
             args, state_path=os.path.join(out_dir, session_mod.state_name(ts)),
