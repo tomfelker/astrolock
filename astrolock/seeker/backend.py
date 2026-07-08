@@ -737,7 +737,7 @@ def main(argv=None):
         elif t == 'set_source':
             role = cmd.get('role')
             src = cmd.get('source')
-            if role in roles and src in ('synthetic', 'zwo', 'sky'):
+            if role in roles and src in ('synthetic', 'zwo', 'sky', 'playback'):
                 sources[role] = src
                 # Don't jump the gun: a driver change never auto-connects. Stop any running cam and
                 # wait for an explicit Connect, so the user can pick which camera first -- two roles

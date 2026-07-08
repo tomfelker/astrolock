@@ -874,14 +874,11 @@ def main(argv=None):
         update_control reconciles capture/record to the backend, and the display toggles write
         view_settings."""
         sset = view_settings.setdefault(role, _default_settings())
-        _combo_row("driver", ['zwo', 'sky', 'playback'], f"src_{role}",
-                   lambda _s, a: _send({'type': 'set_source', 'role': role, 'source': a}), parent,
-                   tip="Frame source: 'zwo' = a real camera, 'sky' = the ISS simulator, "
-                       "'playback' = replay a recorded .ser through the pipeline.")
-        _combo_row("camera", ['(auto)'], f"chooser_{role}",
-                   lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)',
-                   group_tag=f"camrow_{role}",
-                   tip="Which physical ZWO camera to use (by model). '(auto)' = the first one. Press Rescan after plugging in.")
+        _combo_row("camera", ['sky', 'playback'], f"src_{role}",
+                   lambda _s, a: _on_source_pick(role, a), parent, default='sky',
+                   tip="Where this pane's frames come from: a detected ZWO camera (by model), "
+                       "'sky' (ISS simulator), or 'playback' (replay a .ser). Press Rescan after "
+                       "plugging a camera in.")
         # Playback source: a .ser to replay + a loop toggle. Whole row shown only when driver == playback.
         with dpg.group(tag=f"pbrow_{role}", parent=parent, show=False):
             with dpg.group(horizontal=True):
@@ -974,6 +971,32 @@ def main(argv=None):
         _send({'type': 'set_camera', 'role': role, 'url': None if url in (None, '', '(auto)') else url})
         _automatch_optics(role, url)
 
+    # Unified source dropdown: one list of "where this pane's frames come from" -- each detected ZWO
+    # camera (by model), 'sky', or 'playback'. Picking a camera sets source=zwo + that camera at once.
+    def _source_items(st):
+        return ['sky', 'playback'] + list((st or {}).get('cameras_available') or [])
+
+    def _source_value(st, role):
+        """The dropdown value that reflects the backend's (source, camera) for this role, or None."""
+        src = ((st or {}).get('sources') or {}).get(role)
+        cam = ((st or {}).get('camera') or {}).get(role)
+        if src == 'sky':
+            return 'sky'
+        if src == 'playback':
+            return 'playback'
+        if src == 'zwo':
+            return cam if (cam and cam != '(auto)') else None
+        return None
+
+    def _on_source_pick(role, val):
+        if val == 'sky':
+            _send({'type': 'set_source', 'role': role, 'source': 'sky'})
+        elif val == 'playback':
+            _send({'type': 'set_source', 'role': role, 'source': 'playback'})
+        else:                                              # a ZWO camera URL -> source zwo + that camera
+            _send({'type': 'set_source', 'role': role, 'source': 'zwo'})
+            _on_camera_pick(role, val)
+
     # Caps-driven camera controls (exposure/gain/...). The cam publishes each control's kind/range/value;
     # we render a "[<<][<] value [>][>>]" stepper per number control (single = small step, double = large;
     # log scale multiplies, linear scale adds) and push changes live. The GUI owns the value once shown
@@ -1053,8 +1076,8 @@ def main(argv=None):
                 'selection': {role: [dpg.get_value(f"opt_{role}_{k}") for k in ('sensor', 'optic', 'reducer')]
                               for role in roles if dpg.does_item_exist(f"opt_{role}_sensor")},
             },
-            'cameras': {role: dpg.get_value(f"chooser_{role}")
-                        for role in roles if dpg.does_item_exist(f"chooser_{role}")},
+            'cameras': {role: dpg.get_value(f"src_{role}")
+                        for role in roles if dpg.does_item_exist(f"src_{role}")},
             'boresight': [boresight_ui['x'], boresight_ui['y']],
         }
 
@@ -1088,10 +1111,11 @@ def main(argv=None):
                     if dpg.does_item_exist(f"own_{role}_{k}"):
                         dpg.set_value(f"own_{role}_{k}", v in owned[k])
             _send_optics(role)                          # push the loaded optics to the backend
-        for role, url in (data.get('cameras') or {}).items():
-            if url and dpg.does_item_exist(f"chooser_{role}"):
-                dpg.set_value(f"chooser_{role}", url if url in (ctrl.get('cam_items') or ['(auto)']) else '(auto)')
-                _on_camera_pick(role, dpg.get_value(f"chooser_{role}"))   # push the loaded camera to the backend
+        for role, val in (data.get('cameras') or {}).items():
+            if val and dpg.does_item_exist(f"src_{role}"):
+                if val in (ctrl.get('src_items') or []):
+                    dpg.set_value(f"src_{role}", val)
+                _on_source_pick(role, val)                  # push the loaded source (+ camera) to the backend
         b = data.get('boresight')
         if b and len(b) >= 2:
             _bore_set(b[0], b[1])                       # updates the widgets + pushes to the backend
@@ -1324,9 +1348,10 @@ def main(argv=None):
         for role in roles:
             if st is None or not dpg.does_item_exist(f"src_{role}"):
                 continue
-            # One-time init of the intent widgets from the backend's actual state.
-            if role not in src_init and src_st.get(role):
-                dpg.set_value(f"src_{role}", src_st[role]); src_init.add(role)
+            # One-time init of the unified source dropdown from the backend's actual (source, camera).
+            uval = _source_value(st, role)
+            if role not in src_init and uval:
+                dpg.set_value(f"src_{role}", uval); src_init.add(role)
             # Auto-record follows the source: switching TO a zwo (real) cam turns it on; first sight of a
             # sim cam leaves it off. Otherwise it's the user's to toggle.
             cur_src = src_st.get(role)
@@ -1340,11 +1365,7 @@ def main(argv=None):
             # the click (in _toggle_connect) starts/stops the cam. Explicit only -- no auto-connect.
             if dpg.does_item_exist(f"conn_{role}"):
                 dpg.configure_item(f"conn_{role}", label="Disconnect" if cap_st.get(role) else "Connect")
-            # The camera chooser only applies to the zwo driver; hide the whole row otherwise (it lists
-            # the attached ZWO cameras, which mean nothing for the sim / synthetic sources).
-            if dpg.does_item_exist(f"camrow_{role}"):
-                dpg.configure_item(f"camrow_{role}", show=(dpg.get_value(f"src_{role}") == 'zwo'))
-            # Playback row: shown only for the playback driver; reflect the current .ser + loop from state.
+            # Playback row: shown only for the playback source; reflect the current .ser + loop from state.
             if dpg.does_item_exist(f"pbrow_{role}"):
                 dpg.configure_item(f"pbrow_{role}", show=(dpg.get_value(f"src_{role}") == 'playback'))
                 pb = ((st or {}).get('playback') or {}).get(role) or {}
@@ -1371,23 +1392,16 @@ def main(argv=None):
                     dpg.set_value(f"own_{role}_{k}", bool(v) and v in owned[k])
             opt_init.add(role)
 
-        # Camera chooser: keep dropdown items in sync with the detected cameras + init selection once.
-        cam_items = ['(auto)'] + ((st or {}).get('cameras_available') or [])
-        if ctrl.get('cam_items') != cam_items:
-            ctrl['cam_items'] = cam_items
+        # Unified source dropdown: keep its items in sync with the detected cameras, preserving the
+        # current selection (the once-only value init happens above via _source_value + src_init).
+        src_items = _source_items(st)
+        if ctrl.get('src_items') != src_items:
+            ctrl['src_items'] = src_items
             for role in roles:
-                if dpg.does_item_exist(f"chooser_{role}"):
-                    sel = dpg.get_value(f"chooser_{role}")
-                    dpg.configure_item(f"chooser_{role}", items=cam_items)
-                    dpg.set_value(f"chooser_{role}", sel if sel in cam_items else '(auto)')
-        cam_sel_st = (st or {}).get('camera') or {}
-        cam_init = ctrl.setdefault('cam_init', set())
-        for role in roles:
-            if role in cam_init or st is None or not dpg.does_item_exist(f"chooser_{role}"):
-                continue
-            val = cam_sel_st.get(role)
-            dpg.set_value(f"chooser_{role}", val if val in cam_items else '(auto)')
-            cam_init.add(role)
+                if dpg.does_item_exist(f"src_{role}"):
+                    sel = dpg.get_value(f"src_{role}")
+                    dpg.configure_item(f"src_{role}", items=src_items)
+                    dpg.set_value(f"src_{role}", sel if sel in src_items else (_source_value(st, role) or 'sky'))
 
         # Mount chooser + connect state (mirrors the camera chooser): keep the dropdown in sync with the
         # detected mounts, init the selection once, and label the button from the backend's connect state.
