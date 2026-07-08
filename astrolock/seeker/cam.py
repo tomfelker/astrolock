@@ -215,15 +215,11 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         cam.set_roi(bins=bin, image_type=z.ASI_IMG_RAW16)   # full frame, 16-bit raw, NxN binned
     width, height, bins, img_type = cam.get_roi_format()
 
-    if auto:
-        _set(z.ASI_EXPOSURE, exposure_us, is_auto=True)
-        _set(z.ASI_GAIN, gain, is_auto=True)
-        _set(z.ASI_AUTO_MAX_EXP, auto_max_exp_ms)       # milliseconds
-        _set(z.ASI_AUTO_MAX_GAIN, auto_max_gain)
-        _set(z.ASI_AUTO_MAX_BRIGHTNESS, auto_target)    # target brightness, 0-255
-    else:
-        _set(z.ASI_EXPOSURE, exposure_us)
-        _set(z.ASI_GAIN, gain)
+    # This application always wants a fixed, user-specified exposure/gain -- never the camera's auto
+    # mode (a moving satellite would fight an auto loop). Set both with auto explicitly OFF, so a camera
+    # that came up in auto (or a stale setting) is forced to manual and uses exactly the values we ask.
+    _set(z.ASI_EXPOSURE, exposure_us, is_auto=False)
+    _set(z.ASI_GAIN, gain, is_auto=False)
 
     # ZWO bakes white balance into the RAW16 mosaic on color cams (R,B get a digital gain;
     # G is the unity reference). WB=50 is unity on the [1,99] range, so neutral WB gives

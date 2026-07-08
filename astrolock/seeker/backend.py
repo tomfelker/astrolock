@@ -241,6 +241,7 @@ def main(argv=None):
     tracker = None
     tracking = False
     coasting = False          # lost a settled lock -> holding the last rate, still re-acquiring
+    drive_mount = True        # False = "Stop Moving": hold the mount but keep the tracker running
     track_role = None
     track_target = None
     track_seen_index = -1
@@ -631,18 +632,24 @@ def main(argv=None):
 
     def apply_command(cmd):
         nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
-        nonlocal track_center, mount_desired_url
+        nonlocal track_center, mount_desired_url, drive_mount
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
             return
         if t == 'set_rate':
             tracking = coasting = False               # manual slew overrides auto-track (and coast)
+            drive_mount = True
             mount.set_rates(math.radians(cmd.get('az', 0.0)), math.radians(cmd.get('alt', 0.0)))
             estop = False
-        elif t == 'stop':
+        elif t == 'stop':                             # legacy: halt mount + tracking (kept for compat)
             tracking = coasting = False
+            drive_mount = True
             mount.set_rates(0.0, 0.0)
+        elif t == 'follow':                           # Follow on/off: drive the mount to hold the lock, or
+            drive_mount = bool(cmd.get('on', True))   # off = "Stop Moving" -- hold the mount, KEEP the lock
+            if not drive_mount:                       # (the tracker keeps estimating; we just stop driving)
+                mount.set_rates(0.0, 0.0)
         elif t == 'estop':
             tracking = coasting = False               # e-stop halts a coast too
             mount.set_rates(0.0, 0.0)
@@ -679,6 +686,7 @@ def main(argv=None):
                     track_seen_index = latest_det_index[role]
                     tracking = True
                     coasting = False
+                    drive_mount = True                        # a fresh lock drives the mount again
                     track_role = role
                     estop = False
                     print(f"[backend] acquired target on {role} at "
@@ -697,8 +705,9 @@ def main(argv=None):
                 tracker.cy = track_center[1] + boresight['y'] / rpp
             print(f"[backend] boresight -> ({boresight['x'] * 1e3:.3f}, {boresight['y'] * 1e3:.3f}) mrad",
                   flush=True)
-        elif t == 'untrack':
+        elif t == 'untrack':                          # "Unlock": drop the lock entirely + halt the mount
             tracking = coasting = False
+            drive_mount = True
             mount.set_rates(0.0, 0.0)
         elif t == 'record':
             on = bool(cmd.get('on', False))
@@ -827,7 +836,8 @@ def main(argv=None):
                                   f"alt {math.degrees(st['rate_alt_rad_s']):+6.2f} deg/s | "
                                   f"off ({tpx[0] - tracker.cx:+5.0f},{tpx[1] - tracker.cy:+5.0f})px | "
                                   f"alt {math.degrees(st['alt_rad']):5.1f} | {track_status}", flush=True)
-                        mount.set_rates(raz, ralt)
+                        if drive_mount:               # "Stop Moving" holds the mount but keeps tracking
+                            mount.set_rates(raz, ralt)
                         # On 'track' and 'coast' the target estimate keeps moving, so keep publishing it
                         # (the ROI follows, so detect keeps searching and can re-acquire during coast).
                         track_target = list(tpx) if track_status in ('track', 'coast') else None
@@ -863,7 +873,8 @@ def main(argv=None):
                 'rate_az_deg_s': round(math.degrees(st['rate_az_rad_s']), 4),
                 'rate_alt_deg_s': round(math.degrees(st['rate_alt_rad_s']), 4),
                 'recording': dict(recording),           # per-role: {role: bool}
-                'tracking': tracking,
+                'tracking': tracking,                   # "locked": the tracker has a target
+                'following': bool(tracking and drive_mount),   # mount is actively slewing to hold the lock
                 'track_role': track_role if tracking else None,
                 'target_px': track_target if tracking else None,
                 # ROI (cx, cy, size px) around the predicted target, for detect to clamp its work to.

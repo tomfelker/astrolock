@@ -1162,9 +1162,13 @@ def main(argv=None):
                     dpg.draw_line((2, _c + _s * _d), (_P - 2, _c + _s * _d), color=(80, 86, 100, 110), parent=pad_bg)
             dpg.draw_line((_c, 2), (_c, _P - 2), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # az=0
             dpg.draw_line((2, _c), (_P - 2, _c), color=(150, 156, 172, 220), thickness=1.5, parent=pad_bg)  # alt=0
-            dpg.add_button(label="Stop", tag="stop_btn", width=S(200),
-                           callback=lambda: _send({'type': 'stop'}))
-            _tip("Immediately stop mount motion and cancel tracking.")
+            dpg.add_button(label="Stop Moving", tag="stop_btn", width=S(200),
+                           callback=lambda: _send({'type': 'follow', 'on': False}))
+            _tip("Halt mount motion now. Keeps the lock -- the tracker keeps following the target in "
+                 "software; only Unlock (Tracking panel) drops the lock.")
+            dpg.add_button(label="Resume Following", tag="resume_btn", width=S(200),
+                           callback=lambda: _send({'type': 'follow', 'on': True}))
+            _tip("Resume slewing the mount to hold the locked target (undo Stop Moving).")
         with dpg.collapsing_header(label="Cameras", default_open=True):
             dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_cameras'}))
             _tip("Re-enumerate attached ZWO cameras (after plugging one in).")
@@ -1214,6 +1218,14 @@ def main(argv=None):
                         else:
                             dpg.add_button(label=lbl, width=S(30), user_data=(dx, dy),
                                            callback=lambda _s, _a, u: _bore_nudge(u[0], u[1]))
+        with dpg.collapsing_header(label="Tracking"):
+            dpg.add_checkbox(label="Follow target", tag="follow_chk",
+                             callback=lambda _s, a: _send({'type': 'follow', 'on': a}))
+            _tip("When locked, slew the mount to keep the target on the boresight. Uncheck to hold the "
+                 "mount but keep the lock (same as Stop Moving); re-check to resume.")
+            dpg.add_button(label="Unlock", tag="unlock_btn", width=S(200),
+                           callback=lambda: _send({'type': 'untrack'}))
+            _tip("Drop the target lock entirely and halt the mount.")
         with dpg.collapsing_header(label="Settings"):
             dpg.add_combo(settings_store.list_settings(), tag='settings_combo', width=-1)
             _tip("A saved settings file captures the layout, display prefs, optics + owned gear, cameras, "
@@ -1363,6 +1375,18 @@ def main(argv=None):
                           f"Az: {st.get('enc_az_deg', 0.0):7.3f}  Alt: {st.get('enc_alt_deg', 0.0):7.3f} deg")
             dpg.set_value('mount_rate_txt',
                           f"    {st.get('rate_az_deg_s', 0.0):+7.3f}       {st.get('rate_alt_deg_s', 0.0):+7.3f} deg/s")
+
+        # Lock/Follow controls: the Follow checkbox mirrors the backend's `following`; Follow/Resume/Unlock
+        # are only meaningful with a lock, so grey them out when unlocked.
+        locked = bool((st or {}).get('tracking'))
+        if dpg.does_item_exist('follow_chk'):
+            want = bool((st or {}).get('following'))
+            if dpg.get_value('follow_chk') != want:
+                dpg.set_value('follow_chk', want)
+            dpg.configure_item('follow_chk', enabled=locked)
+        for _tag in ('resume_btn', 'unlock_btn'):
+            if dpg.does_item_exist(_tag):
+                dpg.configure_item(_tag, enabled=locked)
 
         # Optics panel: live field-of-view per role (from the backend's resolved optics).
         opt_fov = (st or {}).get('optics') or {}
