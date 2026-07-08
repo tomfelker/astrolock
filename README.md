@@ -1,37 +1,97 @@
 # AstroLock
 
-This software will help you aim a telescope, particularly at moving targets like satellites, rockets, or planes, using a gamepad for precise input.  Alignment is computed within Astrolock, so you only need to point at some unidentified objects.  For satellites, AstroLock can download information about their orbits and track them automatically, with you fine-tuning using the joystick.  Or for cases when you can't predict the path in advance, it can track with momentum, so you only need joystick input when the target changes direction.
+![Astrolock UI Example](data/screenshots/ui_example.png)
 
-There's also a utility to help with collimating and focusing, focus.py.
+This software helps you aim a telescope with a motorized mount, particularly at moving targets like satellites, rockets, or planes.
 
-AstroLock is still rough around the edges, and you may need to dive into the Python code to get it working for you.
+The newest, largest part, AstroLock Seeker, is designed to use a guide camera (mounted alongside the telescope) to acquire and track targets, even if the target motion is unknown and the telescope is not aligned.  It has a GUI that lets you do every step of this process, including recording from the main camera.  The goal is to make this as automatic as possible.
+
+There's also an older GUI (Astrolock Classic), which is more focused on aligning the telescope to known stars, and tracking satellites with a known TLE, and allowing the user to fine-tune the tracking using a finderscope and a joystick.  I'm no longer actively developing this, but eventually its alignment features may be subsumed into Seeker.
+
+There's also a utility to help with collimating and focusing, focus.py.  This will also probably be subsumed into Seeker soon.
 
 ## Hardware
 
-All you need is a telescope, a GoTo mount, a computer, and a gamepad.
+Astrolock can currently talk to Celestron NexStar hand controllers that control AltAz mounted telescopes.  (I'm using it with a Celestron CPC1100.)  It should be fairly easy to support EQ mounts, or to expand to other mount protocols - all that's needed is the ability to set the rates that each axis should move at, and to read the current position.
 
-Astrolock can currently talk to Celestron NexStar hand controllers that control AltAz mounted telescopes.  (I'm using it with a CPC1100.)  It should be fairly easy to support EQ mounts, or to expand to other mount protocols - all that's needed is the ability to set the rates that each axis should move at, and to read the current position.
-
-For testing, you can also connect to Stellarium with the Remote Control plugin.
-
-PS4 or PS5 gamepads work, and it should be trivial to add support for other types.
-
-I've been using Windows, but there's no reason it shouldn't work on Linux or Mac.
+For cameras, Astrolock currently supports Zwo ASI cameras.  (Webcam support coming soon.)
 
 ## Installation
 
-There's no fancy packaging yet, so this is somewhat technical, yet straightforward.
-1. get a working Python environment
+Astrolock is a Python project.  These steps get you running in simulation with no hardware; see [Hardware](#hardware) for the extra bits you'll need at the scope.
 
-1. clone this repository
+1. **Clone the repo:**
 
-1. install the requirements, which includes PyTorch (but no need for GPU support, except perhaps for focus.py)
-    * `python -m pip install -r requirements.txt`
+    ```
+    git clone https://github.com/tomfelker/astrolock.git
+    cd astrolock
+    ```
 
-1. From the root of the cloned repository, run `python -m astrolock` 
-    * or, run from Visual Studio Code - you'll probably want to edit some stuff anyway, until the GUI is more complete.
+2. **(Optional but recommended) Create and activate a virtual environment**, so Astrolock's dependencies don't collide with anything else:
 
-## Quick Start
+    ```
+    python -m venv .venv
+    # Windows (PowerShell):
+    .venv\Scripts\Activate.ps1
+    # Linux / macOS:
+    source .venv/bin/activate
+    ```
+
+3. **Install PyTorch.**  This is done separately from the other dependencies, because the right command depends on your OS and whether you have a CUDA GPU.  Grab the command from the [PyTorch install selector](https://pytorch.org/get-started/locally/) — it'll look something like this for Windows with an nVidia GPU:
+
+    ```
+    pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+    ```
+
+    A GPU is strongly recommended, but CPU-only torch will also work (just install the CPU wheel from the selector).
+
+4. **Install the remaining dependencies:**
+
+    ```
+    pip install -r requirements.txt
+    ```
+
+5. **Install camera drivers** (only needed for real hardware — skip this if you're just running in simulation).  The `zwoasi` Python package is just a wrapper; it needs ZWO's native SDK library (`ASICamera2.dll` on Windows, the equivalent `.so`/`.dylib` elsewhere) at runtime.  The easiest way to get it is to install [ASIStudio](https://www.zwoastro.com/software/), which Astrolock finds automatically at its default path.  Otherwise, download the SDK from ZWO and set the `ZWO_ASI_LIB` environment variable to the full path of the library.
+
+### To run
+
+Activate your venv (if you made one - see above), then from the repo root:
+
+```
+python -m astrolock.seeker.backend
+```
+
+This starts Astrolock Seeker in simulation mode — see the [Quick Start](#astrolock-seeker-quick-start) below.
+
+## Astrolock Seeker Quick Start
+
+1. Connect your mount and cameras to the computer via USB.  (Cameras should have as much bandwidth as possible, so ideally don't use a hub and use the fastest ports for them.)
+
+1. Run the software (see above).  It currently starts in simulation mode, connected to a simulated mount and simulated cameras that are showing a simulated ISS pass.  You can experiment with this, or turn it off by clicking Disconnect on the Mount and both Camera settings groups on the left.
+
+1. Make sure the telescope is pointed exactly at the horizon (zero altitude), and then turn it on.  Even though we don't handle alignment, it's important that we know where the gimbal lock is.  If you're using an equatorial mount, point it along the ecliptic plane (zero declination).
+
+1. Under Mount, select your mount from the dropdown and click Connect.  To test it, you can click in the Slew rate indicator, and the mount should move accordingly.
+
+1. Under Cameras/Guide Camera, select the camera you'll be using for guiding the scope.  For tracking satellites, this should be a fairly wide angle setup (enough that you'll have no problem getting the target into this camera's view).  Click Connect.
+
+1. Under Cameras/Main Camera, select the camera you've connected to your telescope.  (This is optional - you might also just observe visually, or handle this camera yourself.  But if you do set one up, Seeker will record for you (and coming soon, track the target using this camera once the target is in its view)).
+
+1. Under Optics, select which lenses you've attached to your cameras, and make sure the sensors were detected correctly.  It's important to get this right, so Seeker knows the FoVs of the cameras and can accurately respond when they're off center.
+
+1. Focus and aim your setup so the guide camera can see some stars.  You may want to uncheck "Auto Record" for your cameras.  Click on one of those stars, and the telescope should slew to it and track it.  Now, under Boresight, adjust it so that the main camera (or your optical view) is also centered on the star.
+
+1. Coming soon - Focus tab.
+
+1. In the Tracking tab, uncheck "Follow Target", to go back into acquisition mode, and make sure the guide camera view is back in the main pane.  (If it's below in the PIP pane, click the `[^]` button.)  You should now see yellow and green boxes around potential targets.
+
+1. Make sure "Auto Record" is checked for your camera.
+
+1. Wait for your satellite pass!  When you see it in the guide camera, click it, and Seeker will automatically start recording and track the target.  As long as "Record" is checked, your .SER files are being saved (in `sessions/<timestamp>/*.ser`).
+
+1. Save your settings in the Settings tab, to make it easier for next time.
+
+## Astrolock Classic Quick Start
 
 1. Connect everything up: Telescope on, telescope connected to hand controller, hand controller connected to PC via USB, and gamepad connected to PC.
 
@@ -69,13 +129,13 @@ There's also `target_with_spatial_offset` mode, which is the same except the off
 
 What if you have the target centered as well as you can with your sights, but you can't see it in the eyepiece or camera?  Press and hold DPad-Right, and the telescope will move in a spiral pattern designed to cover all the nearby sky.  (Currently you need to edit the source code so it knows your field of view - GUI TODO.)  If you caught a glimpse of the target but you lost it, you can reverse the sweep with DPad-Left.  You can then fine-tune with the joysticks as usual.  Once you are centered, press Cross to reset the spiral, so that subsequent spirals will be centered on your current aim point.
 
-### Sideral mode
+### Sidereal mode
 
 In this mode, the scope just moves with the "fixed stars" no matter where you point it.  This is great for aiming at something you see but don't know the name of, or for adding new alignment points.  However, it's only possible to use this mode when you've already aligned the scope, as otherwise AstroLock wouldn't know how fast to rotate.
 
 ### Axis Momentum
 
-In this mode, you accelerate the scope with your joystick inputs, but when you let go, the scope keeps moving.  (Be careful!  No warranty express or implied!  You can stop it by pressing the right trigger or the Start button.)  Since we're just directly controling the motor speeds, you don't need to be aligned, but if you're tracking an object near gimbal lock, you will need to fight with it a bit to speed up and slow down the azimuth rates.  This mode is good for tracking moving targets.
+In this mode, you accelerate the scope with your joystick inputs, but when you let go, the scope keeps moving.  (Be careful!  No warranty express or implied!  You can stop it by pressing the right trigger or the Start button.)  Since we're just directly controlling the motor speeds, you don't need to be aligned, but if you're tracking an object near gimbal lock, you will need to fight with it a bit to speed up and slow down the azimuth rates.  This mode is good for tracking moving targets.
 
 ### Slew
 
@@ -109,7 +169,7 @@ The protocol is really simple, it just sends us JSON data over HTTP.  There are 
 
 ### Alignment
 
-The basic idea here is to enter a bunch of "observations", which are basically you saying "at this known time, the motor encoders had these known values, and the telescope was pointed at some unknown target.  AstroLock then has to do a bunch of math to determine a bunch of parameters which will later allow it to point in specified directions.
+The basic idea here is to enter a bunch of "observations", which are basically you saying "at this known time, the motor encoders had these known values, and the telescope was pointed at some unknown target".  AstroLock then has to do a bunch of math to determine a bunch of parameters which will later allow it to point in specified directions.
 
 The motor encoders do not know their absolute position, only their position relative to where they were when the telescope was turned on.  So the most important parameters are the two encoder_offsets, which let us convert between the raw positions that the motor encoders can give, and the actual altitude and azimuth.  In theory, if the tripod were perfectly level and the observations were perfectly accurate, those offsets could be determined with just one known target (which AstroLock doesn't yet support) or two unknown targets (which AstroLock will happily attempt, but I've never seen it work).
 
@@ -134,11 +194,11 @@ This uses the Skyfield library, JPL ephemerides, and NORAD / Celestrak TLE data 
 
 This uses the OpenSky API to grab ADS-B data and provide targets representing aircraft.
 
-Note that the without an API key, the data is at least 10 seconds old (and there's a limit on how many queries you can do), so although we extrapolate it, it won't work well for planes that are manouvering.  Also, the time resolution is 1 second at best, which is problematic.  This is mostly a proof of concept.  It'd be cool to use an SDR to grab the ADS-B data ourselves with much less latency.
+Note that without an API key, the data is at least 10 seconds old (and there's a limit on how many queries you can do), so although we extrapolate it, it won't work well for planes that are maneuvering.  Also, the time resolution is 1 second at best, which is problematic.  This is mostly a proof of concept.  It'd be cool to use an SDR to grab the ADS-B data ourselves with much less latency.
 
 #### KML
 
-This lets you use Google Earth (or anything that can output KML) to specify targets that are fixed to the Earth's surface.  If there are distant objects you can see at daytime and get accurate coordintes for, this would let you align your telescope during the day.
+This lets you use Google Earth (or anything that can output KML) to specify targets that are fixed to the Earth's surface.  If there are distant objects you can see at daytime and get accurate coordinates for, this would let you align your telescope during the day.
 
 ## Focus
 
