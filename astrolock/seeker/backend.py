@@ -230,9 +230,9 @@ def main(argv=None):
         at each (re)launch so connecting the real mount in the GUI re-points the sky cams -- otherwise a
         run started on the sim keeps following the now-stale sim sidecar and the sky freezes."""
         return '--sky-follow-mount' if isinstance(mount, mount_mod.SimMount) else '--sky-follow-state'
-    playback_args = (['--playback-ser', args.playback_ser, '--playback-speed', str(args.playback_speed)]
-                     + (['--playback-loop'] if args.playback_loop else [])
-                     if args.source == 'playback' and args.playback_ser else [])
+    # Per-role playback source (.ser to replay + loop), so a role can be switched to playback live from
+    # the GUI. Seeded from the launch args; launch_cam builds the per-role --playback-* flags.
+    playback_by_role = {role: {'ser': args.playback_ser, 'loop': bool(args.playback_loop)} for role in roles}
     estop = False
     recording = {role: False for role in roles}   # per-role: each cam records independently
     gui_quit = False        # set when the GUI tells us it's closing (faster than watching it exit)
@@ -390,6 +390,10 @@ def main(argv=None):
         if sources[role] == 'zwo' and roi_by_role.get(role) and role in roi_window_by_role:
             per_role_sky += ['--roi', ','.join(str(v) for v in roi_window_by_role[role])]   # crop in hardware
         cam_sel = ['--camera-url', camera_url[role]] if (sources[role] == 'zwo' and camera_url[role]) else []
+        pb = playback_by_role.get(role) or {}
+        playback_args = (['--playback-ser', pb['ser'], '--playback-speed', str(args.playback_speed)]
+                         + (['--playback-loop'] if pb.get('loop') else [])
+                         if sources[role] == 'playback' and pb.get('ser') else [])
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
             '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
@@ -755,6 +759,17 @@ def main(argv=None):
                 print(f"[backend] {role} camera -> {camera_url[role]}", flush=True)
                 if sources[role] == 'zwo' and is_connected(role):   # live swap only if already connected
                     restart_cam(role, stop_first=True)              # else it's picked up on Connect
+        elif t == 'set_playback':
+            role = cmd.get('role')
+            if role in roles:
+                pb = playback_by_role.setdefault(role, {'ser': None, 'loop': True})
+                if 'ser' in cmd:
+                    pb['ser'] = cmd.get('ser') or None
+                if 'loop' in cmd:
+                    pb['loop'] = bool(cmd.get('loop'))
+                print(f"[backend] {role} playback -> {pb['ser']} loop={pb['loop']}", flush=True)
+                if sources[role] == 'playback' and is_connected(role):
+                    restart_cam(role, stop_first=True)
         elif t == 'rescan_cameras':
             cams_available[:] = cam_mod.zwo_camera_urls()
             print(f"[backend] cameras: {cams_available}", flush=True)
@@ -881,6 +896,8 @@ def main(argv=None):
                 'track_roi': ([round(track_target[0]), round(track_target[1]), args.track_roi_size]
                               if tracking and track_target and args.track_roi_size > 0 else None),
                 'sources': dict(sources),
+                'playback': {r: dict(playback_by_role[r]) for r in roles},   # per-role .ser + loop
+
                 'cameras_available': list(cams_available),   # detected ZWO URLs, for the GUI chooser
                 'mounts_available': list(mounts_available),   # detected mount URLs, for the GUI chooser
                 'mount_url': mount_desired_url,               # selected mount ('sim' or a celestron URL)

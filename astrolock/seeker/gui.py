@@ -857,18 +857,40 @@ def main(argv=None):
         on = bool((ctrl['state'] or {}).get('mount_connected'))
         _send({'type': 'mount_connect', 'on': not on})
 
+    def _pick_playback(role):
+        """Open a .ser file picker for this role's playback source (created lazily, at viewport level)."""
+        tag = f"pbdlg_{role}"
+        if not dpg.does_item_exist(tag):
+            with dpg.file_dialog(tag=tag, show=False, directory_selector=False, modal=True,
+                                 width=S(560), height=S(420), user_data=role,
+                                 callback=lambda _s, app, r=role: _send(
+                                     {'type': 'set_playback', 'role': r, 'ser': app.get('file_path_name')})):
+                dpg.add_file_extension(".ser")
+                dpg.add_file_extension(".*")
+        dpg.show_item(tag)
+
     def render_camera_settings(role, parent):
         """One camera's connection/capture/display settings under `parent`. Widgets are intent;
         update_control reconciles capture/record to the backend, and the display toggles write
         view_settings."""
         sset = view_settings.setdefault(role, _default_settings())
-        _combo_row("driver", ['zwo', 'sky'], f"src_{role}",
+        _combo_row("driver", ['zwo', 'sky', 'playback'], f"src_{role}",
                    lambda _s, a: _send({'type': 'set_source', 'role': role, 'source': a}), parent,
-                   tip="Frame source: 'zwo' = a real camera, 'sky' = the ISS simulator.")
+                   tip="Frame source: 'zwo' = a real camera, 'sky' = the ISS simulator, "
+                       "'playback' = replay a recorded .ser through the pipeline.")
         _combo_row("camera", ['(auto)'], f"chooser_{role}",
                    lambda _s, a: _on_camera_pick(role, a), parent, default='(auto)',
                    group_tag=f"camrow_{role}",
                    tip="Which physical ZWO camera to use (by model). '(auto)' = the first one. Press Rescan after plugging in.")
+        # Playback source: a .ser to replay + a loop toggle. Whole row shown only when driver == playback.
+        with dpg.group(tag=f"pbrow_{role}", parent=parent, show=False):
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="File...", user_data=role, callback=lambda _s, _a, r: _pick_playback(r))
+                _tip("Choose a recorded .ser to replay through the pipeline.")
+                dpg.add_text("(none)", tag=f"pbfile_{role}", color=(150, 155, 170))
+            dpg.add_checkbox(label="Loop", tag=f"pbloop_{role}", default_value=True, user_data=role,
+                             callback=lambda _s, a, r: _send({'type': 'set_playback', 'role': r, 'loop': a}))
+            _tip("Loop the recording instead of stopping at the end.")
         dpg.add_group(tag=f"ctrls_{role}", parent=parent)   # caps-driven controls (exposure/gain/...), filled live
         dpg.add_button(label="Connect", tag=f"conn_{role}", parent=parent, user_data=role,
                        callback=lambda _s, _a, r: _toggle_connect(r))
@@ -1322,6 +1344,14 @@ def main(argv=None):
             # the attached ZWO cameras, which mean nothing for the sim / synthetic sources).
             if dpg.does_item_exist(f"camrow_{role}"):
                 dpg.configure_item(f"camrow_{role}", show=(dpg.get_value(f"src_{role}") == 'zwo'))
+            # Playback row: shown only for the playback driver; reflect the current .ser + loop from state.
+            if dpg.does_item_exist(f"pbrow_{role}"):
+                dpg.configure_item(f"pbrow_{role}", show=(dpg.get_value(f"src_{role}") == 'playback'))
+                pb = ((st or {}).get('playback') or {}).get(role) or {}
+                dpg.set_value(f"pbfile_{role}", os.path.basename(pb['ser']) if pb.get('ser') else "(none)")
+                if role not in ctrl.setdefault('pbloop_init', set()):
+                    dpg.set_value(f"pbloop_{role}", bool(pb.get('loop', True)))
+                    ctrl['pbloop_init'].add(role)
             # Recording = the manual box OR (Auto-record AND tracking), per camera.
             want_rec = bool(dpg.get_value(f"rec_{role}")) or (bool(dpg.get_value(f"autorec_{role}")) and tracking_st)
             if want_rec != bool(rec_st.get(role)) and want_rec != rec_sent.get(role):
