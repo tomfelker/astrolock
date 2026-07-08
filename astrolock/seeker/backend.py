@@ -261,7 +261,9 @@ def main(argv=None):
     render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
     bin_by_role = {}           # role -> physical NxN bin (recorded in frame metadata; scales plate scale)
-    roi_frac_by_role = {role: 1.0 for role in roles}    # role -> centered readout window, fraction of sensor
+    roi_by_role = {role: None for role in roles}        # role -> None (full) or (out_w, out_h) centered readout
+                                                        # window in binned/output px (GUI picks square pow2)
+    full_res_by_role = {}      # role -> (res_x, res_y) native px of the un-cropped sensor (for ROI sizing)
     roi_window_by_role = {}    # role -> [x0, y0, w, h] in native sensor px (provenance -> frame metadata)
     aperture_by_role = {role: 0.0 for role in roles}    # role -> objective aperture mm (sim Airy-disc PSF)
     optics_sel = {role: [None, None, None] for role in roles}   # role -> [sensor, optic, reducer] in effect
@@ -269,7 +271,7 @@ def main(argv=None):
     def _geom(role, s, feff, aperture_mm=0.0):
         aperture_by_role[role] = aperture_mm            # objective aperture -> physically-sized Airy PSF
         """The one place geometry is computed: render size / plate scale / FoV / readout window for a
-        role from its binning (bin_by_role) and ROI fraction (roi_frac_by_role), given DB sensor `s`
+        role from its binning (bin_by_role) and ROI window (roi_by_role), given DB sensor `s`
         at effective focal length `feff`. Startup and every live bin/ROI/optics change call this.
 
         Binning shrinks the rendered frame 1/b per axis at b x the pixel pitch (same FoV), reported as
@@ -277,13 +279,17 @@ def main(argv=None):
         camera. ROI is a *centered crop* of the sensor: same plate scale, fewer pixels, smaller FoV (the
         boresight stays at frame centre, so the tracker needs no offset). Returns the rendered (rx, ry)."""
         b = max(1, bin_by_role.get(role, 1))
-        frac = min(1.0, max(0.05, roi_frac_by_role.get(role, 1.0)))
-        roi_w, roi_h = max(b, round(s.res_x * frac)), max(b, round(s.res_y * frac))   # window, native px
+        roi = roi_by_role.get(role)                       # (out_w, out_h) in binned px, or None = full sensor
+        if roi:
+            rx, ry = max(1, min(int(roi[0]), s.res_x // b)), max(1, min(int(roi[1]), s.res_y // b))
+        else:
+            rx, ry = max(1, s.res_x // b), max(1, s.res_y // b)                        # rendered (binned)
+        roi_w, roi_h = rx * b, ry * b                                                  # centered native window
         x0, y0 = (s.res_x - roi_w) // 2, (s.res_y - roi_h) // 2
-        rx, ry = max(1, roi_w // b), max(1, roi_h // b)                                # rendered (binned)
         rad_per_px_by_role[role] = optics.rad_per_px(s.pixel_um, feff)                 # per native px
         render_by_role[role] = (rx, ry, s.pixel_um * b, feff)
         roi_window_by_role[role] = [x0, y0, roi_w, roi_h]
+        full_res_by_role[role] = (s.res_x, s.res_y)                                    # for ROI-size choices
         pmm = s.pixel_um / 1000.0
         fov_by_role[role] = (math.degrees(2 * math.atan(roi_w * pmm / (2 * feff))),
                              math.degrees(2 * math.atan(roi_h * pmm / (2 * feff))))
@@ -295,6 +301,7 @@ def main(argv=None):
         rad_per_px_by_role[role] = rad_per_px
         render_by_role[role] = (max(1, args.width // b), max(1, args.height // b),
                                 args.sky_pixel_um * b, args.sky_focal_mm)
+        full_res_by_role[role] = (args.width, args.height)     # sim's native res (no DB sensor picked yet)
         sname, oname = getattr(args, f'{role}_sensor', None), getattr(args, f'{role}_optic', None)
         rname = getattr(args, f'{role}_reducer', None)
         try:
@@ -502,6 +509,22 @@ def main(argv=None):
         except (OSError, ValueError):
             pass
 
+    def _roi_choices(role):
+        """ROI options as rendered (binned) heights: 'Full', then powers of two from the largest that
+        fits the sensor's binned height down to 64px. Recomputed live (depends on binning)."""
+        b = max(1, bin_by_role.get(role, 1))
+        binned_h = max(1, full_res_by_role.get(role, (0, 0))[1] // b)
+        sizes, n = [], 64
+        while n <= binned_h:
+            sizes.append(n)
+            n *= 2
+        return ['Full'] + [str(s) for s in reversed(sizes)]
+
+    def _roi_value(role):
+        """Current ROI as one of _roi_choices: 'Full', else the output height in px (square in the GUI)."""
+        roi = roi_by_role.get(role)
+        return 'Full' if not roi else str(int(roi[1]))
+
     def geometry_caps(role):
         """Backend-owned geometry controls (binning, ROI). Unlike exposure/gain -- which the cam owns,
         having the device open -- the backend owns render/readout geometry, so it publishes these.
@@ -515,8 +538,8 @@ def main(argv=None):
             caps.append({'name': 'bin', 'label': 'Binning', 'kind': 'choice', 'choices': ['1', '2', '3', '4'],
                          'value': str(bin_by_role.get(role, 1)), 'live': False})
         if src == 'sky':
-            caps.append({'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': ['100%', '75%', '50%', '25%'],
-                         'value': f"{round(roi_frac_by_role.get(role, 1.0) * 100)}%", 'live': False})
+            caps.append({'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': _roi_choices(role),
+                         'value': _roi_value(role), 'live': False})
         return caps
 
     def published_caps(role):
@@ -748,11 +771,15 @@ def main(argv=None):
                     restart_cam(role, stop_first=True)
                 print(f"[backend] {role} bin = {bin_by_role[role]}", flush=True)
             elif role in roles and name == 'roi':
-                roi_frac_by_role[role] = min(1.0, max(0.05, float(str(value).rstrip('%')) / 100.0))
+                if str(value).lower() == 'full':
+                    roi_by_role[role] = None
+                else:
+                    n = max(64, int(float(str(value))))     # GUI picks a square; the model allows any (w, h)
+                    roi_by_role[role] = (n, n)
                 recompute_render(role)
                 if is_connected(role):
                     restart_cam(role, stop_first=True)
-                print(f"[backend] {role} roi = {round(roi_frac_by_role[role] * 100)}%", flush=True)
+                print(f"[backend] {role} roi = {_roi_value(role)}", flush=True)
             elif role in roles and name is not None:
                 cam_control_vals[role][name] = value
                 live = next((c.get('live', True) for c in (cam_caps.get(role) or {}).get('controls', [])
