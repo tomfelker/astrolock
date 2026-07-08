@@ -1169,6 +1169,9 @@ def main(argv=None):
             dpg.add_button(label="Resume Following", tag="resume_btn", width=S(200),
                            callback=lambda: _send({'type': 'follow', 'on': True}))
             _tip("Resume slewing the mount to hold the locked target (undo Stop Moving).")
+        with dpg.collapsing_header(label="Simulation"):     # (planned) time/location for sim + target overlays
+            dpg.add_text("planned: set the sim's time & location; target overlays",
+                         color=(120, 125, 140), wrap=S(230))
         with dpg.collapsing_header(label="Cameras", default_open=True):
             dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_cameras'}))
             _tip("Re-enumerate attached ZWO cameras (after plugging one in).")
@@ -1218,6 +1221,8 @@ def main(argv=None):
                         else:
                             dpg.add_button(label=lbl, width=S(30), user_data=(dx, dy),
                                            callback=lambda _s, _a, u: _bore_nudge(u[0], u[1]))
+        with dpg.collapsing_header(label="Focus"):          # (planned) focus assist
+            dpg.add_text("planned: focus assist", color=(120, 125, 140), wrap=S(230))
         with dpg.collapsing_header(label="Tracking"):
             dpg.add_checkbox(label="Follow target", tag="follow_chk",
                              callback=lambda _s, a: _send({'type': 'follow', 'on': a}))
