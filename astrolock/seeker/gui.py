@@ -1175,9 +1175,9 @@ def main(argv=None):
             mono_font = dpg.add_font(_mono_path, 13)       # base size -- set_global_font_scale handles DPI
 
     with dpg.window(tag="win_panel", no_title_bar=True, no_move=True, no_resize=True, no_collapse=True):
-        with dpg.collapsing_header(label="Status", default_open=True):
+        with dpg.tree_node(label="Status", default_open=True):
             dpg.add_text("", tag="perf_txt", color=_READOUT)   # GUI/cam/mount/tracker rates + spinner
-        with dpg.collapsing_header(label="Mount", default_open=True):
+        with dpg.tree_node(label="Mount", default_open=True):
             with dpg.group(horizontal=True):
                 _mlbl = dpg.add_text("Mount:")
                 _tip("Which mount to drive: 'sim', or a detected Celestron on a COM port. Rescan after "
@@ -1215,17 +1215,17 @@ def main(argv=None):
             dpg.add_button(label="Resume Following", tag="resume_btn", width=S(200),
                            callback=lambda: _send({'type': 'follow', 'on': True}))
             _tip("Resume slewing the mount to hold the locked target (undo Stop Moving).")
-        with dpg.collapsing_header(label="Simulation"):     # (planned) time/location for sim + target overlays
+        with dpg.tree_node(label="Simulation"):     # (planned) time/location for sim + target overlays
             dpg.add_text("planned: set the sim's time & location; target overlays",
                          color=(120, 125, 140), wrap=S(230))
-        with dpg.collapsing_header(label="Cameras", default_open=True):
+        with dpg.tree_node(label="Cameras", default_open=True):
             dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_cameras'}))
             _tip("Re-enumerate attached ZWO cameras (after plugging one in).")
             for role in roles:
-                with dpg.collapsing_header(label=role.capitalize(), default_open=True) as hdr:
+                with dpg.tree_node(label=role.capitalize(), default_open=True) as hdr:
                     pass
                 render_camera_settings(role, hdr)
-        with dpg.collapsing_header(label="Optics"):
+        with dpg.tree_node(label="Optics"):
             for role in roles:
                 dpg.add_separator()
                 with dpg.group(horizontal=True):
@@ -1242,7 +1242,7 @@ def main(argv=None):
                             dpg.add_checkbox(tag=f"own_{role}_{kind}", user_data=(role, kind),
                                              callback=lambda _s, _a, u: _toggle_owned(u[0], u[1]))
                             _tip("I own this — pin it to the top of the list (in every dropdown).")
-        with dpg.collapsing_header(label="Boresight"):
+        with dpg.tree_node(label="Boresight"):
             with dpg.group(horizontal=True):
                 dpg.add_text("X:")
                 dpg.add_input_text(tag='bore_x', width=S(56), on_enter=True, default_value="0",
@@ -1267,9 +1267,9 @@ def main(argv=None):
                         else:
                             dpg.add_button(label=lbl, width=S(30), user_data=(dx, dy),
                                            callback=lambda _s, _a, u: _bore_nudge(u[0], u[1]))
-        with dpg.collapsing_header(label="Focus"):          # (planned) focus assist
+        with dpg.tree_node(label="Focus"):          # (planned) focus assist
             dpg.add_text("planned: focus assist", color=(120, 125, 140), wrap=S(230))
-        with dpg.collapsing_header(label="Tracking"):
+        with dpg.tree_node(label="Tracking"):
             dpg.add_checkbox(label="Follow target", tag="follow_chk",
                              callback=lambda _s, a: _send({'type': 'follow', 'on': a}))
             _tip("When locked, slew the mount to keep the target on the boresight. Uncheck to hold the "
@@ -1277,7 +1277,7 @@ def main(argv=None):
             dpg.add_button(label="Unlock", tag="unlock_btn", width=S(200),
                            callback=lambda: _send({'type': 'untrack'}))
             _tip("Drop the target lock entirely and halt the mount.")
-        with dpg.collapsing_header(label="Settings"):
+        with dpg.tree_node(label="Settings"):
             dpg.add_combo(settings_store.list_settings(), tag='settings_combo', width=-1)
             _tip("A saved settings file captures the layout, display prefs, optics + owned gear, cameras, "
                  "and boresight.")
