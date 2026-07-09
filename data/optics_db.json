@@ -50,7 +50,8 @@
   ],
   "optics": [
     {"name": "8mm CS f/1.4", "focal_length_mm": 8, "aperture_mm": 5.7, "source": "typical cheap 1/1.8\" 8mm f/1.4 CS-mount lens (Seeker guide); FoV set by focal length, not aperture"},
-    {"name": "Celestron CPC 1100", "focal_length_mm": 2800, "aperture_mm": 279.4, "source": "Celestron CPC 1100 GPS -- fork-mounted 11\" Schmidt-Cassegrain, 2800 mm f/10"},
+    {"name": "Celestron CPC 1100", "focal_length_mm": 2800, "aperture_mm": 279.4, "obstruction_mm": 95.0, "source": "Celestron CPC 1100 GPS -- fork-mounted 11\" Schmidt-Cassegrain, 2800 mm f/10; secondary ~95mm (0.34 by diameter, ~0.116 by area)"},
+    {"name": "8\" f/6 Newtonian", "focal_length_mm": 1200, "aperture_mm": 203, "obstruction_mm": 47, "spider_vanes": 4, "vane_width_mm": 1.0, "source": "typical 8\" (203mm) f/5.9 Newtonian reflector, 1200mm FL (e.g. Sky-Watcher 200P / Orion XT8 class); ~47mm secondary minor axis (~0.23 by diameter), 4-vane spider ~1mm -> the classic 4-point diffraction spikes"},
     {"name": "Canon EF-S 18-55mm f/3.5-5.6 IS II @ 18mm", "focal_length_mm": 18, "aperture_mm": 5.1, "source": "Canon T4i kit zoom, wide end (18 mm, f/3.5)"},
     {"name": "Canon EF-S 18-55mm f/3.5-5.6 IS II @ 55mm", "focal_length_mm": 55, "aperture_mm": 9.8, "source": "Canon T4i kit zoom, tele end (55 mm, f/5.6)"},
     {"name": "Canon 50mm f/1.8 (nifty fifty)", "focal_length_mm": 50, "aperture_mm": 27.8, "source": "Canon EF/RF 50mm f/1.8 STM 'nifty fifty' prime"},

@@ -155,6 +155,10 @@ def main(argv=None):
     p.add_argument('--pixel-um', type=float, default=0.0,
                    help="frame pixel pitch (um) at the cam's output binning; scaled to the work image internally")
     p.add_argument('--wavelength-nm', type=float, default=550.0, help="wavelength (nm) for the ideal Airy PSF")
+    p.add_argument('--obstruction', type=float, default=0.0,
+                   help="central obstruction (secondary/aperture diameter ratio) for the ideal PSF (0 = clear)")
+    p.add_argument('--vanes', type=int, default=0, help="spider-vane count for the ideal PSF (Newtonian)")
+    p.add_argument('--vane-width', type=float, default=0.0, help="spider-vane width / aperture diameter")
     p.add_argument('--poll', type=float, default=0.02, help="seconds between polls when caught up (live)")
     p.add_argument('--stop-file', default=None, help="stop cleanly when this file appears")
     p.add_argument('--device', default='auto',
@@ -216,7 +220,8 @@ def main(argv=None):
             if args.aperture_mm > 0 and args.focal_mm > 0 and args.pixel_um > 0:
                 r_null = skysim.airy_r_null_px(args.focal_mm, args.aperture_mm, args.wavelength_nm,
                                                args.pixel_um * coord_scale)
-                ideal = skysim.airy_psf(ema.crop, r_null, device=device)
+                ideal = skysim.aperture_psf(ema.crop, r_null, obstruction=args.obstruction,
+                                            vanes=args.vanes, vane_width_frac=args.vane_width, device=device)
             else:
                 ideal = torch.zeros((ema.crop, ema.crop), device=device)   # perfect point source
                 ideal[ema.crop // 2, ema.crop // 2] = 1.0

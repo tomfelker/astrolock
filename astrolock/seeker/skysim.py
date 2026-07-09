@@ -44,6 +44,9 @@ class SkySimConfig:
                                               # px. None = auto: 0 when the aperture is known (trust the
                                               # physical diffraction PSF), else 1.3 (the Gaussian IS the PSF).
     aperture_mm: float = 0.0                  # objective aperture; >0 -> physically-sized Airy-disc PSF
+    central_obstruction: float = 0.0          # secondary/aperture LINEAR (diameter) ratio; >0 -> obstructed
+    spider_vanes: int = 0                     # Newtonian secondary-support struts (0 = none); adds spikes
+    vane_width_frac: float = 0.0              # spider-vane width / aperture diameter
     psf_wavelength_nm: float = 550.0          # wavelength for the Airy disc (green mid-band)
     seeing_r0_m: float = 0.0                  # atmospheric Fried parameter r0 (m); >0 adds a seeing blur
                                               # (FWHM ~ 0.98*lambda/r0). Typical: 0.05 poor .. 0.2 excellent
@@ -123,12 +126,72 @@ def airy_r_null_px(focal_length_mm, aperture_mm, wavelength_nm, pixel_pitch_um):
 
 def airy_psf(size, r_null_px, device='cpu'):
     """A centred (size, size) diffraction-limited Airy PSF (first null at r_null_px px), normalized to
-    sum 1 -- the ideal point-spread a perfect lens gives, for a Strehl-ratio reference. (Clear aperture;
-    a central obstruction would make this an annular-aperture pattern -- a later change.)"""
+    sum 1 -- the ideal point-spread of a CLEAR circular aperture. For an obstructed / vaned aperture use
+    aperture_psf, which builds the PSF numerically from the pupil."""
     ax = torch.arange(size, dtype=torch.float32, device=device) - (size - 1) / 2.0
     yy, xx = torch.meshgrid(ax, ax, indexing='ij')
     inten = _airy_intensity(xx, yy, r_null_px)
     return inten / inten.sum()
+
+
+def pupil_mask(grid, diam_samples, obstruction=0.0, vanes=0, vane_width_samples=0.0, device='cpu'):
+    """A (grid, grid) aperture mask centred on the grid: a disc of diameter `diam_samples`, minus a
+    central obstruction (secondary of diameter = obstruction * aperture diameter) and `vanes` spider
+    struts (rays from the centre to the rim, `vane_width_samples` wide). 1 = light passes, 0 = blocked."""
+    ax = torch.arange(grid, dtype=torch.float32, device=device) - (grid - 1) / 2.0
+    yy, xx = torch.meshgrid(ax, ax, indexing='ij')
+    rr = torch.sqrt(xx * xx + yy * yy)
+    R = diam_samples / 2.0
+    mask = (rr <= R).float()
+    if obstruction > 0:
+        mask = mask * (rr >= obstruction * R).float()          # central obstruction (diameter fraction)
+    if vanes > 0 and vane_width_samples > 0:
+        for k in range(vanes):                                 # struts every 360/vanes deg (a 4-vane "+" etc.)
+            th = 2.0 * math.pi * k / vanes
+            ux, uy = math.cos(th), math.sin(th)
+            along = xx * ux + yy * uy                           # distance along the strut from the centre
+            perp = torch.abs(-xx * uy + yy * ux)                # perpendicular distance to the strut line
+            strut = (along >= 0) & (along <= R) & (perp <= vane_width_samples / 2.0)
+            mask = mask * (~strut).float()
+    return mask
+
+
+def _aperture_psf_full(grid, r_null_px, obstruction, vanes, vane_width_frac, device):
+    """Full (grid, grid) diffraction PSF (sum 1) for the pupil, sampled at camera-pixel scale: PSF =
+    |FFT(pupil)|^2. The aperture spans `d` samples so its Airy null lands at r_null_px camera px."""
+    d = 1.2196699 * grid / r_null_px                           # aperture diameter in grid samples
+    mask = pupil_mask(grid, d, obstruction, vanes, vane_width_frac * d, device)
+    amp = torch.fft.fftshift(torch.fft.fft2(mask))             # |.|^2 is shift-invariant, so centre the PSF
+    psf = amp.real ** 2 + amp.imag ** 2
+    return psf / psf.sum()
+
+
+def aperture_psf(size, r_null_px, obstruction=0.0, vanes=0, vane_width_frac=0.0, grid=256, device='cpu'):
+    """A centred (size, size) diffraction PSF (sum 1) for a possibly obstructed / vaned circular aperture,
+    at camera-pixel scale (Airy null at r_null_px). Falls back to the exact analytic clear-aperture Airy
+    when there's no obstruction/vanes, and when the aperture would overrun the FFT grid (r_null_px below
+    ~1.5 px -- badly undersampled, where the PSF is sub-pixel and the obstruction is moot anyway)."""
+    if (obstruction <= 0 and vanes <= 0) or 1.2196699 * grid / r_null_px >= grid - 2:
+        return airy_psf(size, r_null_px, device=device)
+    psf = _aperture_psf_full(grid, r_null_px, obstruction, vanes, vane_width_frac, device)
+    lo = (grid - size) // 2
+    crop = psf[lo:lo + size, lo:lo + size]
+    return crop / crop.sum()
+
+
+def _kernel_to_otf(psf, sz):
+    """rfft2 of a small centred square PSF `psf` embedded wrap-centred into an sz=(H,W) frame -- so it
+    convolves with no shift and no square-kernel boundary, matching how _airy_otf builds full-frame."""
+    H, W = sz
+    N = psf.shape[0]
+    k = torch.fft.ifftshift(psf)                               # peak -> (0,0), wrapping within N x N
+    full = torch.zeros(H, W, dtype=psf.dtype, device=psf.device)
+    a, b = (N + 1) // 2, N // 2                                # the [0:a] / [a:N] blocks -> the frame corners
+    full[:a, :a] = k[:a, :a]
+    full[:a, W - b:] = k[:a, a:]
+    full[H - b:, :a] = k[a:, :a]
+    full[H - b:, W - b:] = k[a:, a:]
+    return torch.fft.rfft2(full)
 
 
 class SkySim:
@@ -211,6 +274,18 @@ class SkySim:
         inten = _airy_intensity(xx, yy, r_null_px)
         return torch.fft.rfft2((inten / inten.sum()))
 
+    def _aperture_otf(self, sz, r_null_px, grid=256):
+        """OTF for an obstructed / vaned pupil: build the diffraction PSF numerically (|FFT(pupil)|^2) on
+        a square grid at camera-pixel scale, then embed it wrap-centred into the frame and rfft2 (matching
+        _airy_otf). Falls back to the analytic clear Airy if the aperture would overrun the grid."""
+        c = self.cfg
+        grid = min(grid, sz[0], sz[1])                             # the embed needs grid <= min(H, W)
+        if grid < 8 or 1.2196699 * grid / r_null_px >= grid - 2:   # undersampled: PSF is sub-pixel -> Airy
+            return self._airy_otf(sz, r_null_px)
+        psf = _aperture_psf_full(grid, r_null_px, c.central_obstruction, c.spider_vanes,
+                                 c.vane_width_frac, self.device)
+        return _kernel_to_otf(psf, sz)
+
     def _gauss_otf(self, sz, sigma):
         """rfft2 of a full-frame centred Gaussian of stddev `sigma` px."""
         yy, xx = self._centred_offsets(sz)
@@ -239,9 +314,12 @@ class SkySim:
         if sigma is None:                              # auto: pure diffraction when optics are known
             sigma = 0.0 if c.aperture_mm > 0 else 1.3
         sigma = math.hypot(sigma, self._seeing_sigma_px())
-        if c.aperture_mm > 0:                          # physically-sized Airy disc, optionally blurred
+        if c.aperture_mm > 0:                          # physically-sized diffraction PSF, optionally blurred
             r_null_px = airy_r_null_px(c.focal_length_mm, c.aperture_mm, c.psf_wavelength_nm, c.pixel_pitch_um)
-            otf = self._airy_otf(sz, r_null_px)
+            if c.central_obstruction > 0 or c.spider_vanes > 0:
+                otf = self._aperture_otf(sz, r_null_px)  # obstructed / vaned pupil (numeric FFT)
+            else:
+                otf = self._airy_otf(sz, r_null_px)      # clear aperture (exact analytic Airy)
             if sigma > 0:
                 otf = otf * self._gauss_otf(sz, sigma)  # convolution = product in the frequency domain
         else:                                          # unknown optics: the Gaussian IS the PSF

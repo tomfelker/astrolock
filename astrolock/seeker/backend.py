@@ -315,10 +315,16 @@ def main(argv=None):
     full_res_by_role = {}      # role -> (res_x, res_y) native px of the un-cropped sensor (for ROI sizing)
     roi_window_by_role = {}    # role -> [x0, y0, w, h] in native sensor px (provenance -> frame metadata)
     aperture_by_role = {role: 0.0 for role in roles}    # role -> objective aperture mm (sim Airy-disc PSF)
+    obstruction_by_role = {role: 0.0 for role in roles} # role -> central-obstruction diameter ratio (obstructed PSF)
+    vanes_by_role = {role: 0 for role in roles}         # role -> spider-vane count (Newtonian diffraction spikes)
+    vane_width_by_role = {role: 0.0 for role in roles}  # role -> vane width / aperture diameter
     optics_sel = {role: [None, None, None] for role in roles}   # role -> [sensor, optic, reducer] in effect
 
-    def _geom(role, s, feff, aperture_mm=0.0):
-        aperture_by_role[role] = aperture_mm            # objective aperture -> physically-sized Airy PSF
+    def _geom(role, s, feff, aperture_mm=0.0, obstruction=0.0, vanes=0, vane_width_frac=0.0):
+        aperture_by_role[role] = aperture_mm            # objective aperture -> physically-sized diffraction PSF
+        obstruction_by_role[role] = obstruction         # + central obstruction / spider -> obstructed/vaned PSF
+        vanes_by_role[role] = vanes
+        vane_width_by_role[role] = vane_width_frac
         """The one place geometry is computed: render size / plate scale / FoV / readout window for a
         role from its binning (bin_by_role) and ROI window (roi_by_role), given DB sensor `s`
         at effective focal length `feff`. Startup and every live bin/ROI/optics change call this.
@@ -359,7 +365,7 @@ def main(argv=None):
                 mult = _reducers[rname] if rname else 1.0
                 feff = o.focal_length_mm * mult
                 optics_sel[role] = [sname, oname, rname]
-                rx, ry = _geom(role, s, feff, o.aperture_mm)
+                rx, ry = _geom(role, s, feff, o.aperture_mm, o.obstruction_frac, o.spider_vanes, o.vane_width_frac)
                 fx, fy = fov_by_role[role]
                 extra = f" (bin {b}x{b})" if b > 1 else ""
                 print(f"[backend] {role}: {sname} + {oname}{f' x{mult}' if mult != 1.0 else ''} -> "
@@ -390,7 +396,8 @@ def main(argv=None):
             return False
         o = _optics[oname]
         mult = _reducers.get(rname, 1.0) if rname else 1.0
-        _geom(role, _sensors[sname], o.focal_length_mm * mult, o.aperture_mm)
+        _geom(role, _sensors[sname], o.focal_length_mm * mult, o.aperture_mm,
+              o.obstruction_frac, o.spider_vanes, o.vane_width_frac)
         return True
 
     def recompute_render(role):
@@ -401,7 +408,8 @@ def main(argv=None):
             render_by_role[role] = (max(1, args.width // b), max(1, args.height // b),
                                     args.sky_pixel_um * b, args.sky_focal_mm)
             roi_window_by_role.pop(role, None)
-            aperture_by_role[role] = 0.0
+            aperture_by_role[role] = obstruction_by_role[role] = vane_width_by_role[role] = 0.0
+            vanes_by_role[role] = 0
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
     # Per-role sim residual-blur sigma (px): lens softness/defocus atop the physical Airy PSF -- a
@@ -430,6 +438,9 @@ def main(argv=None):
         if sources[role] == 'sky':
             per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum),
                             '--sky-aperture-mm', str(aperture_by_role.get(role, 0.0)),
+                            '--sky-central-obstruction', str(obstruction_by_role.get(role, 0.0)),
+                            '--sky-spider-vanes', str(vanes_by_role.get(role, 0)),
+                            '--sky-vane-width-frac', str(vane_width_by_role.get(role, 0.0)),
                             '--sky-psf-wavelength-nm', str(args.sky_psf_wavelength_nm),
                             '--sky-seeing-r0-m', str(args.sky_seeing_r0_m)]
             if psf_sigma_by_role.get(role) is not None:   # else the cam auto-picks (0 if aperture known, else 1.3)
@@ -505,10 +516,13 @@ def main(argv=None):
                              '--stop-file', focus_stop, '--device', args.device,
                              '--crop', str(args.focus_crop), '--search', str(args.focus_search),
                              '--alpha', str(args.focus_alpha),
-                             # Optics for the Strehl reference (aperture 0 = unknown -> no Strehl emitted).
+                             # Optics for the Strehl reference (aperture 0 = unknown -> delta ideal).
                              '--aperture-mm', str(aperture_by_role.get(role, 0.0)),
                              '--focal-mm', str(fmm), '--pixel-um', str(pum),
-                             '--wavelength-nm', str(args.sky_psf_wavelength_nm)])
+                             '--wavelength-nm', str(args.sky_psf_wavelength_nm),
+                             '--obstruction', str(obstruction_by_role.get(role, 0.0)),
+                             '--vanes', str(vanes_by_role.get(role, 0)),
+                             '--vane-width', str(vane_width_by_role.get(role, 0.0))])
         focus_role = role
         print(f"[backend] focus started on {role}", flush=True)
 

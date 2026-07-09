@@ -309,6 +309,8 @@ def _open_sky(args, state_path=None, mount_path=None):
     cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
                        aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm,
+                       central_obstruction=args.sky_central_obstruction, spider_vanes=args.sky_spider_vanes,
+                       vane_width_frac=args.sky_vane_width_frac,
                        psf_sigma_px=args.sky_psf_sigma_px, seeing_r0_m=args.sky_seeing_r0_m)
     device = resolve_device(getattr(args, 'device', 'auto'))
     sim = SkySim(cfg, device=device)                   # render-only; propagation lives in sky_sim.py
@@ -474,6 +476,13 @@ def main(argv=None):
     p.add_argument('--sky-pixel-um', type=float, default=2.0, help="sky: sensor pixel pitch (um)")
     p.add_argument('--sky-aperture-mm', type=float, default=0.0,
                    help="sky: objective aperture (mm); >0 renders a physically-sized Airy-disc PSF")
+    p.add_argument('--sky-central-obstruction', type=float, default=0.0,
+                   help="sky: central obstruction as a LINEAR (diameter) ratio secondary/aperture; "
+                        ">0 renders the obstructed (annular) diffraction PSF instead of a clear Airy")
+    p.add_argument('--sky-spider-vanes', type=int, default=0,
+                   help="sky: number of spider vanes (Newtonian secondary support); adds diffraction spikes")
+    p.add_argument('--sky-vane-width-frac', type=float, default=0.0,
+                   help="sky: spider-vane width as a fraction of the aperture diameter")
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky: wavelength for the Airy disc (nm)")
     p.add_argument('--sky-psf-sigma-px', type=float, default=None,

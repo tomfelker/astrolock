@@ -62,6 +62,20 @@ class Optic:
     name: str
     focal_length_mm: float
     aperture_mm: float
+    obstruction_mm: float = 0.0     # central-obstruction (secondary) diameter, mm; 0 = clear aperture (a lens)
+    spider_vanes: int = 0           # Newtonian secondary-support struts (0 = none, e.g. an SCT/refractor)
+    vane_width_mm: float = 0.0      # spider-vane width, mm
+
+    @property
+    def obstruction_frac(self):
+        """Central obstruction as a LINEAR (diameter) ratio secondary/aperture -- the epsilon the pupil
+        mask / annular-aperture diffraction wants. 0 for a clear aperture."""
+        return (self.obstruction_mm / self.aperture_mm) if self.aperture_mm > 0 else 0.0
+
+    @property
+    def vane_width_frac(self):
+        """Spider-vane width as a fraction of the aperture diameter."""
+        return (self.vane_width_mm / self.aperture_mm) if self.aperture_mm > 0 else 0.0
 
 
 def load_db(path=None):
@@ -71,7 +85,9 @@ def load_db(path=None):
     sensors = {s['name']: Sensor(s['name'], s['res_x'], s['res_y'], s['pixel_um'],
                                  s.get('bayer'), bool(s.get('mono')))
                for s in raw['sensors']}
-    optics = {o['name']: Optic(o['name'], o['focal_length_mm'], o['aperture_mm'])
+    optics = {o['name']: Optic(o['name'], o['focal_length_mm'], o['aperture_mm'],
+                               o.get('obstruction_mm', 0.0), int(o.get('spider_vanes', 0)),
+                               o.get('vane_width_mm', 0.0))
               for o in raw['optics']}
     reducers = {r['name']: float(r['multiplier']) for r in raw['reducers']}
     return sensors, optics, reducers
