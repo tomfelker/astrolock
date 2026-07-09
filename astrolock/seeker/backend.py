@@ -499,11 +499,16 @@ def main(argv=None):
     def launch_focus(role):
         nonlocal focus_proc, focus_role
         stop_focus()                               # only one focus at a time
+        _rx, _ry, pum, fmm = render_by_role[role]  # frame pixel pitch + focal -> the ideal PSF for Strehl
         focus_proc = _spawn('astrolock.seeker.focus',
                             ['--session', session_dir, '--role', role, '--follow',
                              '--stop-file', focus_stop, '--device', args.device,
                              '--crop', str(args.focus_crop), '--search', str(args.focus_search),
-                             '--alpha', str(args.focus_alpha)])
+                             '--alpha', str(args.focus_alpha),
+                             # Optics for the Strehl reference (aperture 0 = unknown -> no Strehl emitted).
+                             '--aperture-mm', str(aperture_by_role.get(role, 0.0)),
+                             '--focal-mm', str(fmm), '--pixel-um', str(pum),
+                             '--wavelength-nm', str(args.sky_psf_wavelength_nm)])
         focus_role = role
         print(f"[backend] focus started on {role}", flush=True)
 
@@ -903,6 +908,8 @@ def main(argv=None):
                 print(f"[backend] {role} optics -> {optics_sel[role]} ({'ok' if ok else 'fallback'})", flush=True)
                 if ok and sources[role] == 'sky' and is_connected(role):   # sim FoV changed -> relaunch live
                     restart_cam(role, stop_first=True)
+                if focus_proc is not None and focus_proc.poll() is None and role == focus_role:
+                    launch_focus(role)                 # new optics -> rebuild the Strehl reference PSF
         elif t == 'set_camera':
             role = cmd.get('role')
             if role in roles:

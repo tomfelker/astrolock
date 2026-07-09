@@ -341,7 +341,7 @@ def main(argv=None):
     # rolling metric series tailed from <role>_focus.frames.jsonl for the graphs.
     focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'path': None, 'tailer': None,
                 't0': None, 'com_mult': 10.0,             # collimation-trail exaggeration on the star view
-                'series': {k: [] for k in ('t', 'peak', 'dx', 'dy')}}   # peak -> pane graph; dx/dy -> star trail
+                'series': {k: [] for k in ('t', 'peak', 'strehl', 'dx', 'dy')}}   # graph peak/strehl; star trail dx/dy
     FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
     dpg.create_context()
@@ -832,21 +832,25 @@ def main(argv=None):
         # bright (new). A collimated star's trail clusters on the centre tick; a miscollimated one drifts.
         if role.endswith('_focus') and role == focus_ui['role'] + '_focus':
             sc = focus_ui['series']
-            pk = sc['peak']
-            if len(pk) >= 2:
+            # Prefer Strehl (0..1, 1 = diffraction-limited) when the aperture is known; else the raw peak.
+            strehls = sc['strehl']
+            use_str = bool(strehls) and strehls[-1] is not None
+            series = [v if v is not None else 0.0 for v in strehls] if use_str else sc['peak']
+            if len(series) >= 2:
                 GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
                 gx1, gy1 = SW - mgn, SH - mgn
                 gx0, gy0 = gx1 - GW, gy1 - GH
+                hi = 1.0 if use_str else (max(sc['peak']) or 1.0)     # Strehl 0..1; raw peak auto-scales
+                label = f"Strehl {strehls[-1]:.2f}" if use_str else f"focus peak {sc['peak'][-1]:.3f}"
                 dpg.draw_rectangle((gx0 - S(4), gy0 - S(4)), (gx1 + S(4), gy1 + S(4)),
                                    color=(0, 0, 0, 150), fill=(0, 0, 0, 150), parent=f"L_hist_{name}")
-                hi = max(pk) or 1.0                        # anchor 0..max so the absolute peak level reads
-                n = len(pk)
-                pts = [(gx0 + GW * i / (n - 1), gy1 - GH * (v / hi)) for i, v in enumerate(pk)]
+                n = len(series)
+                pts = [(gx0 + GW * i / (n - 1), gy1 - GH * min(1.0, v / hi)) for i, v in enumerate(series)]
                 dpg.draw_polyline(pts, color=(120, 220, 255, 235), thickness=1.4, parent=f"L_hist_{name}")
                 dpg.draw_rectangle((gx0, gy0), (gx1, gy1), color=(150, 155, 172, 170), thickness=1.0,
                                    parent=f"L_hist_{name}")
-                dpg.draw_text((gx0, gy0 - S(16)), f"focus peak {pk[-1]:.3f}", size=S(12),
-                              color=(180, 205, 235, 235), parent=f"L_hist_{name}")
+                dpg.draw_text((gx0, gy0 - S(16)), label, size=S(12), color=(180, 205, 235, 235),
+                              parent=f"L_hist_{name}")
             npts = len(sc['dx'])
             if npts:
                 mult = focus_ui['com_mult']
@@ -1433,6 +1437,7 @@ def main(argv=None):
                 focus_ui['t0'] = t * 1e-9
             s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
             s['peak'].append(rec.get('peak', 0.0))
+            s['strehl'].append(rec.get('strehl'))         # None when the aperture is unknown (no Strehl)
             com = rec.get('com') or [0.0, 0.0]
             s['dx'].append(com[0])
             s['dy'].append(com[1])

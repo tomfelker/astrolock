@@ -33,7 +33,7 @@ import time
 
 import torch
 
-from astrolock.seeker import bayer, ser as ser_mod
+from astrolock.seeker import bayer, ser as ser_mod, skysim
 from astrolock.seeker.detect import (resolve_device, work_image, full_scale,
                                      _segments, _committed, _segment_ready, _frame_count)
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
@@ -73,6 +73,18 @@ def _com_offset(img):
     dy = float((img.sum(dim=1) * ys).sum()) / tot
     dx = float((img.sum(dim=0) * xs).sum()) / tot
     return dx, dy
+
+
+def _normalized_peak(crop):
+    """Subtract the sky pedestal (mean of the crop's border pixels), scale so the crop sums to 1, and
+    return the peak -- i.e. the fraction of the star's energy in its brightest pixel. Strehl = this for
+    the measured star / this for the ideal diffraction PSF. 0 if there's no positive net signal."""
+    edge = torch.cat([crop[0], crop[-1], crop[:, 0], crop[:, -1]])
+    net = crop - edge.mean()
+    total = float(net.sum())
+    if total <= 0:
+        return 0.0
+    return float(net.max()) / total
 
 
 class FocusEma:
@@ -136,6 +148,13 @@ def main(argv=None):
     p.add_argument('--search', type=int, default=128,
                    help="search ROI around the target to find the peak in (px)")
     p.add_argument('--alpha', type=float, default=0.05, help="EMA rate for the star crop (bigger = faster)")
+    # Optics -> the ideal diffraction PSF for the Strehl ratio. Strehl is emitted only when aperture > 0.
+    p.add_argument('--aperture-mm', type=float, default=0.0,
+                   help="objective aperture (mm); >0 enables the Strehl-ratio metric (measured vs ideal Airy peak)")
+    p.add_argument('--focal-mm', type=float, default=0.0, help="effective focal length (mm), for the ideal PSF")
+    p.add_argument('--pixel-um', type=float, default=0.0,
+                   help="frame pixel pitch (um) at the cam's output binning; scaled to the work image internally")
+    p.add_argument('--wavelength-nm', type=float, default=550.0, help="wavelength (nm) for the ideal Airy PSF")
     p.add_argument('--poll', type=float, default=0.02, help="seconds between polls when caught up (live)")
     p.add_argument('--stop-file', default=None, help="stop cleanly when this file appears")
     p.add_argument('--device', default='auto',
@@ -172,12 +191,14 @@ def main(argv=None):
     next_index = 0
     scale = None
     total = 0
+    strehl_ref = None            # ideal (diffraction-limited) normalized peak; computed once, kept across segments
+    strehl_done = False          # False until we've decided whether Strehl is available (needs the plate scale)
 
     def close_segment():
         reader.close(); writer.close(); spine.close(); det.close()
 
     def process(i):
-        nonlocal scale, total
+        nonlocal scale, total, strehl_ref, strehl_done
         frame = reader.read_frame(i)
         cid = reader.header.color_id
         if scale is None:
@@ -185,6 +206,21 @@ def main(argv=None):
             ema.scale = scale
         work = work_image(frame, cid, device=device)
         coord_scale = reader.header.image_width / work.shape[1]     # frame px per (maybe half-res) work px
+        # Strehl reference: the ideal PSF's normalized peak. With a known aperture it's the diffraction
+        # Airy at the WORK-image plate scale (work px are coarser than sensor px -- e.g. 2x for a Bayer
+        # mono-sum -- hence pixel_um * coord_scale). With the aperture UNKNOWN we assume the best a lens
+        # could do is put all the energy in one pixel (a centred delta) -> ideal peak 1.0, so Strehl still
+        # reports, just reading low unless the lens is genuinely sharp. Computed once we know coord_scale.
+        if not strehl_done:
+            strehl_done = True
+            if args.aperture_mm > 0 and args.focal_mm > 0 and args.pixel_um > 0:
+                r_null = skysim.airy_r_null_px(args.focal_mm, args.aperture_mm, args.wavelength_nm,
+                                               args.pixel_um * coord_scale)
+                ideal = skysim.airy_psf(ema.crop, r_null, device=device)
+            else:
+                ideal = torch.zeros((ema.crop, ema.crop), device=device)   # perfect point source
+                ideal[ema.crop // 2, ema.crop // 2] = 1.0
+            strehl_ref = _normalized_peak(ideal)
         # Target in WORK px: the detector's strongest blob (its px are frame coords), else the frame's
         # global brightest pixel -- so we lock a star even before/without any detection.
         present = bool(latest_blobs)
@@ -195,6 +231,8 @@ def main(argv=None):
             pk = int(torch.argmax(work))
             target = (pk % work.shape[1], pk // work.shape[1])
         star_ema, metrics, sat = ema.update(work, target)
+        if strehl_ref:                                 # measured normalized peak vs the ideal (0..~1)
+            metrics['strehl'] = round(_normalized_peak(star_ema) / strehl_ref, 4)
         t = time.perf_counter_ns()
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
         writer.write_frame(_ema_frame_u16(star_ema, scale, sat if even else None))

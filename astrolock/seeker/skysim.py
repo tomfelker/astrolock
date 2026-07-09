@@ -108,6 +108,29 @@ def ensure_cache(cache_dir='data/skyfield_cache'):
         pass
 
 
+def _airy_intensity(xx, yy, r_null_px):
+    """Airy diffraction intensity I(r) = [2 J1(v)/v]^2, first null at r_null_px px, on offset grids
+    xx/yy. The unaberrated (diffraction-limited) point-spread of a clear circular aperture."""
+    v = (3.831705970 / r_null_px) * torch.sqrt(xx * xx + yy * yy)
+    return torch.where(v < 1e-9, torch.ones_like(v), (2.0 * torch.special.bessel_j1(v) / v) ** 2)
+
+
+def airy_r_null_px(focal_length_mm, aperture_mm, wavelength_nm, pixel_pitch_um):
+    """Radius (px) to the first Airy null for this optic + sampling pitch: 1.22 * lambda * f-number
+    / pixel pitch."""
+    return 1.2196699 * (wavelength_nm * 1e-9) * (focal_length_mm / aperture_mm) / (pixel_pitch_um * 1e-6)
+
+
+def airy_psf(size, r_null_px, device='cpu'):
+    """A centred (size, size) diffraction-limited Airy PSF (first null at r_null_px px), normalized to
+    sum 1 -- the ideal point-spread a perfect lens gives, for a Strehl-ratio reference. (Clear aperture;
+    a central obstruction would make this an annular-aperture pattern -- a later change.)"""
+    ax = torch.arange(size, dtype=torch.float32, device=device) - (size - 1) / 2.0
+    yy, xx = torch.meshgrid(ax, ax, indexing='ij')
+    inten = _airy_intensity(xx, yy, r_null_px)
+    return inten / inten.sum()
+
+
 class SkySim:
     def __init__(self, config=None, device='cpu'):
         self.cfg = config or SkySimConfig()
@@ -185,8 +208,7 @@ class SkySim:
         over the WHOLE (centred, wrapping) frame -- so there's no small square kernel to leave a faint
         square halo around bright stars; the pattern just decays to ~0 by the frame edge."""
         yy, xx = self._centred_offsets(sz)
-        v = (3.831705970 / r_null_px) * torch.sqrt(xx * xx + yy * yy)
-        inten = torch.where(v < 1e-9, torch.ones_like(v), (2.0 * torch.special.bessel_j1(v) / v) ** 2)
+        inten = _airy_intensity(xx, yy, r_null_px)
         return torch.fft.rfft2((inten / inten.sum()))
 
     def _gauss_otf(self, sz, sigma):
@@ -218,8 +240,7 @@ class SkySim:
             sigma = 0.0 if c.aperture_mm > 0 else 1.3
         sigma = math.hypot(sigma, self._seeing_sigma_px())
         if c.aperture_mm > 0:                          # physically-sized Airy disc, optionally blurred
-            fnum = c.focal_length_mm / c.aperture_mm
-            r_null_px = 1.2196699 * (c.psf_wavelength_nm * 1e-9) * fnum / (c.pixel_pitch_um * 1e-6)
+            r_null_px = airy_r_null_px(c.focal_length_mm, c.aperture_mm, c.psf_wavelength_nm, c.pixel_pitch_um)
             otf = self._airy_otf(sz, r_null_px)
             if sigma > 0:
                 otf = otf * self._gauss_otf(sz, sigma)  # convolution = product in the frequency domain
