@@ -424,6 +424,60 @@ def detect_roi_peak(work, roi, coord_scale, *, detector, bg_radius, psf_px, doh_
              'moving': True, 'size_px': psf_px * coord_scale, 'score': float(bp[py, px] / m)}]
 
 
+def marginal_target(work, *, nsigma=4.0, density_thresh=0.7):
+    """Symmetric single-extended-target detector (satellites, planes, rockets, daytime silhouettes).
+
+    Assumes ONE bright-or-dark compact target on a flat background. Project the frame onto each axis
+    (mean across rows -> the x marginal; mean across cols -> the y marginal), and on each 1-D marginal:
+    threshold two-tailed at ``|value - mean| > nsigma*stdev`` -- two-tailed so a dark daytime silhouette
+    registers as well as a bright satellite -- then measure how CLUSTERED the above-threshold columns are.
+    On an empty frame they scatter across the axis; on a target they clump. ``density`` is that
+    compactness (~1 = clumped target, ~0.5 = uniform noise). ``present`` := density over its threshold in
+    BOTH axes. All coords in WORK px."""
+    work = torch.as_tensor(work, dtype=torch.float32)
+
+    def axis(profile):
+        length = profile.numel()
+        position = torch.arange(length, dtype=torch.float32, device=profile.device)
+        background = profile.mean()
+        noise = profile.std()
+        is_target = torch.abs(profile - background) > nsigma * noise    # two-tailed: bright OR dark stands out
+        mass = int(is_target.sum())                                     # how many columns cleared the threshold
+        if mass < 1:
+            return {'present': False, 'center': length / 2.0, 'lo': 0.0, 'hi': length - 1.0,
+                    'density': 0.0, 'mass': 0}
+        hit = is_target.float()
+        center = float((hit * position).sum() / mass)                  # centre of the above-threshold columns
+        avg_distance = float((hit * (position - center).abs()).sum() / mass)
+        # The average distance from the centre runs from `packed` (all mass in a solid run around the
+        # centre) up to `spread` = (length-1)/2 (mass split to the two extreme columns 0 and length-1).
+        # density = where avg_distance lands in that range: 1 at the packed end, 0 at the spread end.
+        # Both ends are the EXACT discrete values, so a solid clump (and a single point) come out to
+        # exactly 1 and the fully-split case to exactly 0. `packed` is the discrete average distance of a
+        # solid run of `mass` columns -- the sum of |i-centre| over consecutive integers is floor(mass^2/4).
+        # Uniform noise (avg distance ~length/4, about halfway) -> ~0.5. Pixel-size invariant.
+        packed, spread = (mass * mass // 4) / mass, (length - 1) / 2.0
+        density = (spread - avg_distance) / (spread - packed)
+        edges = position[is_target]
+        present = density >= density_thresh
+        return {'present': present, 'center': center, 'lo': float(edges.min()), 'hi': float(edges.max()),
+                'density': density, 'mass': mass}
+
+    x = axis(work.mean(dim=0))          # x marginal: mean across rows
+    y = axis(work.mean(dim=1))          # y marginal: mean across cols
+    present = x['present'] and y['present']
+    peak = 0.0
+    if present:
+        window = work[int(y['lo']):int(y['hi']) + 1, int(x['lo']):int(x['hi']) + 1]
+        peak = float(window.max()) if window.numel() else float(work.max())
+    return {'present': present,
+            'com': [x['center'], y['center']],
+            'bbox': [x['lo'], y['lo'], x['hi'] - x['lo'], y['hi'] - y['lo']],
+            'density': [x['density'], y['density']],
+            'mass': [x['mass'], y['mass']],
+            'peak': peak}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker blob detector")
     p.add_argument('--session', required=True, help="session directory to follow")
@@ -435,12 +489,14 @@ def main(argv=None):
                    help="detect peaks this many sigma above the band-passed background")
     p.add_argument('--threshold', type=float, default=0.0,
                    help="optional relative floor: fraction of the brightest band-passed pixel (0 = off)")
-    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise'],
+    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise', 'extended'],
                    help="detection surface: 'doh' (default) = determinant of the Hessian "
                         "(Gaussian-derivative blob detector; rejects edges/lines by construction), "
-                        "'bandpass' (the older local-background subtraction), or 'surprise' = per-pixel "
+                        "'bandpass' (the older local-background subtraction), 'surprise' = per-pixel "
                         "temporal surprise + decaying peak-hold (finds faint fast movers / satellite "
-                        "trails that the single-frame surfaces miss; see SurpriseModel)")
+                        "trails that the single-frame surfaces miss; see SurpriseModel), or 'extended' = "
+                        "the symmetric single-bright-or-dark extended-target detector (marginal projection "
+                        "+ compactness; for narrow-field main-cam tracking; see marginal_target)")
     p.add_argument('--surprise-alpha-mean', type=float, default=0.15,
                    help="surprise: EMA rate for the per-pixel mean (bigger = adapts faster to drift)")
     p.add_argument('--surprise-alpha-var', type=float, default=0.08,
@@ -450,6 +506,12 @@ def main(argv=None):
                         "longer for the faintest trails, at more latency)")
     p.add_argument('--surprise-var-floor-frac', type=float, default=0.5,
                    help="surprise: noise floor as this fraction of the median per-pixel variance")
+    p.add_argument('--ext-nsigma', type=float, default=3.0,
+                   help="extended: two-tailed |value-mean| threshold on the row/col marginals, in sigmas "
+                        "(catches bright AND dark targets; lower = includes dimmer target extremities)")
+    p.add_argument('--ext-density', type=float, default=0.7,
+                   help="extended: min compactness to call a target present (~1 = tightly clumped target, "
+                        "~0.5 = uniform noise), in both axes")
     p.add_argument('--debug-ser', action='store_true',
                    help="also write the detection surface as <seg>_<role>_debug.ser (+ .frames.jsonl), a "
                         "normalized greyscale movie of exactly what the detector 'sees' -- follow it in "
@@ -532,7 +594,7 @@ def main(argv=None):
                 state['tailer'] = sidecar.JsonlTailer(sf[-1])
         if state['tailer'] is not None:
             for rec in state['tailer'].poll():
-                state['roi'] = rec.get('track_roi') if rec.get('track_role') == args.role else None
+                state['roi'] = (rec.get('track_roi') or {}).get(args.role)   # per-role: {role: [cx,cy,size]}
 
     def process(i):
         nonlocal prev, scale, total
@@ -544,7 +606,23 @@ def main(argv=None):
         coord_scale = reader.header.image_width / work.shape[1]    # frame px per (maybe half-res) work px
         # Keep the temporal model current every frame (even in track mode) so its state never goes stale.
         trail = surprise.update(work) if surprise is not None else None
-        if state['roi'] is not None:                               # track mode: single peak in the ROI
+        extra, status = {}, ''                                     # extra record fields + a freeform status line
+        if args.detector == 'extended':                            # symmetric extended-target detector
+            # (marginal + compactness). Full-frame for now; ROI-gating comes with the tracker handoff.
+            ext = marginal_target(work, nsigma=args.ext_nsigma, density_thresh=args.ext_density)
+            cs = coord_scale
+            com_f = [ext['com'][0] * cs, ext['com'][1] * cs]
+            bbox_f = [v * cs for v in ext['bbox']]
+            blobs = ([{'px': com_f, 'bbox': bbox_f, 'moving': True,
+                       'score': round(ext['peak'] / (scale or 1.0), 4)}] if ext['present'] else [])
+            extra = {'ext': {'present': ext['present'], 'com': com_f, 'bbox': bbox_f,
+                             'density': [round(d, 3) for d in ext['density']],
+                             'mass': [round(m, 1) for m in ext['mass']]}}
+            status = (f"{'Target' if ext['present'] else 'No Target'} "
+                      f"(Density X: {ext['density'][0]:.2f}, Y: {ext['density'][1]:.2f})")
+            debug_surface = work                                   # debug-ser shows the analysed frame
+            prev = None
+        elif state['roi'] is not None:                             # track mode: single peak in the ROI
             # ROI-peak needs a single-frame surface; 'surprise' is full-frame temporal, so fall back.
             roi_detector = 'bandpass' if args.detector == 'surprise' else args.detector
             blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=roi_detector,
@@ -552,6 +630,7 @@ def main(argv=None):
                                     doh_sigma=args.doh_sigma, snr=args.snr)   # already frame coords
             prev = None                                            # frame-diff not used in ROI mode
             debug_surface = trail                                  # in ROI mode the only surface we have
+            status = "Locked On" if blobs else "Searching"
         else:                                                      # acquisition: full-frame multi-blob
             bp = trail if surprise is not None else detection_surface(
                 work, detector=args.detector, bg_radius=args.bg_radius,
@@ -573,7 +652,9 @@ def main(argv=None):
                     if 'size_px' in b:
                         b['size_px'] = b['size_px'] * coord_scale
             prev = bp
-        writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(), 'blobs': blobs})
+            status = f"Acquired {len(blobs)} target{'' if len(blobs) == 1 else 's'}"
+        writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(),
+                       'blobs': blobs, 'status': status, **extra})
         # Debug movie of the detection surface: a parallel .ser + commit spine the GUI can follow.
         if args.debug_ser and debug_surface is not None:
             if dbg['writer'] is None:

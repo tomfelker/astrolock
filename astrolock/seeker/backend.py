@@ -55,13 +55,15 @@ def main(argv=None):
     p.add_argument('--playback-ser', default=None, help="playback source: the .ser file to replay")
     p.add_argument('--playback-speed', type=float, default=1.0, help="playback source: speed multiplier")
     p.add_argument('--playback-loop', action='store_true', help="playback source: loop instead of stopping")
-    p.add_argument('--detect-roles', default='guide',
-                   help="comma-separated roles to run blob detection on (default: guide only -- the "
-                        "main cam is narrow-field and will get centroid tracking later, not blob detect)")
-    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise'],
-                   help="detection surface: 'doh' (default) = determinant of the Hessian, 'bandpass', or "
+    p.add_argument('--detect-roles', default='guide,main',
+                   help="comma-separated roles to run detection on. Default both: the guide runs the "
+                        "multi-blob detector (--detector) for acquisition, the main runs its "
+                        "single-extended-target detector (--main-detector) for the handoff.")
+    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise', 'extended'],
+                   help="detection surface: 'doh' (default) = determinant of the Hessian, 'bandpass', "
                         "'surprise' (per-pixel temporal surprise + decaying peak-hold; finds faint fast "
-                        "movers / satellite trails)")
+                        "movers / satellite trails), or 'extended' (symmetric single-extended-target "
+                        "marginal+compactness detector for the main cam). Per-role override: --<role>-detector")
     p.add_argument('--doh-sigma', type=float, default=0.0, help="doh detector: Gaussian scale px (0 = psf default)")
     p.add_argument('--surprise-decay', type=float, default=0.85,
                    help="surprise detector: trail peak-hold decay (->1 integrates longer for fainter trails)")
@@ -75,6 +77,13 @@ def main(argv=None):
                    help="detect density cap: tiles across the frame (0 = off); keeps targets from "
                         "a dense bright region from starving the rest of the frame")
     p.add_argument('--per-tile', type=int, default=2, help="detect density cap: max blobs per tile")
+    # Extended detector ('extended') knobs -- the symmetric single-target marginal+compactness detector.
+    p.add_argument('--ext-nsigma', type=float, default=3.0,
+                   help="extended detector: two-tailed |value-mean| marginal threshold in sigmas "
+                        "(catches bright AND dark targets; lower = includes dimmer target extremities)")
+    p.add_argument('--ext-density', type=float, default=0.7,
+                   help="extended detector: min compactness to call a target present (~1 = tightly "
+                        "clumped, ~0.5 = uniform noise), in both axes")
     p.add_argument('--device', default='auto',
                    help="torch device for detect + gui: 'auto' (default) = cuda if present else cpu, "
                         "or force 'cpu' / 'cuda' (passed through to both child processes)")
@@ -118,6 +127,12 @@ def main(argv=None):
     p.add_argument('--main-sensor', default='ZWO ASI678MC', help="main camera sensor name in the optics DB")
     p.add_argument('--main-optic', default='Celestron CPC 1100', help="main optic name in the optics DB")
     p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
+    # Per-role detector override (default: --detector). Typical: main-cam extended-target tracking.
+    p.add_argument('--guide-detector', default=None, choices=['bandpass', 'doh', 'surprise', 'extended'],
+                   help="override --detector for the guide role (default: --detector)")
+    p.add_argument('--main-detector', default='extended', choices=['bandpass', 'doh', 'surprise', 'extended'],
+                   help="detector for the main role (default 'extended': the narrow-field single-target "
+                        "detector that drives the guide->main handoff)")
     p.add_argument('--guide-bin', type=int, default=2,
                    help="guide camera NxN binning (default 2x2): combine NxN pixels. A color cam "
                         "binned 2x2 reads out mono at ~the debayered resolution -- the natural guide "
@@ -126,9 +141,10 @@ def main(argv=None):
                    help="main camera NxN binning (default 1 = native full resolution)")
     # Tracking: sky-space closed loop (TargetModel + min-time-intercept servo). A blind, measurement-
     # driven model of the target's motion; the servo commands the mount to intercept its prediction.
-    p.add_argument('--track-rate-smoothing-s', type=float, default=0.5,
+    p.add_argument('--track-rate-smoothing-s', type=float, default=1.0,
                    help="EMA time constant for the target angular-velocity estimate "
-                        "(bigger = smoother but laggier rate; smaller = snappier but noisier)")
+                        "(bigger = smoother but laggier rate; smaller = snappier but noisier). "
+                        "Live-adjustable in the GUI Tracking panel")
     p.add_argument('--track-min-intercept-s', type=float, default=1.0,
                    help="min intercept time; also sets the position-correction stiffness (P ~ 1/this)")
     p.add_argument('--track-command-latency-s', type=float, default=0.0,
@@ -146,6 +162,20 @@ def main(argv=None):
                         "target so detect can work just that window instead of the whole frame. 0 = full-frame.")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
+    # Camera handoff: guide acquires, then promote the sky-space loop to a finer role (main) running the
+    # extended detector once it stably sees the target -- closing the loop in main px self-corrects the
+    # guide->main boresight and rides an extended target's steadier centroid. Demote back on loss.
+    p.add_argument('--handoff', dest='handoff', action='store_true', default=True,
+                   help="promote tracking to the main cam once its extended detector locks (default on)")
+    p.add_argument('--no-handoff', dest='handoff', action='store_false',
+                   help="disable main-cam handoff -- track on the acquisition (guide) cam only")
+    p.add_argument('--handoff-promote-s', type=float, default=1.5,
+                   help="seconds the fine cam must continuously see the target before promoting to it")
+    p.add_argument('--handoff-demote-s', type=float, default=0.4,
+                   help="demote back to the guide when the evidence accumulator falls to this (s)")
+    p.add_argument('--handoff-fall-rate', type=float, default=3.0,
+                   help="how many seconds of accumulated evidence are shed per second the fine cam has no "
+                        "target (>1 = demote faster than promote, so a brief flicker won't drop the lock)")
     p.add_argument('--boresight-x-mrad', type=float, default=0.0,
                    help="main-vs-guide boresight X offset (mrad, guide image right): where the main cam "
                         "points relative to the guide, so a guide-tracked target is centred in the main "
@@ -164,9 +194,11 @@ def main(argv=None):
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky source: lens focal length (mm)")
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky source: wavelength for the physically-sized Airy-disc PSF (nm)")
-    p.add_argument('--sky-psf-sigma-px', type=float, default=None,
-                   help="sky source: residual-blur Gaussian on top of the Airy disc, px (default auto: 0 "
-                        "when the aperture is known, else 1.3)")
+    p.add_argument('--sky-psf-sigma-px', type=float, default=2.0,
+                   help="sky source: per-camera residual-blur Gaussian (lens softness/defocus) on top of the "
+                        "Airy disc, px. Default 2.0 softens the sub-pixel guide PSF so tracking isn't jumpy; "
+                        "pass 0 for the sharp physical-PSF worst case. Live-adjustable per camera in the GUI "
+                        "(the sky camera's Defocus control)")
     p.add_argument('--sky-seeing-r0-m', type=float, default=0.0,
                    help="sky source: atmospheric Fried parameter r0 (m); >0 adds a seeing blur to all sim cams")
     p.add_argument('--wb-r', type=float, default=1.24, help="GUI display-only WB gain for red (1 = none)")
@@ -242,10 +274,19 @@ def main(argv=None):
     tracking = False
     coasting = False          # lost a settled lock -> holding the last rate, still re-acquiring
     drive_mount = True        # False = "Stop Moving": hold the mount but keep the tracker running
-    track_role = None
-    track_target = None
+    track_role = None         # the role whose detections currently feed the sky-space model (guide or main)
+    track_target = None       # model-predicted target px in the source frame (the smooth blue pipper)
+    track_detect_px = None    # raw detection px of the locked target in the source frame (the green marker)
     track_seen_index = -1
     track_center = None       # (cx, cy) true frame centre at lock time, for live boresight re-offset
+    # Camera handoff (guide acquires -> promote to the narrow main cam once it stably sees the target,
+    # closing the loop directly in main px so the guide->main boresight error self-corrects; demote back
+    # on loss). A time-based leaky integrator (framerate-independent) with asymmetric rise/fall + Schmitt
+    # hysteresis, fed by the fine cam's extended-detector 'present'. track_primary is the fallback role.
+    track_primary = None
+    handoff_fine = None       # the finer role to promote to (e.g. 'main'), or None if none is eligible
+    handoff_conf = 0.0        # seconds-of-evidence accumulator, clamped to [0, --handoff-promote-s]
+    track_pref = 'auto'       # GUI radio: 'guide' (pin), 'main' (prefer), or 'auto' (hysteresis handoff)
     # Boresight: where the main cam points relative to the guide, as an image-frame angular offset
     # (x right, y down), radians. Offsets the guide tracker's hold point so the target lands in the main.
     boresight = {'x': args.boresight_x_mrad * 1e-3, 'y': args.boresight_y_mrad * 1e-3}
@@ -356,6 +397,10 @@ def main(argv=None):
             aperture_by_role[role] = 0.0
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
+    # Per-role sim residual-blur sigma (px): lens softness/defocus atop the physical Airy PSF -- a
+    # per-camera optical property (each sim cam is a different lens), so it lives here, not globally.
+    # None = auto (sharp physical PSF); the GUI exposes it as the sky cam's 'Defocus' control.
+    psf_sigma_by_role = {role: args.sky_psf_sigma_px for role in roles}
     camera_url = {role: None for role in roles}           # per-role selected ZWO camera URL (None = default)
     cams_available = cam_mod.zwo_camera_urls()            # detected ZWO cameras (model-qualified URLs), [] if none
     cam_caps = {role: None for role in roles}             # role -> {'source','controls':[...]} from caps_<role>.json
@@ -380,8 +425,8 @@ def main(argv=None):
                             '--sky-aperture-mm', str(aperture_by_role.get(role, 0.0)),
                             '--sky-psf-wavelength-nm', str(args.sky_psf_wavelength_nm),
                             '--sky-seeing-r0-m', str(args.sky_seeing_r0_m)]
-            if args.sky_psf_sigma_px is not None:     # else the cam auto-picks (0 if aperture known, else 1.3)
-                per_role_sky += ['--sky-psf-sigma-px', str(args.sky_psf_sigma_px)]
+            if psf_sigma_by_role.get(role) is not None:   # else the cam auto-picks (0 if aperture known, else 1.3)
+                per_role_sky += ['--sky-psf-sigma-px', str(psf_sigma_by_role[role])]
             if role in fov_by_role:                   # DB optics named -> render at the true sensor
                 per_role_sky += ['--sky-width', str(rx), '--sky-height', str(ry)]   # res, so FoV matches
             if role in roi_window_by_role:            # centered readout window (sensor px) -> frame metadata
@@ -410,11 +455,14 @@ def main(argv=None):
     detect_procs = {}
 
     def launch_detect(role):
+        det = getattr(args, f'{role}_detector', None) or args.detector   # per-role override
         detect_procs[role] = _spawn('astrolock.seeker.detect',
                                     ['--session', session_dir, '--role', role, '--follow',
                                      '--stop-file', stop_file,
-                                     '--detector', args.detector, '--doh-sigma', str(args.doh_sigma),
+                                     '--detector', det, '--doh-sigma', str(args.doh_sigma),
                                      '--surprise-decay', str(args.surprise_decay),
+                                     '--ext-nsigma', str(args.ext_nsigma),
+                                     '--ext-density', str(args.ext_density),
                                      '--snr', str(args.snr), '--max-candidates', str(args.max_candidates),
                                      '--min-blob-px', str(args.min_blob_px),
                                      '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile),
@@ -458,6 +506,7 @@ def main(argv=None):
     det_ser = {role: None for role in roles}
     latest_blobs = {role: [] for role in roles}
     latest_det_index = {role: -1 for role in roles}
+    latest_ext = {role: None for role in roles}          # role -> extended-detector metrics (present/...)
 
     def update_detections():
         for role in roles:
@@ -474,6 +523,7 @@ def main(argv=None):
             for rec in det_tailers[role].poll():
                 latest_blobs[role] = rec.get('blobs', [])
                 latest_det_index[role] = rec.get('index', latest_det_index[role])
+                latest_ext[role] = rec.get('ext')        # extended detector: {'present', 'com', ...} or None
 
     def frame_binning(role):
         """Sensor pixels per frame pixel for a role (from the cam's frame sidecar; default 1)."""
@@ -496,6 +546,26 @@ def main(argv=None):
         if index < len(lines) and 't_mono_ns' in lines[index]:
             return lines[index]['t_mono_ns'] * 1e-9
         return None
+
+    def _detector_for(role):
+        return getattr(args, f'{role}_detector', None) or args.detector
+
+    def track_geom(role):
+        """Reconstruction geometry for tracking on `role`: (cx, cy, rad_per_px, sign_az, sign_alt). The
+        optical centre is the frame centre, except the guide holds the target at the boresight pixel (so
+        it lands in the main cam); the main cam holds at its own centre and self-corrects the boresight."""
+        hdr = followers[role].header
+        rpp = rad_per_px_by_role.get(role, rad_per_px) * frame_binning(role)
+        cx, cy = hdr.image_width / 2.0, hdr.image_height / 2.0
+        if role == 'guide':
+            cx += boresight['x'] / rpp
+            cy += boresight['y'] / rpp
+        return cx, cy, rpp, args.track_sign_az, args.track_sign_alt
+
+    def _fine_present():
+        """True if the fine (main) cam's extended detector currently sees a target."""
+        ext = latest_ext.get(handoff_fine)
+        return bool(ext and ext.get('present'))
 
     def control_write(role, obj):
         if role in control_writers:
@@ -547,6 +617,11 @@ def main(argv=None):
         if src in ('sky', 'zwo'):                          # sim crops the render; zwo crops in hardware
             caps.append({'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': _roi_choices(role),
                          'value': _roi_value(role), 'live': False})
+        if src == 'sky':                                   # sim-only: lens softness/defocus atop the Airy PSF
+            sig = psf_sigma_by_role.get(role)              # None (auto) shows as 0 -> "sharp physical PSF"
+            caps.append({'name': 'defocus', 'label': 'Defocus', 'kind': 'number', 'unit': 'px',
+                         'scale': 'linear', 'min': 0.0, 'max': 8.0,
+                         'value': 0.0 if sig is None else float(sig), 'live': False})
         return caps
 
     def published_caps(role):
@@ -636,7 +711,8 @@ def main(argv=None):
 
     def apply_command(cmd):
         nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
-        nonlocal track_center, mount_desired_url, drive_mount
+        nonlocal track_center, mount_desired_url, drive_mount, track_primary, handoff_fine, handoff_conf
+        nonlocal track_pref
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -692,9 +768,17 @@ def main(argv=None):
                     coasting = False
                     drive_mount = True                        # a fresh lock drives the mount again
                     track_role = role
+                    # Handoff setup: this role is the fallback ('primary'); if a *finer* role runs the
+                    # extended detector, watch it to promote once it stably sees the target.
+                    track_primary = role
+                    handoff_conf = 0.0
+                    handoff_fine = next((r for r in roles if r != role and r in detect_roles
+                                         and _detector_for(r) == 'extended'), None) if args.handoff else None
                     estop = False
                     print(f"[backend] acquired target on {role} at "
-                          f"({float(px[0]):.0f},{float(px[1]):.0f})px", flush=True)
+                          f"({float(px[0]):.0f},{float(px[1]):.0f})px"
+                          + (f"; will promote to {handoff_fine} when it locks" if handoff_fine else ""),
+                          flush=True)
                     info, warns = tracker.diagnostics()      # tracker self-report at lock time
                     for ln in info:
                         print(f"[backend] track {role}: {ln}", flush=True)
@@ -709,9 +793,28 @@ def main(argv=None):
                 tracker.cy = track_center[1] + boresight['y'] / rpp
             print(f"[backend] boresight -> ({boresight['x'] * 1e3:.3f}, {boresight['y'] * 1e3:.3f}) mrad",
                   flush=True)
+        elif t == 'set_track_smoothing':              # live tracker-tuning: EMA time constant (s)
+            v = max(0.0, float(cmd.get('value', args.track_rate_smoothing_s)))
+            args.track_rate_smoothing_s = v           # remembered for the next lock...
+            if tracker is not None and hasattr(tracker.model, 'smoothing_s'):
+                tracker.model.smoothing_s = v         # ...and applied to the running lock right now
+            print(f"[backend] track rate smoothing = {v:.2f}s", flush=True)
+        elif t == 'set_track_pref':                   # which cam drives tracking: 'guide' / 'main' / 'auto'
+            p = cmd.get('pref')
+            if p in ('guide', 'main', 'auto'):
+                track_pref = p
+                print(f"[backend] track source preference = {track_pref}", flush=True)
+        elif t == 'set_sky_render':                   # global sim-truth atmosphere: seeing r0 (one sky, all cams)
+            if 'r0_m' in cmd:
+                args.sky_seeing_r0_m = max(0.0, float(cmd['r0_m']))
+            print(f"[backend] sky seeing r0 = {args.sky_seeing_r0_m}m", flush=True)
+            for r in roles:                            # rebuild each live sky cam's PSF (built at launch)
+                if sources.get(r) == 'sky' and is_connected(r):
+                    restart_cam(r, stop_first=True)
         elif t == 'untrack':                          # "Unlock": drop the lock entirely + halt the mount
             tracking = coasting = False
             drive_mount = True
+            handoff_fine, handoff_conf = None, 0.0    # drop any pending main-cam handoff
             mount.set_rates(0.0, 0.0)
         elif t == 'record':
             on = bool(cmd.get('on', False))
@@ -806,6 +909,12 @@ def main(argv=None):
                 if is_connected(role):
                     restart_cam(role, stop_first=True)
                 print(f"[backend] {role} roi = {_roi_value(role)}", flush=True)
+            elif role in roles and name == 'defocus':      # sim residual blur (px); rebuilds the PSF -> relaunch
+                b = float(value)
+                psf_sigma_by_role[role] = b if b > 0.0 else None   # 0 -> auto (sharp physical PSF)
+                if is_connected(role):
+                    restart_cam(role, stop_first=True)
+                print(f"[backend] {role} defocus = {psf_sigma_by_role[role]} px", flush=True)
             elif role in roles and name is not None:
                 cam_control_vals[role][name] = value
                 live = next((c.get('live', True) for c in (cam_caps.get(role) or {}).get('controls', [])
@@ -819,6 +928,7 @@ def main(argv=None):
     start = time.perf_counter()
     last_health = start
     last_cleanup = start
+    handoff_last = start          # for the handoff integrator's real-time dt (framerate-independent)
     clean = False
     try:
         while True:
@@ -856,6 +966,9 @@ def main(argv=None):
                         # On 'track' and 'coast' the target estimate keeps moving, so keep publishing it
                         # (the ROI follows, so detect keeps searching and can re-acquire during coast).
                         track_target = list(tpx) if track_status in ('track', 'coast') else None
+                        # Raw detection (green marker) only while we have a fresh one; None on coast/lost.
+                        track_detect_px = (list(tracker.last_meas_px)
+                                           if track_status == 'track' and tracker.last_meas_px else None)
                         if track_status == 'lost':
                             tracking, coasting = False, False
                             print(f"[backend] lost target on {role}", flush=True)
@@ -865,6 +978,31 @@ def main(argv=None):
                                   f"to re-acquire -- e-stop to halt)", flush=True)
                         elif track_status == 'track':
                             coasting = False
+
+            # ---- camera handoff: choose which cam feeds the model, honouring the GUI preference ---------
+            # Leaky integrator of the fine cam's 'present' signal, in real seconds (framerate-independent):
+            # rise while present, fall faster (--handoff-fall-rate) while absent. Desired source per pref:
+            #   'guide' -> always the guide; 'main' -> the main whenever it has seen the target recently;
+            #   'auto'  -> Schmitt-triggered (promote after sustained presence, demote on loss). A switch is
+            # just swapping which role's detections feed the sky-space model (switch_role = a geometry swap);
+            # the model's velocity carries across untouched.
+            if tracking and tracker is not None and handoff_fine is not None and not estop:
+                dt = now - handoff_last
+                handoff_conf += dt * (1.0 if _fine_present() else -args.handoff_fall_rate)
+                handoff_conf = max(0.0, min(args.handoff_promote_s, handoff_conf))
+                if track_pref == 'guide':
+                    want = track_primary
+                elif track_pref == 'main':
+                    want = handoff_fine if handoff_conf >= args.handoff_demote_s else track_primary
+                elif track_role == track_primary:                    # 'auto', currently on guide
+                    want = handoff_fine if handoff_conf >= args.handoff_promote_s else track_primary
+                else:                                                # 'auto', currently on main
+                    want = track_primary if handoff_conf <= args.handoff_demote_s else handoff_fine
+                if want != track_role and followers[want].header is not None:
+                    tracker.switch_role(*track_geom(want), single_target=_detector_for(want) == 'extended')
+                    track_role, track_seen_index = want, latest_det_index[want]
+                    print(f"[backend] handoff: now tracking on {want}", flush=True)
+            handoff_last = now
 
             moving = abs(st['rate_az_rad_s']) > 1e-9 or abs(st['rate_alt_rad_s']) > 1e-9
             if tracking:
@@ -878,10 +1016,42 @@ def main(argv=None):
             else:
                 mode = 'idle'
 
+            # ROIs to hand the detectors: the active source's window around the predicted target, PLUS
+            # the fallback (guide) role's, projected into its own frame -- so the guide keeps ROI-tracking
+            # the target while the main cam drives, and a demotion is a clean handoff, not a re-acquire.
+            track_rois = {}
+            if tracking and tracker is not None and args.track_roi_size > 0:
+                # The active source's ROI -- but only if its detector actually uses one (the main cam's
+                # extended detector is full-frame, so no ROI for it).
+                if track_target and _detector_for(track_role) != 'extended':
+                    track_rois[track_role] = [round(track_target[0]), round(track_target[1]), args.track_roi_size]
+                # The fallback (guide) keeps ROI-tracking too, projected into its own frame.
+                fb = track_primary
+                if (fb and fb != track_role and fb in detect_roles and _detector_for(fb) != 'extended'
+                        and followers[fb].header is not None):
+                    hdr = followers[fb].header
+                    grpp = rad_per_px_by_role.get(fb, rad_per_px) * frame_binning(fb)
+                    pp = tracker.predict_pixel_in(now, hdr.image_width / 2.0, hdr.image_height / 2.0,
+                                                  grpp, args.track_sign_az, args.track_sign_alt)
+                    if pp is not None:
+                        track_rois[fb] = [round(pp[0]), round(pp[1]), args.track_roi_size]
+
+            # Freeform status line for the GUI: what the backend is doing right now.
+            if tracking:
+                omega = math.degrees(tracker.target_speed_rad_s()) if tracker is not None else 0.0
+                backend_status = (f"following {track_role}, target {omega:.2f} deg/s"
+                                  + (" (coasting)" if coasting else ""))
+            elif estop:
+                backend_status = "e-stopped"
+            else:
+                backend_status = {'lost': 'target lost', 'slew': 'slewing'}.get(mode, 'idle')
+
             state_writer.append({
                 't_mono_ns': time.perf_counter_ns(),
                 't_utc': session_mod.utc_now_iso(),
                 'mode': mode,
+                'status': backend_status,               # freeform backend status line for the GUI
+                'detect_roles': sorted(detect_roles),   # which roles have a detector (for the GUI status)
                 'enc_t_mono_ns': st.get('t_mono_ns'),   # when the angles were measured (for extrapolation)
                 'enc_az_deg': round(math.degrees(st['az_rad']), 4),
                 'enc_alt_deg': round(math.degrees(st['alt_rad']), 4),
@@ -891,10 +1061,16 @@ def main(argv=None):
                 'tracking': tracking,                   # "locked": the tracker has a target
                 'following': bool(tracking and drive_mount),   # mount is actively slewing to hold the lock
                 'track_role': track_role if tracking else None,
-                'target_px': track_target if tracking else None,
+                'track_pref': track_pref,               # GUI radio: guide / main / auto
+                'target_px': track_target if tracking else None,        # model prediction (blue pipper)
+                'detect_px': track_detect_px if tracking else None,     # raw detection (green marker)
+                # Handoff telemetry: which finer role we may promote to, the evidence accumulator, and
+                # whether we're currently locked on it (track_role == handoff_fine).
+                'handoff': ({'fine': handoff_fine, 'primary': track_primary,
+                             'conf': round(handoff_conf, 2), 'on_fine': track_role == handoff_fine}
+                            if tracking and handoff_fine else None),
                 # ROI (cx, cy, size px) around the predicted target, for detect to clamp its work to.
-                'track_roi': ([round(track_target[0]), round(track_target[1]), args.track_roi_size]
-                              if tracking and track_target and args.track_roi_size > 0 else None),
+                'track_roi': track_rois or None,        # {role: [cx, cy, size]} -- active source + guide fallback
                 'sources': dict(sources),
                 'playback': {r: dict(playback_by_role[r]) for r in roles},   # per-role .ser + loop
 

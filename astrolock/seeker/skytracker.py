@@ -59,11 +59,18 @@ class SkyTracker:
         self.lock_min_time = lock_min_time
         self.sign_az, self.sign_alt = sign_az, sign_alt
         self.active = False
+        self.single_target = False        # feed reports exactly the target (main extended cam) -> no association
+        self.last_meas_px = None          # last ingested detection pixel (current role's frame), for the GUI
         # Piecewise-linear history of mount measurements (t, az, alt) to look up the pose at a *past*
         # frame time by interpolation. The latest measured rate is kept only to extrapolate *forward*
         # past the last measurement (the servo's command-latency lookahead) -- never backward.
         self._hist = collections.deque(maxlen=256)
         self._mount_rate = (0.0, 0.0)
+
+    def target_speed_rad_s(self):
+        """Magnitude of the model's current angular-velocity estimate (rad/s), for status display."""
+        av = getattr(self.model, 'ang_vel', None)
+        return float(torch.linalg.norm(av)) if av is not None else 0.0
 
     def diagnostics(self):
         """(info_lines, warnings) printed by the backend at lock time."""
@@ -128,6 +135,20 @@ class SkyTracker:
         py = self.cy + float(cam[2]) * scale / (self.rad_per_px * self.sign_alt)
         return px, py
 
+    def predict_pixel_in(self, t, cx, cy, rad_per_px, sign_az, sign_alt):
+        """Where the model's predicted target lands in ANOTHER camera's frame (its centre + plate scale)
+        at time t -- so the backend can keep a fallback camera's ROI on the target while a different
+        camera drives, making a handoff back clean. Returns (px, py), or None before the first fix."""
+        direction = self.model.predict(t)
+        if direction is None:
+            return None
+        R = geo.mount_matrix(*self._pose_at(t))
+        cam = R.transpose(0, 1) @ direction
+        fd = float(cam[0])
+        scale = 1.0 / fd if fd > 1e-6 else 1e6
+        return (cx + float(cam[1]) * scale / (rad_per_px * sign_az),
+                cy + float(cam[2]) * scale / (rad_per_px * sign_alt))
+
     # ---- lifecycle ----
 
     def start(self, px, py, obs_time, st):
@@ -140,9 +161,26 @@ class SkyTracker:
         self.settled_since = None                     # first association after a gap
         self.settled = False                          # associated for >= lock_min_time
         self.last_rate = (0.0, 0.0)
+        self.last_meas_px = (px, py)
 
     def stop(self):
         self.active = False
+
+    def switch_role(self, cx, cy, rad_per_px, sign_az, sign_alt, single_target=False):
+        """Hand the sky-space model to a different camera (role handoff). Because Layer A models the
+        target in absolute sky *directions*, this is just swapping the reconstruction geometry -- optical
+        centre (cx, cy), plate scale, axis signs -- so the new camera's detection pixels reconstruct to
+        the right directions and its centre becomes the hold point. The model (and its angular-velocity
+        estimate) is untouched; the new camera's detections simply feed in through the normal update path.
+        With a decent boresight the direction the model already holds and the new camera's detection agree
+        to within the boresight accuracy, so there's no jump worth hacking around.
+
+        ``single_target`` marks a feed that reports exactly the target (the main extended detector) so
+        update() ingests it directly, no association/gate."""
+        self.cx, self.cy = cx, cy
+        self.rad_per_px = rad_per_px
+        self.sign_az, self.sign_alt = sign_az, sign_alt
+        self.single_target = single_target
 
     # ---- per-frame update ----
 
@@ -157,12 +195,21 @@ class SkyTracker:
         self.push_mount(st)
         if new_data and blobs:
             oaz, oalt = self._pose_at(obs_time)                # boresight when the frame was captured
-            pred = self.model.predict(obs_time)                 # where we think the target was then
-            epx, epy = self._dir_to_pixel(pred, oaz, oalt)      # ... projected into that frame
-            best = min(blobs, key=lambda b: math.hypot(b['px'][0] - epx, b['px'][1] - epy))
-            if math.hypot(best['px'][0] - epx, best['px'][1] - epy) <= self.gate_px:
+            if self.single_target:
+                # The feed already reports exactly the target (the extended detector's own present/
+                # compactness made the call), so there's nothing to associate -- just ingest it.
+                best, hit = blobs[0], True
+            else:
+                # Multi-blob feed (e.g. the guide's DoH stars): pick the blob nearest our prediction and
+                # gate it, so a brighter neighbour can't steal the lock.
+                pred = self.model.predict(obs_time)             # where we think the target was then
+                epx, epy = self._dir_to_pixel(pred, oaz, oalt)  # ... projected into that frame
+                best = min(blobs, key=lambda b: math.hypot(b['px'][0] - epx, b['px'][1] - epy))
+                hit = math.hypot(best['px'][0] - epx, best['px'][1] - epy) <= self.gate_px
+            if hit:
                 self.model.ingest(obs_time,
                                   self._pixel_to_dir(best['px'][0], best['px'][1], oaz, oalt))
+                self.last_meas_px = (best['px'][0], best['px'][1])
                 self.good_t = obs_time
                 if self.settled_since is None:
                     self.settled_since = obs_time

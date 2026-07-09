@@ -331,6 +331,9 @@ def main(argv=None):
     layout = {'panel_open': True, 'pip_open': True, 'pip_debug': False, 'panel_w': S(PANEL_W),
               'pip_h': S(200), 'big_role': ROLES[0], '_sig': None}
     boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
+    track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True}   # Tracking panel state; backend defaults
+    sim_ui = {'r0': 0.0}                                  # Simulation panel: global seeing r0 (m); backend default
+    # (per-camera defocus/lens-softness is a sky-cam 'Defocus' control, rendered from backend caps like bin/ROI)
 
     dpg.create_context()
     dpg.set_global_font_scale(ui_scale)   # crisp text at the right size (ImGui 1.92 re-rasterizes)
@@ -435,7 +438,8 @@ def main(argv=None):
                                         format=dpg.mvFormat_Float_rgba, tag=tex)
             det_path = seg[:-len('.ser')] + '.detections.jsonl'
             cam = cams[role] = dict(tex=tex, texver=0, w=w, h=h, fw=fw0, fh=fh0, ox=w / fw0, oy=h / fh0,
-                                    color_id=f.header.color_id, blobs=[], det_idx=-1, last_idx=-1,
+                                    color_id=f.header.color_id, blobs=[], ext=None, status=None,
+                                    det_idx=-1, last_idx=-1,
                                     hist=None, det_tailer=JsonlTailer(det_path), ser_path=seg)
         # segment rollover / source switch -> re-point the detections tailer. det_idx/last_idx are indices
         # into cam['ser_path'], so reset them: index N in the old segment is a different frame than in the new.
@@ -446,6 +450,8 @@ def main(argv=None):
             cam['last_idx'] = cam['det_idx'] = -1
         for rec in cam['det_tailer'].poll():
             cam['blobs'] = rec.get('blobs', [])
+            cam['ext'] = rec.get('ext')                         # extended-detector metrics (or None)
+            cam['status'] = rec.get('status')                   # detector's freeform status line (or None)
             cam['det_idx'] = rec.get('index', cam['det_idx'])   # an index into cam['ser_path'] (== seg)
             if role in perf['det']:                      # a detection record = one frame the detector ran
                 perf['det'][role].hit()
@@ -533,6 +539,18 @@ def main(argv=None):
                           parent=f"L_tb_{name}")
 
     PIP_R = S(15)      # pipper circle radius; a view's centre crosshairs stop here so a centred pipper joins them
+
+    # Overlay colour scheme: RED = tracker inputs / info (reticles, main-cam FoV, the ROI handed to the
+    # detector); GREEN = tracker products (detection boxes, the locked target's CoM, the main-cam AABB);
+    # BLUE = model output (the smooth predicted target). Amber flags a coasting model (no fresh detection).
+    COL_INPUT = (255, 70, 70, 160)          # red
+    COL_MODEL = (90, 160, 255, 220)         # blue
+    COL_COAST = (255, 180, 40, 200)         # amber
+    COL_STATIC = (255, 200, 40, 200)        # yellow: a non-moving detection (potential target)
+
+    def _green(active, a=210):
+        """Detection green: bright when it comes from the active tracking source, dim otherwise."""
+        return (70, 230, 100, a) if active else (46, 122, 74, min(a, 150))
 
     def _draw_pipper(name, tx, ty, col, box):
         """Circle at the target, clamped to stay inside the visible camera view `box` (x0,y0,x1,y1),
@@ -637,17 +655,44 @@ def main(argv=None):
 
         dpg.draw_image(cam['tex'], (offx, offy), (offx + dw, offy + dh), parent=f"L_img_{name}")
 
-        # Detection boxes (green = moving, amber = static; faded if detect lags the shown frame).
-        a = 255 if cam['det_idx'] >= cam['last_idx'] else 70
+        # Tracking state shared by the overlays below.
+        stt = ctrl['state'] or {}
+        tracking = bool(stt.get('tracking'))
+        active_src = stt.get('track_role') if tracking else None   # the cam currently feeding the model
+        this_active = (active_src is None) or (role == active_src)  # bright green unless a *different* cam drives
+
+        # Detection boxes = tracker products: green (moving) / yellow (static) potential targets. Green is
+        # bright for the active tracking source and dim for a cam that's only watching, so you can tell
+        # which camera is driving. Further faded if detection lags the shown frame.
+        a = 210 if cam['det_idx'] >= cam['last_idx'] else 70
         for b in cam['blobs']:
             X, Y = T(b['px'][0], b['px'][1])
             half = max(S(4), b.get('size_px', 4) * cam['ox'] * scale) + S(3)
-            col = (60, 255, 60, a) if b.get('moving') else (255, 200, 40, a)
+            col = _green(this_active, a) if b.get('moving') else (*COL_STATIC[:3], a)
             dpg.draw_rectangle((X - half, Y - half), (X + half, Y + half), color=col,
                                thickness=1.0, parent=f"L_box_{name}")
 
-        # --- Reticles + target pipper (alpha'd red unless noted; all FoV via the pinhole tan-ratio) ---
-        RED = (255, 70, 70, 160)                  # alpha'd red (the default for reticle geometry)
+        # Extended-detector overlay = a tracker product: green AABB + a circle at the CoM when present,
+        # plus the density readout (watch it spike as the target enters/leaves). Bright green when this cam
+        # is the active source, dim when it's only watching; grey when it sees nothing.
+        ext = cam.get('ext')
+        if ext is not None:
+            present = bool(ext.get('present'))
+            gcol = _green(this_active) if present else (120, 128, 138, 130)
+            bb, com = ext.get('bbox'), ext.get('com')
+            if present and bb:
+                bx0, by0 = T(bb[0], bb[1])
+                bx1, by1 = T(bb[0] + bb[2], bb[1] + bb[3])
+                dpg.draw_rectangle((bx0, by0), (bx1, by1), color=gcol, thickness=1.5, parent=f"L_box_{name}")
+                if com:
+                    mx, my = T(com[0], com[1])
+                    dpg.draw_circle((mx, my), S(6), color=gcol, thickness=1.5, parent=f"L_box_{name}")
+            d = ext.get('density') or [0.0, 0.0]
+            dpg.draw_text((S(8), SH - S(38)), f"{'TARGET' if present else 'no target'}  "
+                          f"density {d[0]:.2f} {d[1]:.2f}", size=S(13), color=gcol, parent=f"L_warn_{name}")
+
+        # --- Reticles = tracker inputs/info: crosshairs + main-cam FoV rect (red; FoV via pinhole tan-ratio) ---
+        RED = COL_INPUT                           # alpha'd red (reticle geometry = a tracker input)
         il, ir, it, ib = offx, offx + dw, offy, offy + dh   # image edges (not the letterbox bars)
         bmr = (ctrl['state'] or {}).get('boresight_mrad') or (0.0, 0.0)   # main-vs-guide offset (mrad)
         bore_x_rad, bore_y_rad = bmr[0] * 1e-3, bmr[1] * 1e-3
@@ -696,18 +741,19 @@ def main(argv=None):
                 dpg.draw_line((cx, it), (cx, cy - PIP_R), color=RED, thickness=1.0, parent=f"L_ret_{name}")
                 dpg.draw_line((cx, ib), (cx, cy + PIP_R), color=RED, thickness=1.0, parent=f"L_ret_{name}")
 
-        # Target pipper: green where THIS view is doing the tracking (amber while coasting), red where
-        # the target is tracked via the *other* camera (its direction mapped in via the pinhole tan-ratio).
-        stt = ctrl['state']
-        pip = pcol = None
-        if stt and stt.get('tracking') and stt.get('target_px'):
-            tr = stt.get('track_role')
-            if tr == role:
-                pip = T(stt['target_px'][0], stt['target_px'][1])
-                pcol = (255, 180, 40, 185) if stt.get('mode') == 'coast' else (70, 230, 100, 185)
-            elif tr and tr != role:
+        # Clamp box = the visible camera view (image ∩ pane): letterboxed image zoomed out, the pane zoomed in.
+        box = (max(0.0, il), max(0.0, it), min(float(SW), ir), min(float(SH), ib))
+
+        # BLUE = model prediction (the smooth product of the Ema model): drawn in the active source cam
+        # directly, and mapped via the pinhole tan-ratio into any other cam, so it shows in both views.
+        # Amber while coasting (the model is extrapolating with no fresh detection).
+        mpip = None
+        if tracking and stt.get('target_px'):
+            if active_src == role:
+                mpip = T(stt['target_px'][0], stt['target_px'][1])
+            elif active_src and active_src != role:
                 optx = stt.get('optics') or {}
-                src, sf, mf = cams.get(tr), optx.get(tr), optx.get(role)
+                src, sf, mf = cams.get(active_src), optx.get(active_src), optx.get(role)
                 if src is not None and sf and mf:
                     gtx, gty = stt['target_px'][0] * src['ox'], stt['target_px'][1] * src['oy']
                     sfx = (src['w'] / 2.0) / math.tan(math.radians(sf['fov_x_deg'] / 2.0))
@@ -719,19 +765,27 @@ def main(argv=None):
                     bsign = -1.0 if sf['fov_x_deg'] >= mf['fov_x_deg'] else 1.0
                     mtx = cam['w'] / 2.0 + ((gtx - src['w'] / 2.0) / sfx + bsign * math.tan(bore_x_rad)) * mfx
                     mty = cam['h'] / 2.0 + ((gty - src['h'] / 2.0) / sfy + bsign * math.tan(bore_y_rad)) * mfy
-                    pip, pcol = (offx + mtx * scale, offy + mty * scale), (255, 80, 80, 195)
-        if pip is not None:
-            # Clamp box = the visible camera view (image ∩ pane): the letterboxed image when zoomed
-            # out, the pane itself when zoomed in past fit.
-            box = (max(0.0, il), max(0.0, it), min(float(SW), ir), min(float(SH), ib))
-            _draw_pipper(name, pip[0], pip[1], pcol, box)
+                    mpip = (offx + mtx * scale, offy + mty * scale)
+        if mpip is not None:
+            _draw_pipper(name, mpip[0], mpip[1], COL_COAST if stt.get('mode') == 'coast' else COL_MODEL, box)
 
-        # Tracker ROI: the detect search window around the predicted target, drawn in the tracked view.
-        if stt and stt.get('track_roi') and stt.get('track_role') == role:
-            rcx, rcy, rsz = stt['track_roi']
+        # GREEN = the raw detection this instant (jumpier than the model): a bright circle at where the
+        # active source's detector actually put the locked target -- only in that source cam.
+        if tracking and active_src == role and stt.get('detect_px'):
+            dcx, dcy = T(stt['detect_px'][0], stt['detect_px'][1])
+            dcx = min(max(dcx, box[0] + PIP_R), max(box[0] + PIP_R, box[2] - PIP_R))
+            dcy = min(max(dcy, box[1] + PIP_R), max(box[1] + PIP_R, box[3] - PIP_R))
+            dpg.draw_circle((dcx, dcy), PIP_R * 0.72, color=_green(True), thickness=1.6, parent=f"L_trk_{name}")
+
+        # Tracker ROI = an input we hand the detector (search window around the prediction): red. The
+        # active source draws it solid; a fallback cam (guide still ROI-tracking while main drives) dims it.
+        roi = (stt.get('track_roi') or {}).get(role)
+        if roi:
+            rcx, rcy, rsz = roi
             x0, y0 = T(rcx - rsz / 2.0, rcy - rsz / 2.0)
             x1, y1 = T(rcx + rsz / 2.0, rcy + rsz / 2.0)
-            dpg.draw_rectangle((x0, y0), (x1, y1), color=(70, 230, 100, 150), thickness=1.0, parent=f"L_box_{name}")
+            col = COL_INPUT if role == active_src else (*COL_INPUT[:3], 80)
+            dpg.draw_rectangle((x0, y0), (x1, y1), color=col, thickness=1.0, parent=f"L_box_{name}")
 
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
         if dw > SW + 1:
@@ -1079,6 +1133,9 @@ def main(argv=None):
             'cameras': {role: dpg.get_value(f"src_{role}")
                         for role in roles if dpg.does_item_exist(f"src_{role}")},
             'boresight': [boresight_ui['x'], boresight_ui['y']],
+            'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
+                         'auto_switch': track_ui['auto_switch']},
+            'sim': {'r0': sim_ui['r0']},                # per-camera defocus rides with the cam caps, not here
         }
 
     def apply_settings(data):
@@ -1120,6 +1177,20 @@ def main(argv=None):
         if b and len(b) >= 2:
             _bore_set(b[0], b[1])                       # updates the widgets + pushes to the backend
             ctrl['bore_init'] = True                    # ...and don't let the state-init clobber it
+        trk = data.get('tracking') or {}
+        if 'smoothing' in trk and dpg.does_item_exist('track_smooth'):
+            dpg.set_value('track_smooth', f"{float(trk['smoothing']):g}")
+            _track_smoothing_input()                    # clamp + push to the backend
+        if trk.get('pref') in ('guide', 'main', 'auto'):
+            _set_track_pref(trk['pref'])                # push to the backend + reflect on the radio
+        if 'auto_switch' in trk:
+            track_ui['auto_switch'] = bool(trk['auto_switch'])
+            if dpg.does_item_exist('auto_switch_chk'):
+                dpg.set_value('auto_switch_chk', track_ui['auto_switch'])
+        sim = data.get('sim') or {}
+        if 'r0' in sim and dpg.does_item_exist('sim_r0'):
+            dpg.set_value('sim_r0', f"{float(sim['r0']):g}")
+            _sim_render_input()                         # clamp + push to the backend
 
     def _settings_refresh(select=None):
         dpg.configure_item('settings_combo', items=settings_store.list_settings())
@@ -1166,6 +1237,46 @@ def main(argv=None):
             except (ValueError, TypeError):
                 return cur
         _bore_set(_f('bore_x', boresight_ui['x']), _f('bore_y', boresight_ui['y']))
+
+    def _flt(tag, fallback):
+        try:
+            return float(dpg.get_value(tag))
+        except (ValueError, TypeError):
+            return fallback
+
+    def _track_smoothing_input(send=True):
+        track_ui['smoothing'] = max(0.0, _flt('track_smooth', track_ui['smoothing']))
+        if dpg.does_item_exist('track_smooth'):
+            dpg.set_value('track_smooth', f"{track_ui['smoothing']:g}")
+        if send:
+            _send({'type': 'set_track_smoothing', 'value': track_ui['smoothing']})
+
+    _TRACK_PREFS = (('guide', 'Guide'), ('main', 'Main'), ('auto', 'Auto'))
+
+    def _set_track_pref(val):
+        track_ui['pref'] = val
+        _send({'type': 'set_track_pref', 'pref': val})
+
+    def _refresh_track_pref():
+        """Reflect the backend's track-source preference on the radio buttons, and grey out a camera
+        that isn't connected (Auto stays available; it degrades to guide-only when there's no main)."""
+        st = ctrl['state'] or {}
+        cap = st.get('capturing') or {}
+        det = set(st.get('detect_roles') or [])
+        cur = st.get('track_pref') or track_ui['pref']
+        avail = {'guide': bool(cap.get('guide')), 'main': bool(cap.get('main')) and 'main' in det, 'auto': True}
+        for val, lbl in _TRACK_PREFS:
+            tag = f"trk_pref_{val}"
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, label=('* ' + lbl) if cur == val else ('  ' + lbl),
+                                   enabled=avail.get(val, True))
+
+    def _sim_render_input(send=True):
+        sim_ui['r0'] = max(0.0, _flt('sim_r0', sim_ui['r0']))
+        if dpg.does_item_exist('sim_r0'):
+            dpg.set_value('sim_r0', f"{sim_ui['r0']:g}")
+        if send:
+            _send({'type': 'set_sky_render', 'r0_m': sim_ui['r0']})
 
     _READOUT = (205, 210, 222)                            # one consistent tone for the numeric readouts
     mono_font = None                                      # monospace, so the aligned readouts actually line up
@@ -1215,8 +1326,16 @@ def main(argv=None):
             dpg.add_button(label="Resume Following", tag="resume_btn", width=S(200),
                            callback=lambda: _send({'type': 'follow', 'on': True}))
             _tip("Resume slewing the mount to hold the locked target (undo Stop Moving).")
-        with dpg.tree_node(label="Simulation"):     # (planned) time/location for sim + target overlays
-            dpg.add_text("planned: set the sim's time & location; target overlays",
+        with dpg.tree_node(label="Simulation", default_open=True):   # sim-truth render knobs (+ planned time/location/overlays)
+            with dpg.group(horizontal=True):
+                _slbl = dpg.add_text("Seeing r0:")
+                dpg.add_input_text(tag='sim_r0', width=S(56), on_enter=True,
+                                   default_value=f"{sim_ui['r0']:g}", callback=lambda *_: _sim_render_input())
+                dpg.add_text("m", color=(140, 145, 160))
+            _tip("Atmospheric seeing as the Fried parameter r0 (m): bigger = steadier air. 0 = off; "
+                 "~0.05 poor, ~0.2 excellent. One sky, so it blurs all sim cameras (FWHM ~ 0.98*lambda/r0). "
+                 "Per-camera lens softness is the Defocus knob in each camera's settings.", item=_slbl)
+            dpg.add_text("planned: sim time & location; target overlays",
                          color=(120, 125, 140), wrap=S(230))
         with dpg.tree_node(label="Cameras", default_open=True):
             dpg.add_button(label="Rescan", callback=lambda: _send({'type': 'rescan_cameras'}))
@@ -1270,6 +1389,19 @@ def main(argv=None):
         with dpg.tree_node(label="Focus"):          # (planned) focus assist
             dpg.add_text("planned: focus assist", color=(120, 125, 140), wrap=S(230))
         with dpg.tree_node(label="Tracking"):
+            with dpg.group(horizontal=True):
+                _tlbl = dpg.add_text("Track:")
+                for _val, _lbl in _TRACK_PREFS:
+                    dpg.add_button(tag=f"trk_pref_{_val}", label='  ' + _lbl, width=S(56), user_data=_val,
+                                   callback=lambda _s, _a, u: _set_track_pref(u))
+            _tip("Which camera drives tracking: Guide only, the Main cam, or Auto (acquire on the guide, "
+                 "hand off to the main once it locks). A camera that isn't connected is greyed out.",
+                 item=_tlbl)
+            dpg.add_checkbox(label="Auto switch to main pane", tag="auto_switch_chk",
+                             default_value=track_ui['auto_switch'],
+                             callback=lambda _s, a: track_ui.__setitem__('auto_switch', a))
+            _tip("When tracking hands off between cameras, bring the newly-active camera into the main "
+                 "pane (as if you'd pressed its ^ button).")
             dpg.add_checkbox(label="Follow target", tag="follow_chk",
                              callback=lambda _s, a: _send({'type': 'follow', 'on': a}))
             _tip("When locked, slew the mount to keep the target on the boresight. Uncheck to hold the "
@@ -1277,6 +1409,15 @@ def main(argv=None):
             dpg.add_button(label="Unlock", tag="unlock_btn", width=S(200),
                            callback=lambda: _send({'type': 'untrack'}))
             _tip("Drop the target lock entirely and halt the mount.")
+            with dpg.group(horizontal=True):
+                _rlbl = dpg.add_text("Rate smoothing:")
+                dpg.add_input_text(tag='track_smooth', width=S(48), on_enter=True,
+                                   default_value=f"{track_ui['smoothing']:g}",
+                                   callback=lambda *_: _track_smoothing_input())
+                dpg.add_text("s", color=(140, 145, 160))
+            _tip("EMA time constant for the target's angular-velocity estimate. Bigger = smoother "
+                 "(rides out sub-pixel detection jitter) but laggier on real acceleration; smaller = "
+                 "snappier but noisier. Applies live and to the next lock.", item=_rlbl)
         with dpg.tree_node(label="Settings"):
             dpg.add_combo(settings_store.list_settings(), tag='settings_combo', width=-1)
             _tip("A saved settings file captures the layout, display prefs, optics + owned gear, cameras, "
@@ -1297,16 +1438,23 @@ def main(argv=None):
 
     def _perf_text():
         spin = "|/-\\"[perf['frame'] % 4]                 # advances every GUI frame -> a live "alive" spinner
-        def row(pre, label, val, unit):                   # pre = spinner (GUI) or a space, so columns align
-            return f"{pre} {label:>9}: {val:5.1f} {unit}"
-        lines = [row(spin, 'GUI', perf['gui'].rate, 'fps')]
+        def row(pre, label, val):                         # pre = spinner (GUI) or a space, so the fps align
+            return f"{pre} {label:>14}: {val:5.1f} fps"
+        st = ctrl['state'] or {}
+        det_roles = st.get('detect_roles') or []
+        lines = [row(spin, 'GUI', perf['gui'].rate)]      # aligned rate block
         for r in roles:
-            lines.append(row(' ', r.capitalize() + ' Cam', perf['cam'][r].rate, 'fps'))
-        lines.append(row(' ', 'Mount', perf['mount'].rate, 'fps'))
-        dr = roles[0]                                     # the detector runs on the guide by default
-        cam_fps, det_fps = perf['cam'][dr].rate, perf['det'][dr].rate
-        skips = 0.0 if cam_fps < 1e-6 else max(0.0, 100.0 * (1.0 - det_fps / cam_fps))
-        lines.append(row(' ', 'Tracker', skips, '% skips'))
+            lines.append(row(' ', r.capitalize() + ' Camera', perf['cam'][r].rate))
+        lines.append(row(' ', 'Mount', perf['mount'].rate))
+        for r in det_roles:
+            lines.append(row(' ', r.capitalize() + ' Detector', perf['det'][r].rate if r in perf['det'] else 0.0))
+        # Freeform status lines below -- their own thing, so NOT aligned to the fps columns.
+        for r in det_roles:
+            s = (cams.get(r) or {}).get('status')
+            if s:
+                lines.append(f"{r.capitalize()} Detector: {s}")
+        if st.get('status'):
+            lines.append(f"Backend: {st['status']}")
         return "\n".join(lines)
 
     def update_control():
@@ -1338,6 +1486,16 @@ def main(argv=None):
                 ctrl['state'] = rec
                 perf['mount'].hit()                       # each state record = one mount/backend update
         st = ctrl['state']
+        _refresh_track_pref()                           # reflect + grey the track-source radio
+        # Auto-switch the main pane to follow the active tracking source (as if its ^ button were pressed):
+        # only when the *previously* active cam is the one currently in the big pane, so manual choices hold.
+        tr = (st or {}).get('track_role')
+        prev = ctrl.get('prev_track_role')
+        if (tr and prev and tr != prev and track_ui['auto_switch']
+                and layout['big_role'] == prev and tr in roles):
+            layout['big_role'] = tr
+            layout['_sig'] = None                       # force a relayout next frame
+        ctrl['prev_track_role'] = tr
         rec_st = (st or {}).get('recording') or {}     # per-role: {role: bool}
         cap_st = (st or {}).get('capturing') or {}
         src_st = (st or {}).get('sources') or {}
