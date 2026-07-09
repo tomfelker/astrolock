@@ -48,9 +48,12 @@ class _Meter:
         self._n = 0
         self._t = None
         self.rate = 0.0
+        self.spin = 0        # advances once per real update (n>0) -> a per-meter spinner that FREEZES when
 
-    def hit(self, n=1):
+    def hit(self, n=1):      # the thing stops producing, even while `rate` still reads its last (stale) value
         self._n += n
+        if n:
+            self.spin += 1
 
     def sample(self, now):
         if self._t is None:
@@ -322,7 +325,7 @@ def main(argv=None):
     roles = ([r.strip() for r in args.roles.split(',') if r.strip()] if args.roles else list(ROLES))
     followers = {}
     cams = {}                 # role -> live camera data (texture + frames + detections); lazily created
-    perf = {'gui': _Meter(), 'mount': _Meter(), 'frame': 0,       # GUI loop rate + spinner; mount state rate
+    perf = {'gui': _Meter(), 'mount': _Meter(), 'focus': _Meter(), 'frame': 0,   # GUI/mount/focus rates
             'cam': {r: _Meter() for r in roles},                  # per-role frames *produced* / s
             'det': {r: _Meter() for r in roles},                  # per-role detector frames processed / s
             'idx': {}}                                            # role -> last committed frame index seen
@@ -334,6 +337,12 @@ def main(argv=None):
     track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True}   # Tracking panel state; backend defaults
     sim_ui = {'r0': 0.0}                                  # Simulation panel: global seeing r0 (m); backend default
     # (per-camera defocus/lens-softness is a sky-cam 'Defocus' control, rendered from backend caps like bin/ROI)
+    # Focus tab: which cam to focus, whether we want it running (drives the big-pane star view), and the
+    # rolling metric series tailed from <role>_focus.frames.jsonl for the graphs.
+    focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'path': None, 'tailer': None,
+                't0': None, 'com_mult': 10.0,             # collimation-trail exaggeration on the star view
+                'series': {k: [] for k in ('t', 'peak', 'dx', 'dy')}}   # peak -> pane graph; dx/dy -> star trail
+    FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
     dpg.create_context()
     dpg.set_global_font_scale(ui_scale)   # crisp text at the right size (ImGui 1.92 re-rasterizes)
@@ -360,27 +369,57 @@ def main(argv=None):
             return False
         return rmin[0] <= mx <= rmin[0] + rsz[0] and rmin[1] <= my <= rmin[1] + rsz[1]
 
-    def _other(role):
-        return ROLES[1] if role == ROLES[0] else ROLES[0]
-
-    def _slot_role(name):
-        return layout['big_role'] if name == 'big' else _other(layout['big_role'])
+    MAXPIP = 4          # pool of PIP panes along the bottom; each shows a stream not in the big pane
 
     def _slot_stream(name):
-        """The stream a slot DISPLAYS -- normally its role, but with Dbg on the pip shows the big pane's
-        detector debug surface (<role>_debug.ser, written when the backend has --debug-detect-ser). Only
-        the display + follower path uses this; toolbar/target-pick actions keep the real role."""
-        if name == 'pipother' and layout.get('pip_debug'):
-            return layout['big_role'] + '_debug'
-        return _slot_role(name)
+        """The stream a slot DISPLAYS. The big pane shows `big_stream` when set (the focus star, or a
+        stream promoted with ^), else its role; each PIP shows one entry of the live pip map (built in
+        relayout). Only the display + follower path uses this; target-pick/zoom resolve the role below."""
+        if name == 'big':
+            return layout.get('big_stream') or layout['big_role']
+        return (layout.get('pip_map') or {}).get(name) or layout['big_role']
+
+    def _slot_role(name):
+        """The underlying CAMERA role a slot acts on (target-pick, zoom key): the shown stream with any
+        _focus/_debug suffix stripped."""
+        s = _slot_stream(name)
+        for suf in ('_focus', '_debug'):
+            if s.endswith(suf):
+                return s[:-len(suf)]
+        return s
+
+    def _promote(stream):
+        """'^' on a PIP: make its stream the big pane. A plain camera role becomes a normal big-role view
+        (so Swap / auto-switch / persistence keep working); a derived stream (focus/debug) rides big_stream."""
+        if stream in roles:
+            layout['big_role'], layout['big_stream'] = stream, None
+        else:
+            layout['big_stream'] = stream
+        layout['_sig'] = None
 
     def _toggle_dbg():
         layout['pip_debug'] = not layout['pip_debug']
         if layout['pip_debug']:
             layout['pip_open'] = True                    # no point showing the debug surface with the pip hidden
 
+    def _pip_streams():
+        """Ordered streams to show as PIPs: every connected camera, plus the focus star (if running) and
+        the big pane's detector debug surface (if Dbg on), MINUS whatever the big pane already shows."""
+        cap = (ctrl['state'] or {}).get('capturing') or {}
+        streams = [r for r in roles if cap.get(r)]
+        if focus_ui['want']:
+            fs = focus_ui['role'] + '_focus'
+            if fs not in streams:
+                streams.append(fs)
+        if layout.get('pip_debug'):
+            dbg = layout['big_role'] + '_debug'
+            if dbg not in streams:
+                streams.append(dbg)
+        big = _slot_stream('big')
+        return [s for s in streams if s != big][:MAXPIP]
+
     def _active_slots():
-        return ['big'] + (['pipother'] if layout['pip_open'] else [])
+        return ['big'] + ((layout.get('pip_slots') or []) if layout['pip_open'] else [])
 
     def _zoom_step(role, delta):
         s = view_settings.setdefault(role, _default_settings())
@@ -511,12 +550,12 @@ def main(argv=None):
             return [('Panel', lambda: layout.__setitem__('panel_open', not layout['panel_open'])),
                     ('PIP',   lambda: layout.__setitem__('pip_open', not layout['pip_open'])),
                     ('Dbg',   _toggle_dbg),               # pip shows this pane's detector surface
-                    ('-',     lambda: _zoom_step(_slot_role('big'), -1)),
-                    ('+',     lambda: _zoom_step(_slot_role('big'), +1))]
-        # PIP panes: '^' promotes this pane to the main view (each PIP has its own, vs one global Swap).
-        return [('^', lambda n=name: layout.__setitem__('big_role', _slot_role(n))),
-                ('-',    lambda n=name: _zoom_step(_slot_role(n), -1)),
-                ('+',    lambda n=name: _zoom_step(_slot_role(n), +1))]
+                    ('-',     lambda: _zoom_step(_slot_stream('big'), -1)),   # zoom what's shown (focus star too)
+                    ('+',     lambda: _zoom_step(_slot_stream('big'), +1))]
+        # PIP panes: '^' promotes this pane's stream to the main view; zoom targets the shown stream.
+        return [('^', lambda n=name: _promote(_slot_stream(n))),
+                ('-',    lambda n=name: _zoom_step(_slot_stream(n), -1)),
+                ('+',    lambda n=name: _zoom_step(_slot_stream(n), +1))]
 
     def _toolbar_layout(name):
         """[(label, (x0,y0,x1,y1) in drawlist coords, action), ...] laid left-to-right from top-left."""
@@ -600,7 +639,8 @@ def main(argv=None):
         dpg.add_button(tag="hsplitter_btn", label="", width=S(40), height=S(6))
     dpg.bind_item_theme("hsplitter", splitter_win_theme)
     dpg.bind_item_theme("hsplitter_btn", splitter_theme)
-    make_slot('pipother')
+    for _i in range(MAXPIP):           # a pool of PIP panes; relayout shows/positions as many as needed
+        make_slot(f'pip{_i}')
     # Vertical divider between the big+PIP column and the right panel (drag to resize the panel).
     with dpg.window(tag="splitter", no_title_bar=True, no_move=True, no_resize=True,
                     no_scrollbar=True, no_collapse=True, no_bring_to_front_on_focus=True):
@@ -787,6 +827,40 @@ def main(argv=None):
             col = COL_INPUT if role == active_src else (*COL_INPUT[:3], 80)
             dpg.draw_rectangle((x0, y0), (x1, y1), color=col, thickness=1.0, parent=f"L_box_{name}")
 
+        # Focus overlays (focus stream only): a focus-quality graph (peak vs time) in the lower-right, and
+        # a collimation trail (the last ~10 EMA CoM offsets, exaggerated) on the star -- faint (old) ->
+        # bright (new). A collimated star's trail clusters on the centre tick; a miscollimated one drifts.
+        if role.endswith('_focus') and role == focus_ui['role'] + '_focus':
+            sc = focus_ui['series']
+            pk = sc['peak']
+            if len(pk) >= 2:
+                GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
+                gx1, gy1 = SW - mgn, SH - mgn
+                gx0, gy0 = gx1 - GW, gy1 - GH
+                dpg.draw_rectangle((gx0 - S(4), gy0 - S(4)), (gx1 + S(4), gy1 + S(4)),
+                                   color=(0, 0, 0, 150), fill=(0, 0, 0, 150), parent=f"L_hist_{name}")
+                hi = max(pk) or 1.0                        # anchor 0..max so the absolute peak level reads
+                n = len(pk)
+                pts = [(gx0 + GW * i / (n - 1), gy1 - GH * (v / hi)) for i, v in enumerate(pk)]
+                dpg.draw_polyline(pts, color=(120, 220, 255, 235), thickness=1.4, parent=f"L_hist_{name}")
+                dpg.draw_rectangle((gx0, gy0), (gx1, gy1), color=(150, 155, 172, 170), thickness=1.0,
+                                   parent=f"L_hist_{name}")
+                dpg.draw_text((gx0, gy0 - S(16)), f"focus peak {pk[-1]:.3f}", size=S(12),
+                              color=(180, 205, 235, 235), parent=f"L_hist_{name}")
+            npts = len(sc['dx'])
+            if npts:
+                mult = focus_ui['com_mult']
+                ctr = cam['fw'] / 2.0                     # crop centre in frame px (mono crop, ox == 1)
+                cgx, cgy = T(ctr, ctr)
+                dpg.draw_line((cgx - S(6), cgy), (cgx + S(6), cgy), color=(120, 128, 138, 150), parent=f"L_ret_{name}")
+                dpg.draw_line((cgx, cgy - S(6)), (cgx, cgy + S(6)), color=(120, 128, 138, 150), parent=f"L_ret_{name}")
+                k = min(10, npts)
+                for j in range(npts - k, npts):
+                    a = 0.5 + 0.5 * (j - (npts - k)) / max(1, k - 1)    # 0.5 (oldest) -> 1.0 (newest)
+                    X, Y = T(ctr + sc['dx'][j] * mult, ctr + sc['dy'][j] * mult)
+                    col = (90, 230, 220, int(255 * a))
+                    dpg.draw_circle((X, Y), S(3), color=col, fill=col, parent=f"L_trk_{name}")
+
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
         if dw > SW + 1:
             for ex, sx in ((-1, S(12)), (1, SW - S(12))):
@@ -852,12 +926,16 @@ def main(argv=None):
                 action()
                 return
         role = _slot_role(name)
+        if _slot_stream(name) != role:                     # a derived stream (focus star / debug): not a picker
+            return
         if role in roles and not bool((ctrl['state'] or {}).get('capturing', {}).get(role)):
             _toggle_connect(role)                          # disconnected pane body -> "Click to connect"
             return
         cam = cams.get(role)
         if cam is None:
             return
+        if (ctrl['state'] or {}).get('tracking'):          # already locked -> a pane click doesn't re-target
+            return                                          # (right-click to unlock first, then pick a new one)
         SW, SH = rsz
         w, h = cam['w'], cam['h']
         scale = _floor_pow2(min(SW / w, SH / h) * 0.95) * view_settings.setdefault(role, _default_settings())['zoom']
@@ -1278,6 +1356,91 @@ def main(argv=None):
         if send:
             _send({'type': 'set_sky_render', 'r0_m': sim_ui['r0']})
 
+    # ---- Focus tab: start/stop the focus process + tail its metrics into the graphs ------------
+    def _focus_reset_series():
+        for k in focus_ui['series']:
+            focus_ui['series'][k] = []
+        focus_ui['t0'] = None
+        if focus_ui['tailer'] is not None:
+            focus_ui['tailer'].close()
+        focus_ui['tailer'], focus_ui['path'] = None, None
+
+    def _focus_com_mult_input():
+        focus_ui['com_mult'] = max(1.0, _flt('focus_com_mult', focus_ui['com_mult']))
+        if dpg.does_item_exist('focus_com_mult'):
+            dpg.set_value('focus_com_mult', f"{focus_ui['com_mult']:g}")
+
+    def _focus_start(role):
+        """Point the big pane at this cam's star stream and (re)launch the focus process on it."""
+        _focus_reset_series()
+        focus_ui['role'], focus_ui['want'] = role, True
+        layout['big_stream'] = role + '_focus'            # big pane shows the star; the cams drop to PIPs
+        layout['big_role'] = role
+        layout['_sig'] = None
+        _send({'type': 'focus', 'on': True, 'role': role})
+
+    def _focus_stop():
+        focus_ui['want'] = False
+        if (layout.get('big_stream') or '').endswith('_focus'):
+            layout['big_stream'] = None                   # drop the star view (unless it was moved to a PIP)
+        layout['_sig'] = None
+        _send({'type': 'focus', 'on': False})
+
+    def _set_focus_role(role):
+        if role == focus_ui['role'] and focus_ui['want']:
+            return
+        if focus_ui['want']:
+            _focus_start(role)                            # live-switch the running focus to the other cam
+        else:
+            focus_ui['role'] = role                       # just remember the selection until Start
+
+    def _toggle_focus():
+        _focus_stop() if focus_ui['want'] else _focus_start(focus_ui['role'])
+
+    def _refresh_focus():
+        """Reflect the focus selection on the Camera radio (greying a disconnected cam) and the Start/Stop
+        button label. The big-pane view follows our own 'want' intent, not the backend, so a click reacts
+        instantly (the star .ser shows up a beat later)."""
+        cap = (ctrl['state'] or {}).get('capturing') or {}
+        for r in roles:
+            tag = f"focus_role_{r}"
+            if dpg.does_item_exist(tag):
+                sel = focus_ui['role'] == r
+                dpg.configure_item(tag, label=('* ' + r.capitalize()) if sel else ('  ' + r.capitalize()),
+                                   enabled=bool(cap.get(r)))
+        if dpg.does_item_exist('focus_toggle'):
+            dpg.configure_item('focus_toggle', label='Stop Focus' if focus_ui['want'] else 'Start Focus')
+
+    def _poll_focus_metrics():
+        """Tail <role>_focus.frames.jsonl (the focus process's metric spine) into the rolling series that
+        feed the on-pane focus graph (peak) + collimation trail (dx/dy). Rolls to a newer segment's file."""
+        if not focus_ui['want']:
+            return
+        p = _newest(args.session, f"_{focus_ui['role']}_focus.frames.jsonl")
+        if p and p != focus_ui['path']:                   # first file, or a new segment
+            if focus_ui['tailer'] is not None:
+                focus_ui['tailer'].close()
+            focus_ui['tailer'] = JsonlTailer(p)
+            focus_ui['path'] = p
+        if focus_ui['tailer'] is None:
+            return
+        s = focus_ui['series']
+        for rec in focus_ui['tailer'].poll():
+            t = rec.get('t_mono_ns')
+            if t is None:
+                continue
+            if focus_ui['t0'] is None:
+                focus_ui['t0'] = t * 1e-9
+            s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
+            s['peak'].append(rec.get('peak', 0.0))
+            com = rec.get('com') or [0.0, 0.0]
+            s['dx'].append(com[0])
+            s['dy'].append(com[1])
+            perf['focus'].hit()                            # one metric record = one focus frame produced
+        for k in s:                                       # keep only the last FOCUS_MAX points
+            if len(s[k]) > FOCUS_MAX:
+                del s[k][:len(s[k]) - FOCUS_MAX]
+
     _READOUT = (205, 210, 222)                            # one consistent tone for the numeric readouts
     mono_font = None                                      # monospace, so the aligned readouts actually line up
     _mono_path = "C:/Windows/Fonts/consola.ttf"
@@ -1386,8 +1549,32 @@ def main(argv=None):
                         else:
                             dpg.add_button(label=lbl, width=S(30), user_data=(dx, dy),
                                            callback=lambda _s, _a, u: _bore_nudge(u[0], u[1]))
-        with dpg.tree_node(label="Focus"):          # (planned) focus assist
-            dpg.add_text("planned: focus assist", color=(120, 125, 140), wrap=S(230))
+        with dpg.tree_node(label="Focus"):          # focus + collimation assist (see astrolock.seeker.focus)
+            with dpg.group(horizontal=True):
+                _flbl = dpg.add_text("Camera:")
+                for _r in roles:
+                    dpg.add_button(tag=f"focus_role_{_r}", label='  ' + _r.capitalize(), width=S(56),
+                                   user_data=_r, callback=lambda _s, _a, u: _set_focus_role(u))
+            _tip("Which camera to focus/collimate. Switching while running moves the helper to that cam. "
+                 "A camera that isn't connected is greyed out.", item=_flbl)
+            dpg.add_button(label="Start Focus", tag="focus_toggle", width=S(200),
+                           callback=lambda: _toggle_focus())
+            _tip("Start/stop the focus helper. It locks the brightest star, averages it (EMA), and shows "
+                 "that lucky star in the main pane; the collimation trail is drawn on it and the graph "
+                 "below tracks focus quality. Slowly sweep focus and maximize the peaks. Saturated cores "
+                 "FLASH (their peak reading can't be trusted -- reduce exposure/gain).")
+            with dpg.group(horizontal=True):
+                _cml = dpg.add_text("Collimation ×:")
+                dpg.add_input_text(tag='focus_com_mult', width=S(48), on_enter=True,
+                                   default_value=f"{focus_ui['com_mult']:g}",
+                                   callback=lambda *_: _focus_com_mult_input())
+            _tip("Exaggeration for the collimation (CoM-offset) trail drawn on the star view -- higher "
+                 "magnifies smaller miscollimation. The last ~10 measurements are drawn, faint→bright.",
+                 item=_cml)
+            dpg.add_text("The focus-quality graph + collimation trail draw on the star (main pane).",
+                         color=(120, 125, 140), wrap=S(230))
+            dpg.add_text("planned: graph vs focuser position (electronic focuser)",
+                         color=(120, 125, 140), wrap=S(230))
         with dpg.tree_node(label="Tracking"):
             with dpg.group(horizontal=True):
                 _tlbl = dpg.add_text("Track:")
@@ -1437,17 +1624,21 @@ def main(argv=None):
             dpg.bind_item_font(_t, mono_font)
 
     def _perf_text():
-        spin = "|/-\\"[perf['frame'] % 4]                 # advances every GUI frame -> a live "alive" spinner
-        def row(pre, label, val):                         # pre = spinner (GUI) or a space, so the fps align
-            return f"{pre} {label:>14}: {val:5.1f} fps"
+        # One spinner PER meter, in place of the colon -- it advances only when that meter gets a real
+        # frame, so a stalled source freezes its spinner even though its (stale) fps number stays high.
+        def row(meter, label):
+            return f"{label:>14} {'|/-\\'[meter.spin % 4]} {meter.rate:5.1f} fps"
         st = ctrl['state'] or {}
         det_roles = st.get('detect_roles') or []
-        lines = [row(spin, 'GUI', perf['gui'].rate)]      # aligned rate block
+        lines = [row(perf['gui'], 'GUI')]                 # aligned rate block
         for r in roles:
-            lines.append(row(' ', r.capitalize() + ' Camera', perf['cam'][r].rate))
-        lines.append(row(' ', 'Mount', perf['mount'].rate))
+            lines.append(row(perf['cam'][r], r.capitalize() + ' Camera'))
+        lines.append(row(perf['mount'], 'Mount'))
         for r in det_roles:
-            lines.append(row(' ', r.capitalize() + ' Detector', perf['det'][r].rate if r in perf['det'] else 0.0))
+            if r in perf['det']:
+                lines.append(row(perf['det'][r], r.capitalize() + ' Detector'))
+        if focus_ui['want']:
+            lines.append(row(perf['focus'], 'Focus'))
         # Freeform status lines below -- their own thing, so NOT aligned to the fps columns.
         for r in det_roles:
             s = (cams.get(r) or {}).get('status')
@@ -1463,7 +1654,7 @@ def main(argv=None):
         perf['frame'] += 1
         perf['gui'].hit()
         now = time.perf_counter()
-        for _m in (perf['gui'], perf['mount'], *perf['cam'].values(), *perf['det'].values()):
+        for _m in (perf['gui'], perf['mount'], perf['focus'], *perf['cam'].values(), *perf['det'].values()):
             _m.sample(now)
         if dpg.does_item_exist('perf_txt'):
             dpg.set_value('perf_txt', _perf_text())
@@ -1487,6 +1678,8 @@ def main(argv=None):
                 perf['mount'].hit()                       # each state record = one mount/backend update
         st = ctrl['state']
         _refresh_track_pref()                           # reflect + grey the track-source radio
+        _refresh_focus()                                # reflect + grey the focus-source radio + Start/Stop
+        _poll_focus_metrics()                           # tail focus metrics into the graphs
         # Auto-switch the main pane to follow the active tracking source (as if its ^ button were pressed):
         # only when the *previously* active cam is the one currently in the big pane, so manual choices hold.
         tr = (st or {}).get('track_role')
@@ -1665,10 +1858,16 @@ def main(argv=None):
         bm = S(6)                                    # bottom margin: keep panes off the viewport edge
         pw = layout['panel_w'] if layout['panel_open'] else 0
         vsp = S(6) if layout['panel_open'] else 0
-        hsp = S(6) if layout['pip_open'] else 0
         usable_h = vh - bm
         left_w = max(S(120), vw - pw - vsp)
-        ph = layout['pip_h'] if layout['pip_open'] else 0
+        # The PIP strip shows every stream not in the big pane, one pane each. No such streams -> no strip
+        # (the big pane takes the whole left column). The map/slots are consumed by _slot_stream/_active_slots.
+        pip_names = _pip_streams() if layout['pip_open'] else []
+        layout['pip_slots'] = [f"pip{i}" for i in range(len(pip_names))]
+        layout['pip_map'] = {f"pip{i}": s for i, s in enumerate(pip_names)}
+        strip = bool(pip_names)
+        hsp = S(6) if strip else 0
+        ph = layout['pip_h'] if strip else 0
         ph = max(0, min(ph, usable_h - hsp - S(200)))   # keep the big pane >= ~200 tall
         big_h = usable_h - hsp - ph                      # big_h + hsp + ph == usable_h (== vh - bm)
         # Inset the drawlists a few px inside their windows: a dpg window's content region can be a
@@ -1676,17 +1875,27 @@ def main(argv=None):
         inx, iny = S(4), S(6)
         dpg.configure_item("slot_big", pos=(0, 0), width=left_w, height=big_h)
         dpg.configure_item("dl_big", width=max(S(40), left_w - inx), height=max(S(40), big_h - iny))
-        if layout['pip_open'] and ph > S(20):
-            pipw = max(S(80), min(left_w, int(ph * 16 / 9)))
+        if strip and ph > S(20):
             # Full-width divider (spans the whole left column, up to the vertical splitter). The 6px
-            # window no longer overflows now that WindowMinSize is tiny, so it doesn't cover the PIP.
+            # window no longer overflows now that WindowMinSize is tiny, so it doesn't cover the PIPs.
             dpg.configure_item("hsplitter", show=True, pos=(0, big_h), width=left_w, height=hsp)
             dpg.configure_item("hsplitter_btn", width=left_w, height=hsp)
-            dpg.configure_item("slot_pipother", show=True, pos=(0, big_h + hsp), width=pipw, height=ph)
-            dpg.configure_item("dl_pipother", width=max(S(40), pipw - inx), height=max(S(40), ph - iny))
+            n = len(pip_names)
+            gap = S(4)
+            col_w = (left_w - gap * (n - 1)) / n         # equal columns across the strip
+            for i in range(MAXPIP):
+                nm = f"pip{i}"
+                if i < n:
+                    x = round(i * (col_w + gap))
+                    w = round(col_w) if i < n - 1 else left_w - x    # last pane absorbs the rounding remainder
+                    dpg.configure_item(f"slot_{nm}", show=True, pos=(x, big_h + hsp), width=w, height=ph)
+                    dpg.configure_item(f"dl_{nm}", width=max(S(40), w - inx), height=max(S(40), ph - iny))
+                else:
+                    dpg.configure_item(f"slot_{nm}", show=False)
         else:
             dpg.configure_item("hsplitter", show=False)
-            dpg.configure_item("slot_pipother", show=False)
+            for i in range(MAXPIP):
+                dpg.configure_item(f"slot_pip{i}", show=False)
         if layout['panel_open']:
             dpg.configure_item("win_panel", show=True, pos=(vw - pw, 0), width=pw, height=vh)
             dpg.configure_item("splitter", show=True, pos=(vw - pw - vsp, 0), width=vsp, height=vh)
@@ -1731,7 +1940,10 @@ def main(argv=None):
         if layout['pip_open'] and dpg.is_item_active("hsplitter_btn"):
             _, my = dpg.get_mouse_pos(local=False)
             layout['pip_h'] = int(max(S(120), min(vh - S(300), (vh - S(6)) - S(6) - my)))
-        sig = (vw, vh, layout['panel_open'], layout['pip_open'], layout['panel_w'], layout['pip_h'])
+        # Include the PIP stream set + the big stream so relayout re-runs when a cam connects, focus
+        # toggles, Dbg toggles, or a pane is promoted -- not just on a viewport/panel resize.
+        sig = (vw, vh, layout['panel_open'], layout['pip_open'], layout['panel_w'], layout['pip_h'],
+               _slot_stream('big'), tuple(_pip_streams()) if layout['pip_open'] else ())
         if sig != layout['_sig']:
             relayout()
             layout['_sig'] = sig

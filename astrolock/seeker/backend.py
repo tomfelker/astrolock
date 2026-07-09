@@ -84,6 +84,13 @@ def main(argv=None):
     p.add_argument('--ext-density', type=float, default=0.7,
                    help="extended detector: min compactness to call a target present (~1 = tightly "
                         "clumped, ~0.5 = uniform noise), in both axes")
+    # Focus/collimation process (one optional, toggled live from the GUI Focus tab).
+    p.add_argument('--focus-crop', type=int, default=63,
+                   help="focus: star crop size (px, forced odd) -- the EMA star image")
+    p.add_argument('--focus-search', type=int, default=128,
+                   help="focus: search ROI around the target to find the peak in (px)")
+    p.add_argument('--focus-alpha', type=float, default=0.05,
+                   help="focus: EMA rate for the star crop (bigger = faster to settle, noisier)")
     p.add_argument('--device', default='auto',
                    help="torch device for detect + gui: 'auto' (default) = cuda if present else cpu, "
                         "or force 'cpu' / 'cuda' (passed through to both child processes)")
@@ -469,6 +476,37 @@ def main(argv=None):
                                      '--device', args.device]
                                     + (['--debug-ser'] if args.debug_detect_ser else []))
 
+    # Focus/collimation: one optional focus process, toggled from the GUI Focus tab (Guide or Main).
+    # It follows a role's cam .ser + detections and writes <seg>_<role>_focus.ser (the EMA star image,
+    # PIP-able) + _focus.frames.jsonl (peak / focus_x/y / com metrics for the graph). Only one runs at a
+    # time; a role switch stops the old one. focus_stop is its private stop flag (the session stop file
+    # is for the always-on cams/detectors); we remove it before each launch and touch it to stop.
+    focus_proc = None
+    focus_role = None
+    focus_stop = os.path.join(session_dir, 'focus_stop')
+
+    def stop_focus():
+        nonlocal focus_proc, focus_role
+        if focus_proc is not None and focus_proc.poll() is None:
+            open(focus_stop, 'w').close()          # ask it to finish cleanly; it polls the flag
+            _reap([focus_proc])
+        try:
+            os.remove(focus_stop)                  # clear the flag so the next launch isn't pre-stopped
+        except OSError:
+            pass
+        focus_proc, focus_role = None, None
+
+    def launch_focus(role):
+        nonlocal focus_proc, focus_role
+        stop_focus()                               # only one focus at a time
+        focus_proc = _spawn('astrolock.seeker.focus',
+                            ['--session', session_dir, '--role', role, '--follow',
+                             '--stop-file', focus_stop, '--device', args.device,
+                             '--crop', str(args.focus_crop), '--search', str(args.focus_search),
+                             '--alpha', str(args.focus_alpha)])
+        focus_role = role
+        print(f"[backend] focus started on {role}", flush=True)
+
     # Pre-warm the skyfield ephemeris/star cache once, serially. Two sky cams starting together
     # otherwise race to download de421.bsp / hipparcos into the shared cache and one loses the
     # rename (WinError 5) -- which is what crashed both sim cams in a fresh worktree. Best-effort:
@@ -712,7 +750,7 @@ def main(argv=None):
     def apply_command(cmd):
         nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
         nonlocal track_center, mount_desired_url, drive_mount, track_primary, handoff_fine, handoff_conf
-        nonlocal track_pref
+        nonlocal track_pref, focus_proc, focus_role
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -816,6 +854,16 @@ def main(argv=None):
             drive_mount = True
             handoff_fine, handoff_conf = None, 0.0    # drop any pending main-cam handoff
             mount.set_rates(0.0, 0.0)
+        elif t == 'focus':                            # GUI Focus tab: start/stop the focus process on a role
+            role = cmd.get('role')
+            if cmd.get('on', True):
+                if role in roles:
+                    launch_focus(role)
+                else:
+                    print(f"[backend] ignoring focus on {role!r} (unknown role)", flush=True)
+            else:
+                stop_focus()
+                print("[backend] focus stopped", flush=True)
         elif t == 'record':
             on = bool(cmd.get('on', False))
             r = cmd.get('role')
@@ -1069,6 +1117,9 @@ def main(argv=None):
                 'handoff': ({'fine': handoff_fine, 'primary': track_primary,
                              'conf': round(handoff_conf, 2), 'on_fine': track_role == handoff_fine}
                             if tracking and handoff_fine else None),
+                # Focus process: which role it's running on (the GUI follows <role>_focus + its metrics).
+                'focus': {'running': focus_proc is not None and focus_proc.poll() is None,
+                          'role': focus_role},
                 # ROI (cx, cy, size px) around the predicted target, for detect to clamp its work to.
                 'track_roi': track_rois or None,        # {role: [cx, cy, size]} -- active source + guide fallback
                 'sources': dict(sources),
@@ -1121,6 +1172,7 @@ def main(argv=None):
             control_write(role, {'stop': True})
             control_writers[role].close()
         open(stop_file, 'w').close()               # tell detectors to exit
+        open(focus_stop, 'w').close()              # and the focus process, if one is running
         if gui_proc is not None and gui_proc.poll() is None:
             gui_proc.terminate()
         cmd_server.close()
@@ -1135,7 +1187,8 @@ def main(argv=None):
         # Make sure every child is fully dead before cleanup: a still-terminating cam/detect holds
         # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow
         # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
-        _reap(list(cam_procs.values()) + list(detect_procs.values()) + [gui_proc, sky_sim_proc])
+        _reap(list(cam_procs.values()) + list(detect_procs.values())
+              + [focus_proc, gui_proc, sky_sim_proc])
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
         print("[backend] done", flush=True)

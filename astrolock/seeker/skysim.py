@@ -237,14 +237,20 @@ class SkySim:
 
     def _apply_tail(self, *args):
         """Run the elementwise render tail, fused into one kernel by torch.compile (built lazily on the
-        first frame). suppress_errors degrades that to eager wherever no C++ compiler is present, so it's
-        seamless -- no flag. (Force plain eager with the env var TORCHDYNAMO_DISABLE=1.)"""
+        first frame). We gate the build on is_dynamo_supported() -- older torch RAISES 'Windows not yet
+        supported' inside torch.compile() itself, which suppress_errors (a runtime-only setting) can't
+        catch -- so it degrades to eager seamlessly, no flag. (Force plain eager with TORCHDYNAMO_DISABLE=1.)"""
         if self._tail is None:
-            import logging
-            import torch._dynamo
-            torch._dynamo.config.suppress_errors = True    # compile is best-effort; fall back to eager...
-            logging.getLogger("torch._dynamo").setLevel(logging.ERROR)   # ...quietly (no cl.exe / no Triton)
-            self._tail = torch.compile(_render_tail)
+            self._tail = _render_tail                      # eager fallback (default if compile is unavailable)
+            try:
+                import logging
+                import torch._dynamo
+                if torch._dynamo.is_dynamo_supported():    # False on older torch (Windows) -> stay eager
+                    torch._dynamo.config.suppress_errors = True    # runtime graph breaks -> eager, quietly...
+                    logging.getLogger("torch._dynamo").setLevel(logging.ERROR)   # ...(no cl.exe / no Triton)
+                    self._tail = torch.compile(_render_tail)
+            except Exception:                              # torch too old to even have is_dynamo_supported
+                self._tail = _render_tail
         return self._tail(*args)
 
     def _unit_noise(self, h, w):

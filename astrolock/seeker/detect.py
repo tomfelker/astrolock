@@ -36,9 +36,10 @@ def resolve_device(name):
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     return torch.device(name)
 
-# The hot per-frame surfaces are torch.compile'd into single fused kernels where a C++ compiler is
-# present (a real win on the live detector -- DoH ~85->66ms, surprise ~17->8ms at 1080p); suppress_errors
-# falls back to eager otherwise, so it's seamless -- no flag. (TORCHDYNAMO_DISABLE=1 forces eager.)
+# The hot per-frame surfaces are torch.compile'd into single fused kernels where dynamo is supported and a
+# C++ compiler is present (a real win on the live detector -- DoH ~85->66ms, surprise ~17->8ms at 1080p).
+# is_dynamo_supported() gates the build (older torch RAISES on Windows, before suppress_errors could help),
+# and suppress_errors degrades runtime graph breaks to eager -- so it's seamless. (TORCHDYNAMO_DISABLE=1 forces eager.)
 # Compiled lazily + cached, and only ever applied to fixed-shape *full-frame* inputs -- never the
 # variable-size track ROI -- so each compiles exactly once.
 _compiled = {}
@@ -47,11 +48,20 @@ _compiled = {}
 def _compiled_fn(fn):
     c = _compiled.get(fn)
     if c is None:
-        import logging
-        import torch._dynamo
-        torch._dynamo.config.suppress_errors = True    # compile is best-effort; fall back to eager...
-        logging.getLogger("torch._dynamo").setLevel(logging.ERROR)   # ...quietly (e.g. no Triton on Win+CUDA)
-        c = _compiled[fn] = torch.compile(fn)
+        c = fn                                         # eager fallback (default if compile is unavailable)
+        try:
+            import logging
+            import torch._dynamo
+            # is_dynamo_supported() is the boolean sibling of the check that RAISES "Windows not yet
+            # supported" on older torch -- gate on it so torch.compile() can't hard-crash the process at
+            # build time (a plain try/except is only the backstop for torch too old to even have it).
+            if torch._dynamo.is_dynamo_supported():
+                torch._dynamo.config.suppress_errors = True    # runtime graph breaks -> eager, quietly...
+                logging.getLogger("torch._dynamo").setLevel(logging.ERROR)   # ...(e.g. no Triton on Win+CUDA)
+                c = torch.compile(fn)
+        except Exception:
+            c = fn
+        _compiled[fn] = c
     return c
 
 
@@ -560,7 +570,6 @@ def main(argv=None):
     def open_segment(ser_path):
         reader = ser_mod.SerReader(ser_path)
         writer = JsonlWriter(ser_path[:-len('.ser')] + '.detections.jsonl')
-        print(f"[detect:{args.role}] {os.path.basename(ser_path)}", flush=True)
         return reader, writer
 
     def new_surprise():                                # per-pixel temporal detector (stateful), or None
