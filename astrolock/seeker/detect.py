@@ -591,40 +591,58 @@ def detect_roi_peak(work, roi, coord_scale, *, detector, bg_radius, psf_px, doh_
              'moving': True, 'size_px': psf_px * coord_scale, 'score': float(bp[py, px] / m)}]
 
 
-def surprise_roi_peak(z, roi, coord_scale, *, nsigma, psf_px):
-    """Track-mode detection for the surprise detector: the tile pass collapsed to a single tile.
-    The full-frame matched-filtered surprisal ``z`` is already computed every frame (the model
-    stays warm in track mode), so this is nearly free: crop the predicted ROI, weight by a gentle
-    Gaussian pull toward the predicted centre (the distance component of the score -- a brighter
-    mover elsewhere in the window can't casually steal the lock), take the single argmax, and
-    accept it only if the RAW surprisal there clears ``nsigma`` (z is in true sigma units, so
-    this is an absolute test -- no per-window background estimate needed). Returns one blob in
-    frame coords, or [] (a miss the tracker coasts through)."""
-    z = torch.as_tensor(z, dtype=torch.float32)
-    H, W = z.shape
+def matched_roi_peak(work, roi, coord_scale, *, blur_px, psf_px, scale, pull):
+    """Tracking-phase detector ('matched'): stateless, current-frame only.
+
+    While locked we want to HOLD track, so there is no found/lost gate: crop the predicted ROI,
+    matched-filter it (Gaussian ~ the PSF), standardize against the window's own mean/std (z~,
+    spatial sigma units), then pick the EXTREMAL pixel of |z~| - pull*distance. The cone penalty
+    is linear and in sigma units: a candidate d px from the prediction wins iff it's pull*d
+    sigmas more surprising -- equivalently a Laplacian (heavy-tailed) prior on prediction error,
+    forgiving of the big misses a catch-up slew produces where a multiplicative Gaussian would
+    wall off. Extremal (|z~|) tracks dark targets too (daytime planes / silhouettes); a dip
+    carries 'dark': True. Deliberately no temporal state -- per-pixel history only adds lag when
+    the mount is moving the whole field.
+
+    Always answers (the only empty return is an ROI fully off the frame). Confidence, never a
+    gate: 'nsigma' = |z~| at the pick, and 'conf' = nsigma - E[max of the window under NO
+    target]. That null max is sqrt(2 ln(2 N_eff)) with N_eff = pixels / (2.355*blur_px)^2 --
+    extreme value theory over the window's independent resolution elements (the matched filter
+    correlates neighbours, so resels not pixels; the 2x is the two-sided extremal test). So
+    conf ~ 0 honestly reads "answering from pure noise". TODO: replace/validate the Gumbel
+    approximation with a one-time Monte-Carlo E[max] (blur white-noise windows of this size
+    with the real kernel and average the maxima) -- exact for our filter, cheap at startup."""
+    work = torch.as_tensor(work, dtype=torch.float32)
+    H, W = work.shape
     cx, cy, size = roi
     half = (size / coord_scale) / 2.0
     ecx, ecy = cx / coord_scale, cy / coord_scale            # expected centre, work coords
     x0, x1 = max(0, int(ecx - half)), min(W, int(ecx + half) + 1)
     y0, y1 = max(0, int(ecy - half)), min(H, int(ecy + half) + 1)
     if x1 - x0 < 4 or y1 - y0 < 4:
-        return []                                            # ROI off the frame
-    sub = z[y0:y1, x0:x1]
-    h, w = sub.shape
-    dev = sub.device
+        return []                                            # ROI entirely off the frame
+    sub = work[y0:y1, x0:x1]
+    if blur_px > 0:                                          # matched filter (reflect pad needs r < dim)
+        r = min(max(1, int(4.0 * blur_px + 0.5)), (min(sub.shape) - 1) // 2)
+        g, _, _ = gaussian_deriv_kernels(blur_px, r, device=sub.device)
+        sub = _conv1d_axis(_conv1d_axis(sub, g, 1), g, 0)
+    zt = (sub - sub.mean()) / (sub.std() + 1e-6)             # window-standardized, spatial sigma units
+    h, w = zt.shape
+    dev = zt.device
     yy, xx = torch.meshgrid(torch.arange(h, dtype=torch.float32, device=dev),
                             torch.arange(w, dtype=torch.float32, device=dev), indexing='ij')
-    sig_b = max(2.0 * psf_px, half / 2.0)                    # gentle pull toward the predicted centre
-    weight = torch.exp(-(((xx - (ecx - x0)) ** 2 + (yy - (ecy - y0)) ** 2)) / (2.0 * sig_b ** 2))
-    pidx = int(torch.argmax(sub * weight))
+    dist = torch.sqrt((xx - (ecx - x0)) ** 2 + (yy - (ecy - y0)) ** 2)
+    pidx = int(torch.argmax(zt.abs() - pull * dist))
     py, px = pidx // w, pidx % w
-    zpk = float(sub[py, px])
-    if zpk < nsigma:
-        return []                                            # nothing surprising near the prediction
-    cr = max(1, int(round(psf_px)))                          # sub-pixel centroid in a +/-psf window
+    sgn = 1.0 if float(zt[py, px]) >= 0.0 else -1.0
+    nsig = abs(float(zt[py, px]))
+    resel = max(1.0, (2.355 * blur_px) ** 2)                 # pixels per independent resolution element
+    n_eff = max(2.0, (h * w) / resel)
+    conf = nsig - math.sqrt(2.0 * math.log(2.0 * n_eff))    # excess over the empty-window expected max
+    cr = max(1, int(round(psf_px + 2.0 * blur_px)))          # centroid window covers the FILTERED blob
     wy0, wy1 = max(0, py - cr), min(h, py + cr + 1)
     wx0, wx1 = max(0, px - cr), min(w, px + cr + 1)
-    patch = sub[wy0:wy1, wx0:wx1]
+    patch = (zt[wy0:wy1, wx0:wx1] * sgn).clamp(min=0)        # flip a dark target positive for the centroid
     s = float(patch.sum())
     if s > 0:
         pyy, pxx = torch.meshgrid(torch.arange(wy0, wy1, dtype=torch.float32, device=dev),
@@ -632,9 +650,12 @@ def surprise_roi_peak(z, roi, coord_scale, *, nsigma, psf_px):
         cpx, cpy = float((patch * pxx).sum()) / s, float((patch * pyy).sum()) / s
     else:
         cpx, cpy = float(px), float(py)
-    return [{'px': [(x0 + cpx) * coord_scale, (y0 + cpy) * coord_scale], 'moving': True,
-             'size_px': psf_px * coord_scale, 'nsigma': round(zpk, 1),
-             'score': round(min(1.0, zpk / 10.0), 4)}]       # same white-at-10-sigma convention as the debug
+    out = {'px': [(x0 + cpx) * coord_scale, (y0 + cpy) * coord_scale], 'moving': True,
+           'size_px': psf_px * coord_scale, 'nsigma': round(nsig, 1), 'conf': round(conf, 1),
+           'score': round(float(work[y0 + py, x0 + px]) / scale, 4)}
+    if sgn < 0:
+        out['dark'] = True
+    return [out]
 
 
 def marginal_target(work, *, nsigma=4.0, density_thresh=0.7):
@@ -736,13 +757,19 @@ def main(argv=None):
     p.add_argument('--tile-mask-px', type=int, default=16,
                    help="surprise: mask radius (px) around every tile's fixed extrema when hunting "
                         "movers, so a twinkling star can't claim the mover slot")
-    p.add_argument('--track-detector', default='auto', choices=['auto', 'peak', 'surprise', 'extended'],
+    p.add_argument('--track-detector', default='peak', choices=['peak', 'matched'],
                    help="the TRACKING-phase detector (answers 'where is the locked target?' inside the "
-                        "backend's predicted ROI, one answer per frame): 'peak' = centre-weighted "
-                        "single-frame surface peak, 'surprise' = centre-weighted argmax of the "
-                        "matched-filtered surprisal, 'extended' = the full-frame single-large-target "
-                        "test. Default 'auto' follows --detector's family (surprise->surprise, "
-                        "extended->extended, else peak).")
+                        "backend's predicted ROI, one answer per frame; independent of --detector): "
+                        "'peak' = the original detection-surface peak with a brightness found-test, "
+                        "'matched' = stateless matched filter + centre pull + argmax on the current "
+                        "frame, no found/lost gate (confidence reported, never used to refuse)")
+    p.add_argument('--track-blur-px', type=float, default=1.5,
+                   help="matched track detector: matched-filter Gaussian sigma (px), ~the PSF width")
+    p.add_argument('--track-pull', type=float, default=0.5,
+                   help="matched track detector: cone pull strength (sigma per work px) -- a candidate "
+                        "d px from the prediction must be pull*d sigmas more surprising to win the "
+                        "argmax. Bigger = harder for a bright field star to steal the lock, but less "
+                        "tolerant of big prediction misses during a catch-up slew")
     p.add_argument('--ext-nsigma', type=float, default=3.0,
                    help="extended: two-tailed |value-mean| threshold on the row/col marginals, in sigmas "
                         "(catches bright AND dark targets; lower = includes dimmer target extremities)")
@@ -800,14 +827,8 @@ def main(argv=None):
         writer = JsonlWriter(ser_path[:-len('.ser')] + '.detections.jsonl')
         return reader, writer
 
-    # The track-phase detector: what answers "where is the locked target?" when the backend
-    # broadcasts a predicted ROI. 'auto' follows the acquisition detector's family.
-    track_det = args.track_detector
-    if track_det == 'auto':
-        track_det = args.detector if args.detector in ('surprise', 'extended') else 'peak'
-
     def new_surprise():                                # per-pixel temporal detector (stateful), or None
-        if args.detector != 'surprise' and track_det != 'surprise':
+        if args.detector != 'surprise':
             return None
         return SurpriseModel(args.surprise_alpha_mean, args.surprise_alpha_var,
                              args.surprise_decay, args.surprise_var_floor_frac,
@@ -872,33 +893,34 @@ def main(argv=None):
         # ---- phase dispatch ------------------------------------------------------------------
         # acquisition: no lock -> full-frame, many candidates (the user picks one).
         # tracking:    the backend broadcasts a predicted ROI for this role -> one answer,
-        #              found by the per-phase --track-detector.
-        # detection:   'extended' -- the main-cam single-large-target present-or-not test; as an
-        #              *acquisition* detector it runs full-frame in every phase (its ROI-gated
-        #              form is just the same test, so 'extended' as a track detector is identical).
-        if args.detector == 'extended' or (state['roi'] is not None and track_det == 'extended'):
+        #              found by the per-phase --track-detector (independent of --detector).
+        # detection:   'extended' -- the main-cam single-large-target present-or-not test;
+        #              runs full-frame in every phase (the backend never sends it an ROI).
+        if args.detector == 'extended':
             blobs, extra, status = run_extended()
             debug_surface, debug_hi = work, None                   # debug-ser shows the analysed frame
             prev = None
         elif state['roi'] is not None:                             # tracking: one answer near the prediction
-            if track_det == 'surprise':                            # the tile pass, collapsed to one tile:
-                blobs = surprise_roi_peak(surprise.z, state['roi'], coord_scale,   # centre-weighted argmax
-                                          nsigma=args.tile_moving_nsigma, psf_px=args.psf_px)
+            if args.track_detector == 'matched':                   # stateless current-frame matched filter
+                blobs = matched_roi_peak(work, state['roi'], coord_scale,
+                                         blur_px=args.track_blur_px, psf_px=args.psf_px,
+                                         scale=scale, pull=args.track_pull)
             else:                                                  # 'peak': single-frame surface peak
                 roi_det = args.detector if args.detector in ('bandpass', 'doh') else 'bandpass'
                 blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=roi_det,
                                         bg_radius=args.bg_radius, psf_px=args.psf_px,
                                         doh_sigma=args.doh_sigma, snr=args.snr)   # already frame coords
             prev = None                                            # frame-diff not used in ROI mode
-            debug_surface = surprise.z if surprise is not None else None
-            debug_hi = 10.0                                        # z is sigma units: white = 10 sigma
+            if surprise is not None:                               # keep showing the surprisal if it's running
+                debug_surface, debug_hi = surprise.z, 10.0         # sigma units: white = 10 sigma
+            else:
+                debug_surface, debug_hi = work, None
             status = "Locked On" if blobs else "Searching"
         else:                                                      # acquisition: full-frame multi-blob
-            if args.detector == 'surprise':    # key on the choice, not the model -- the SurpriseModel
-                # may exist purely for the track phase (--track-detector surprise) while acquisition
-                # runs another surface. Tile-extremum pass: fixed targets from the running mean,
-                # movers from the signed matched-filtered surprisal (fixed extrema masked out).
-                # Debug shows the RAW per-frame surprisal (sigma units).
+            if args.detector == 'surprise':
+                # Tile-extremum pass: fixed targets from the running mean, movers from the signed
+                # matched-filtered surprisal (fixed extrema masked out). Debug shows the RAW
+                # per-frame surprisal (sigma units).
                 blobs = tile_targets(surprise.mu_filtered(), surprise.zs, work,
                                      tile_size=args.tile_size, fixed_nsigma=args.tile_fixed_nsigma,
                                      moving_nsigma=args.tile_moving_nsigma,

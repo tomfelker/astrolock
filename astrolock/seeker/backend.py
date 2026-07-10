@@ -89,13 +89,20 @@ def main(argv=None):
                    help="surprise detector: stdevs from the tile mean to keep a moving (surprisal) extremum")
     p.add_argument('--tile-mask-px', type=int, default=16,
                    help="surprise detector: mask radius (px) around fixed extrema when hunting movers")
-    p.add_argument('--track-detector', default='auto', choices=['auto', 'peak', 'surprise', 'extended'],
-                   help="tracking-phase detector (single answer inside the predicted ROI): 'auto' "
-                        "follows each role's acquisition detector. Per-role: --<role>-track-detector")
-    p.add_argument('--guide-track-detector', default=None, choices=['auto', 'peak', 'surprise', 'extended'],
+    p.add_argument('--track-detector', default='peak', choices=['peak', 'matched'],
+                   help="tracking-phase detector (single answer inside the predicted ROI; independent "
+                        "of the acquisition --detector): 'peak' = the original surface peak with a "
+                        "brightness found-test, 'matched' = stateless matched filter + centre pull + "
+                        "argmax, no found/lost gate. Per-role: --<role>-track-detector")
+    p.add_argument('--guide-track-detector', default=None, choices=['peak', 'matched'],
                    help="override --track-detector for the guide role")
-    p.add_argument('--main-track-detector', default=None, choices=['auto', 'peak', 'surprise', 'extended'],
+    p.add_argument('--main-track-detector', default=None, choices=['peak', 'matched'],
                    help="override --track-detector for the main role")
+    p.add_argument('--track-blur-px', type=float, default=1.5,
+                   help="matched track detector: matched-filter Gaussian sigma (px), ~the PSF width")
+    p.add_argument('--track-pull', type=float, default=0.5,
+                   help="matched track detector: cone pull (sigma per work px of distance from the "
+                        "predicted position)")
     p.add_argument('--debug-detect-ser', action='store_true',
                    help="have each detector also write <seg>_<role>_debug.ser -- a movie of its detection "
                         "surface, followable in the GUI/any SER viewer for tuning")
@@ -524,6 +531,8 @@ def main(argv=None):
                                     ['--session', session_dir, '--role', role, '--follow',
                                      '--stop-file', stop_file,
                                      '--detector', det, '--track-detector', tdet,
+                                     '--track-blur-px', str(args.track_blur_px),
+                                     '--track-pull', str(args.track_pull),
                                      '--doh-sigma', str(args.doh_sigma),
                                      '--surprise-decay', str(args.surprise_decay),
                                      '--surprise-blur-px', str(args.surprise_blur_px),

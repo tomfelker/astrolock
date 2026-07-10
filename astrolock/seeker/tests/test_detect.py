@@ -68,6 +68,44 @@ def test_tile_targets_fixed_moving_split():
     assert all(b['nsigma'] >= 5.0 for b in blobs)
 
 
+def test_matched_roi_peak_tracking():
+    import torch
+    torch.manual_seed(1)
+    kw = dict(blur_px=1.5, psf_px=3.0, scale=4095.0, pull=0.5)
+    # A dim target near the predicted centre, a 2x-brighter star off to the side, on noisy sky:
+    # the cone pull (0.5 sigma/px * 40 px = 20 sigma) must keep the lock on the dim one.
+    work = (torch.randn(300, 300) * 5.0 + 1000.0)
+    ys, xs = torch.meshgrid(torch.arange(300.), torch.arange(300.), indexing='ij')
+    work += 30.0 * torch.exp(-(((xs - 150) ** 2 + (ys - 148) ** 2) / (2 * 2.0 ** 2)))   # target
+    work += 60.0 * torch.exp(-(((xs - 190) ** 2 + (ys - 150) ** 2) / (2 * 2.0 ** 2)))   # brighter thief
+    blobs = detect.matched_roi_peak(work, [150, 150, 120], 1.0, **kw)
+    assert blobs, "matched tracker always answers inside a valid ROI"
+    bx, by = blobs[0]['px']
+    assert abs(bx - 150) <= 2 and abs(by - 148) <= 2, (bx, by)
+    assert not blobs[0].get('dark')
+    assert blobs[0]['nsigma'] > 5.0 and blobs[0]['conf'] > 2.0, blobs[0]
+
+    # Extremal: a DARK target (a dip -- daytime silhouette) is found and flagged.
+    dip = (torch.randn(300, 300) * 5.0 + 1000.0)
+    dip -= 40.0 * torch.exp(-(((xs - 150) ** 2 + (ys - 148) ** 2) / (2 * 2.0 ** 2)))
+    blobs = detect.matched_roi_peak(dip, [150, 150, 120], 1.0, **kw)
+    assert blobs and blobs[0].get('dark'), blobs
+    bx, by = blobs[0]['px']
+    assert abs(bx - 150) <= 2 and abs(by - 148) <= 2, (bx, by)
+
+    # No gate: an empty (pure noise) window still returns its best guess (either polarity), and
+    # conf goes clearly NEGATIVE: the cone pins the pick near the prediction, where noise reads
+    # ~1 sigma -- far below the window's expected no-target extreme. (conf ~ 0 would mean the
+    # pick tied the whole window's noise max; a real target reads well positive.)
+    flat = torch.randn(300, 300) * 5.0 + 1000.0
+    blobs = detect.matched_roi_peak(flat, [150, 150, 120], 1.0, **kw)
+    assert blobs, "no found/lost gate -- always an answer"
+    assert blobs[0]['nsigma'] < 6.0 and blobs[0]['conf'] < 0.0, blobs[0]
+
+    # ROI fully off-frame is the only empty answer.
+    assert detect.matched_roi_peak(flat, [5000, 5000, 120], 1.0, **kw) == []
+
+
 def test_detect_rejects_extended_clutter():
     # Wide-FOV scene: a big bright "rooftop" slab plus one faint-ish point source.
     work = np.zeros((200, 200), np.float32)
@@ -215,6 +253,7 @@ def test_roi_peak_track_mode():
 if __name__ == '__main__':
     test_detect_tracks_moving_blob()
     test_tile_targets_fixed_moving_split()
+    test_matched_roi_peak_tracking()
     test_detect_rejects_extended_clutter()
     test_roundness_rejects_streak()
     test_doh_detects_blobs_rejects_edge()
