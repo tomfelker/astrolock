@@ -197,12 +197,13 @@ def main(argv=None):
     total = 0
     strehl_ref = None            # ideal (diffraction-limited) normalized peak; computed once, kept across segments
     strehl_done = False          # False until we've decided whether Strehl is available (needs the plate scale)
+    rad_per_px = None            # radians per work px (for the pixel-scale-free CoM offset); None if unknown
 
     def close_segment():
         reader.close(); writer.close(); spine.close(); det.close()
 
     def process(i):
-        nonlocal scale, total, strehl_ref, strehl_done
+        nonlocal scale, total, strehl_ref, strehl_done, rad_per_px
         frame = reader.read_frame(i)
         cid = reader.header.color_id
         if scale is None:
@@ -217,6 +218,8 @@ def main(argv=None):
         # reports, just reading low unless the lens is genuinely sharp. Computed once we know coord_scale.
         if not strehl_done:
             strehl_done = True
+            if args.focal_mm > 0 and args.pixel_um > 0:   # radians per WORK px, for a pixel-scale-free CoM
+                rad_per_px = (args.pixel_um * coord_scale * 1e-3) / args.focal_mm
             if args.aperture_mm > 0 and args.focal_mm > 0 and args.pixel_um > 0:
                 r_null = skysim.airy_r_null_px(args.focal_mm, args.aperture_mm, args.wavelength_nm,
                                                args.pixel_um * coord_scale)
@@ -238,6 +241,9 @@ def main(argv=None):
         star_ema, metrics, sat = ema.update(work, target)
         if strehl_ref:                                 # measured normalized peak vs the ideal (0..~1)
             metrics['strehl'] = round(_normalized_peak(star_ema) / strehl_ref, 4)
+        if rad_per_px is not None:                     # CoM offset in radians (pixel-scale-free) -> screw guide
+            metrics['com_rad'] = [round(metrics['com'][0] * rad_per_px, 9),
+                                  round(metrics['com'][1] * rad_per_px, 9)]
         t = time.perf_counter_ns()
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
         writer.write_frame(_ema_frame_u16(star_ema, scale, sat if even else None))

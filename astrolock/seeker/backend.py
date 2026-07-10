@@ -902,6 +902,8 @@ def main(argv=None):
             mount.set_rates(0.0, 0.0)
         elif t == 'focus':                            # GUI Focus tab: start/stop the focus process on a role
             role = cmd.get('role')
+            if 'alpha' in cmd:                        # star-crop EMA smoothing (relaunch-tier)
+                args.focus_alpha = max(1e-4, min(1.0, float(cmd['alpha'])))
             if cmd.get('on', True):
                 if role in roles:
                     launch_focus(role)

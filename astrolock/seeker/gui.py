@@ -341,6 +341,11 @@ def main(argv=None):
     # rolling metric series tailed from <role>_focus.frames.jsonl for the graphs.
     focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'path': None, 'tailer': None,
                 't0': None, 'com_mult': 10.0,             # collimation-trail exaggeration on the star view
+                'screw_phase': 0.0,                       # deg: rotation of the 3 collimation screws in the image
+                'rad_per_turn': 100e-6,                   # empirical: CoM-offset radians removed per screw turn
+                'invert_x': False, 'invert_y': False,     # flip screw-turn direction per axis (image parity)
+                'alpha': 0.05,                            # star-crop EMA smoothing (relaunch-tier)
+                'com_rad': (0.0, 0.0),                    # latest CoM offset (radians) for the screw dial
                 'series': {k: [] for k in ('t', 'peak', 'strehl', 'dx', 'dy')}}   # graph peak/strehl; star trail dx/dy
     FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
@@ -610,6 +615,48 @@ def main(argv=None):
             dpg.draw_line((sx, sy), (sx + vx / n * PIP_R * 0.5, sy + vy / n * PIP_R * 0.5),
                           color=col, thickness=1.0, parent=f"L_trk_{name}")
 
+    _SCREW_COL = (230, 185, 70, 235)                      # collimation-screw guide colour (amber)
+
+    def _draw_turn_arc(layer, cx, cy, r, turns):
+        """A curved arrow around a screw: sweep ∝ turns (clamped to ±1 turn for the arc), arrowhead at the
+        end showing CW (tighten, +) / CCW (loosen, −)."""
+        sweep = max(-1.0, min(1.0, turns)) * 2.0 * math.pi
+        if abs(sweep) < 0.08:
+            return
+        a0 = -math.pi / 2.0                               # start at the top of the screw
+        steps = max(4, int(abs(sweep) / (math.pi / 12)))
+        pts = [(cx + r * math.cos(a0 + sweep * i / steps), cy + r * math.sin(a0 + sweep * i / steps))
+               for i in range(steps + 1)]
+        dpg.draw_polyline(pts, color=_SCREW_COL, thickness=S(2), parent=layer)
+        ae = a0 + sweep                                   # arrowhead at the sweep end, along the tangent
+        ex, ey = cx + r * math.cos(ae), cy + r * math.sin(ae)
+        tx, ty = -math.sin(ae) * (1 if sweep > 0 else -1), math.cos(ae) * (1 if sweep > 0 else -1)  # tangent
+        px, py = -ty, tx                                  # perpendicular
+        h = S(5)
+        dpg.draw_triangle((ex + tx * h, ey + ty * h),
+                          (ex - tx * h * 0.4 + px * h * 0.7, ey - ty * h * 0.4 + py * h * 0.7),
+                          (ex - tx * h * 0.4 - px * h * 0.7, ey - ty * h * 0.4 - py * h * 0.7),
+                          color=_SCREW_COL, fill=_SCREW_COL, parent=layer)
+
+    def _draw_screw_dial(name, cx, cy, R, offset, phase_deg, rad_per_turn):
+        """Collimation-screw guide: 3 SCT secondary screws at 120° (rotated by phase_deg to match the
+        physical scope), each with a turn arrow to null the CoM offset. `offset` is the collimation error
+        in radians (pixel-scale-free). Screw turn = min-norm solution t_k = −(2/3)(û_k·offset)/sens across
+        the three symmetric screws; sign of `rad_per_turn` flips CW/CCW if the arcs read backwards."""
+        layer = f"L_hist_{name}"
+        ox, oy = offset
+        sens = rad_per_turn if abs(rad_per_turn) > 1e-12 else 1e-12
+        dpg.draw_circle((cx, cy), R, color=(90, 96, 110, 130), thickness=1.0, parent=layer)
+        for k in range(3):
+            ang = math.radians(phase_deg + 120.0 * k)     # image frame (x right, y down == screen)
+            ux, uy = math.cos(ang), math.sin(ang)
+            sx, sy = cx + R * ux, cy + R * uy
+            t = -(2.0 / 3.0) * (ux * ox + uy * oy) / sens     # turns to null the offset via this screw
+            dpg.draw_circle((sx, sy), S(9), color=(160, 165, 182, 230), thickness=S(2), parent=layer)
+            dpg.draw_text((sx - S(3), sy - S(7)), str(k + 1), size=S(13), color=(190, 195, 210, 235), parent=layer)
+            _draw_turn_arc(layer, sx, sy, S(15), t)
+            dpg.draw_text((sx - S(11), sy + S(13)), f"{t:+.2f}", size=S(12), color=_SCREW_COL, parent=layer)
+
     # Both dividers are thin dpg windows, but a dpg window has a ~32px minimum size, so a thin one's
     # body overflows past its visible sliver. Each is created *behind* the pane it borders and kept
     # there (no_bring_to_front_on_focus) so that pane covers the overflow; only the sliver in the gap
@@ -832,14 +879,14 @@ def main(argv=None):
         # bright (new). A collimated star's trail clusters on the centre tick; a miscollimated one drifts.
         if role.endswith('_focus') and role == focus_ui['role'] + '_focus':
             sc = focus_ui['series']
-            # Prefer Strehl (0..1, 1 = diffraction-limited) when the aperture is known; else the raw peak.
+            GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
+            gx1, gy1 = SW - mgn, SH - mgn
+            gx0, gy0 = gx1 - GW, gy1 - GH
+            # Focus-quality graph: prefer Strehl (0..1, 1 = diffraction-limited) when known, else raw peak.
             strehls = sc['strehl']
             use_str = bool(strehls) and strehls[-1] is not None
             series = [v if v is not None else 0.0 for v in strehls] if use_str else sc['peak']
             if len(series) >= 2:
-                GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
-                gx1, gy1 = SW - mgn, SH - mgn
-                gx0, gy0 = gx1 - GW, gy1 - GH
                 hi = 1.0 if use_str else (max(sc['peak']) or 1.0)     # Strehl 0..1; raw peak auto-scales
                 label = f"Strehl {strehls[-1]:.2f}" if use_str else f"focus peak {sc['peak'][-1]:.3f}"
                 dpg.draw_rectangle((gx0 - S(4), gy0 - S(4)), (gx1 + S(4), gy1 + S(4)),
@@ -851,6 +898,14 @@ def main(argv=None):
                                    parent=f"L_hist_{name}")
                 dpg.draw_text((gx0, gy0 - S(16)), label, size=S(12), color=(180, 205, 235, 235),
                               parent=f"L_hist_{name}")
+            # Collimation-screw dial, centred above the graph (SCT secondary screws + turn arrows). Per-axis
+            # invert flips the image parity so the turn arrows match the physical scope.
+            Rd = S(38)
+            ox, oy = focus_ui['com_rad']
+            off = (-ox if focus_ui['invert_x'] else ox, -oy if focus_ui['invert_y'] else oy)
+            dcy = max(Rd + S(14), gy0 - Rd - S(42))       # above the graph, clear of its top label
+            _draw_screw_dial(name, (gx0 + gx1) / 2.0, dcy, Rd,
+                             off, focus_ui['screw_phase'], focus_ui['rad_per_turn'])
             npts = len(sc['dx'])
             if npts:
                 mult = focus_ui['com_mult']
@@ -1218,6 +1273,9 @@ def main(argv=None):
             'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
                          'auto_switch': track_ui['auto_switch']},
             'sim': {'r0': sim_ui['r0'], 'bortle': sim_ui['bortle']},   # per-cam defocus rides with the cam caps
+            'focus': {'com_mult': focus_ui['com_mult'], 'screw_phase': focus_ui['screw_phase'],
+                      'rad_per_turn': focus_ui['rad_per_turn'], 'alpha': focus_ui['alpha'],
+                      'invert_x': focus_ui['invert_x'], 'invert_y': focus_ui['invert_y']},  # collimation calib
         }
 
     def apply_settings(data):
@@ -1276,6 +1334,28 @@ def main(argv=None):
         if 'bortle' in sim and dpg.does_item_exist('sim_bortle'):
             dpg.set_value('sim_bortle', int(sim['bortle']))
             _sim_bortle_input()                         # clamp + push to the backend
+        foc = data.get('focus') or {}                   # collimation-screw calibration + trail exaggeration
+        if 'com_mult' in foc:
+            focus_ui['com_mult'] = float(foc['com_mult'])
+            if dpg.does_item_exist('focus_com_mult'):
+                dpg.set_value('focus_com_mult', f"{focus_ui['com_mult']:g}")
+        if 'screw_phase' in foc:
+            focus_ui['screw_phase'] = float(foc['screw_phase'])
+            if dpg.does_item_exist('focus_screw_phase'):
+                dpg.set_value('focus_screw_phase', focus_ui['screw_phase'])
+        if 'rad_per_turn' in foc:
+            focus_ui['rad_per_turn'] = float(foc['rad_per_turn'])
+            if dpg.does_item_exist('focus_screw_sens'):
+                dpg.set_value('focus_screw_sens', focus_ui['rad_per_turn'] * 1e6)
+        if 'alpha' in foc:
+            focus_ui['alpha'] = float(foc['alpha'])
+            if dpg.does_item_exist('focus_alpha'):
+                dpg.set_value('focus_alpha', f"{focus_ui['alpha']:g}")
+        for _ax in ('x', 'y'):
+            if f'invert_{_ax}' in foc:
+                focus_ui[f'invert_{_ax}'] = bool(foc[f'invert_{_ax}'])
+                if dpg.does_item_exist(f'focus_inv_{_ax}'):
+                    dpg.set_value(f'focus_inv_{_ax}', focus_ui[f'invert_{_ax}'])
 
     def _settings_refresh(select=None):
         dpg.configure_item('settings_combo', items=settings_store.list_settings())
@@ -1384,6 +1464,20 @@ def main(argv=None):
         if dpg.does_item_exist('focus_com_mult'):
             dpg.set_value('focus_com_mult', f"{focus_ui['com_mult']:g}")
 
+    def _focus_screw_input():
+        if dpg.does_item_exist('focus_screw_phase'):
+            focus_ui['screw_phase'] = float(dpg.get_value('focus_screw_phase'))
+        if dpg.does_item_exist('focus_screw_sens'):
+            v = float(dpg.get_value('focus_screw_sens'))          # entered in urad/turn (signed -> flip)
+            focus_ui['rad_per_turn'] = v * 1e-6 if abs(v) > 1e-6 else focus_ui['rad_per_turn']
+
+    def _focus_alpha_input():
+        focus_ui['alpha'] = max(0.001, min(1.0, _flt('focus_alpha', focus_ui['alpha'])))
+        if dpg.does_item_exist('focus_alpha'):
+            dpg.set_value('focus_alpha', f"{focus_ui['alpha']:g}")
+        if focus_ui['want']:                              # relaunch the running focus with the new smoothing
+            _send({'type': 'focus', 'on': True, 'role': focus_ui['role'], 'alpha': focus_ui['alpha']})
+
     def _focus_start(role):
         """Point the big pane at this cam's star stream and (re)launch the focus process on it."""
         _focus_reset_series()
@@ -1391,7 +1485,7 @@ def main(argv=None):
         layout['big_stream'] = role + '_focus'            # big pane shows the star; the cams drop to PIPs
         layout['big_role'] = role
         layout['_sig'] = None
-        _send({'type': 'focus', 'on': True, 'role': role})
+        _send({'type': 'focus', 'on': True, 'role': role, 'alpha': focus_ui['alpha']})
 
     def _focus_stop():
         focus_ui['want'] = False
@@ -1451,6 +1545,9 @@ def main(argv=None):
             com = rec.get('com') or [0.0, 0.0]
             s['dx'].append(com[0])
             s['dy'].append(com[1])
+            cr = rec.get('com_rad')                         # pixel-scale-free CoM offset -> screw dial (latest)
+            if cr:
+                focus_ui['com_rad'] = (cr[0], cr[1])
             perf['focus'].hit()                            # one metric record = one focus frame produced
         for k in s:                                       # keep only the last FOCUS_MAX points
             if len(s[k]) > FOCUS_MAX:
@@ -1587,6 +1684,14 @@ def main(argv=None):
                  "below tracks focus quality. Slowly sweep focus and maximize the peaks. Saturated cores "
                  "FLASH (their peak reading can't be trusted -- reduce exposure/gain).")
             with dpg.group(horizontal=True):
+                _sml = dpg.add_text("Smoothing α:")
+                dpg.add_input_text(tag='focus_alpha', width=S(48), on_enter=True,
+                                   default_value=f"{focus_ui['alpha']:g}",
+                                   callback=lambda *_: _focus_alpha_input())
+            _tip("Star-crop EMA rate (0..1): lower = a steadier averaged star (rides out seeing + tracking "
+                 "jitter) but slower to settle; higher = snappier but noisier. Changing it restarts the "
+                 "focus helper, so the average resets.", item=_sml)
+            with dpg.group(horizontal=True):
                 _cml = dpg.add_text("Collimation ×:")
                 dpg.add_input_text(tag='focus_com_mult', width=S(48), on_enter=True,
                                    default_value=f"{focus_ui['com_mult']:g}",
@@ -1594,7 +1699,34 @@ def main(argv=None):
             _tip("Exaggeration for the collimation (CoM-offset) trail drawn on the star view -- higher "
                  "magnifies smaller miscollimation. The last ~10 measurements are drawn, faint→bright.",
                  item=_cml)
-            dpg.add_text("The focus-quality graph + collimation trail draw on the star (main pane).",
+            with dpg.group(horizontal=True):               # SCT collimation-screw guide (dial on the star pane)
+                _spl = dpg.add_text("Screw phase:")
+                dpg.add_input_float(tag='focus_screw_phase', width=S(56), on_enter=True, step=0, format="%.0f",
+                                    default_value=focus_ui['screw_phase'],
+                                    callback=lambda *_: _focus_screw_input())
+                dpg.add_text("deg", color=(140, 145, 160))
+            _tip("Rotational orientation of the 3 secondary collimation screws in the camera image -- dial "
+                 "it so the numbered screws on the star pane match how you physically see them on the "
+                 "corrector plate.", item=_spl)
+            with dpg.group(horizontal=True):
+                _ssl = dpg.add_text("Turn sensitivity:")
+                dpg.add_input_float(tag='focus_screw_sens', width=S(56), on_enter=True, step=0, format="%.0f",
+                                    default_value=focus_ui['rad_per_turn'] * 1e6,
+                                    callback=lambda *_: _focus_screw_input())
+                dpg.add_text("µrad/turn", color=(140, 145, 160))
+            _tip("Empirical: collimation error (CoM offset, in microradians -- pixel-scale-free, so it's the "
+                 "same across cameras) removed by one full screw turn. Calibrate once: note how far a screw "
+                 "turn moves the offset. Make it negative if the turn arrows point the wrong way.", item=_ssl)
+            with dpg.group(horizontal=True):
+                _ivl = dpg.add_text("Invert screws:")
+                dpg.add_checkbox(label="X", tag='focus_inv_x', default_value=focus_ui['invert_x'],
+                                 callback=lambda _s, a: focus_ui.__setitem__('invert_x', a))
+                dpg.add_checkbox(label="Y", tag='focus_inv_y', default_value=focus_ui['invert_y'],
+                                 callback=lambda _s, a: focus_ui.__setitem__('invert_y', a))
+            _tip("Flip the screw-turn direction per axis to match your camera's image parity (mirror/flip); "
+                 "set these empirically alongside the sensitivity. A future optics-DB collimator type will "
+                 "preset them correctly.", item=_ivl)
+            dpg.add_text("The focus graph, collimation trail, and screw dial draw on the star (main pane).",
                          color=(120, 125, 140), wrap=S(230))
             dpg.add_text("planned: graph vs focuser position (electronic focuser)",
                          color=(120, 125, 140), wrap=S(230))
