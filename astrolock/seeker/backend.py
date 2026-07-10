@@ -46,6 +46,15 @@ def _spawn(module, args):
     return subprocess.Popen([sys.executable, '-m', module, *args])
 
 
+# Bortle dark-sky class -> approximate zenith sky surface brightness (V mag/arcsec^2). Higher = darker.
+_BORTLE_SKY_MAG = {1: 21.9, 2: 21.8, 3: 21.5, 4: 21.0, 5: 20.4, 6: 19.5, 7: 18.9, 8: 18.4, 9: 18.0}
+
+
+def bortle_to_sky_mag(zone):
+    """Sky surface brightness (mag/arcsec^2) for a Bortle class 1..9 (clamped)."""
+    return _BORTLE_SKY_MAG[int(max(1, min(9, round(zone))))]
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker backend / orchestrator")
     p.add_argument('--roles', default='guide,main', help="comma-separated camera roles to launch")
@@ -208,6 +217,10 @@ def main(argv=None):
                         "(the sky camera's Defocus control)")
     p.add_argument('--sky-seeing-r0-m', type=float, default=0.0,
                    help="sky source: atmospheric Fried parameter r0 (m); >0 adds a seeing blur to all sim cams")
+    p.add_argument('--sky-bortle', type=int, default=4,
+                   help="sky source: Bortle dark-sky class 1..9 (sky brightness); 1 = pristine, 9 = inner city. "
+                        "With a physical sensor (QE/full-well in the DB) this sets the sim sky background. "
+                        "Live-adjustable in the GUI Simulation panel")
     p.add_argument('--wb-r', type=float, default=1.24, help="GUI display-only WB gain for red (1 = none)")
     p.add_argument('--wb-b', type=float, default=1.98, help="GUI display-only WB gain for blue (1 = none)")
     p.add_argument('--gui', dest='gui', action='store_true', default=True)
@@ -318,6 +331,9 @@ def main(argv=None):
     obstruction_by_role = {role: 0.0 for role in roles} # role -> central-obstruction diameter ratio (obstructed PSF)
     vanes_by_role = {role: 0 for role in roles}         # role -> spider-vane count (Newtonian diffraction spikes)
     vane_width_by_role = {role: 0.0 for role in roles}  # role -> vane width / aperture diameter
+    qe_by_role = {role: 0.0 for role in roles}          # role -> sensor peak QE (sim physical-flux model)
+    full_well_by_role = {role: 0.0 for role in roles}   # role -> sensor full-well capacity (e-)
+    read_noise_by_role = {role: 0.0 for role in roles}  # role -> sensor read noise (e-)
     optics_sel = {role: [None, None, None] for role in roles}   # role -> [sensor, optic, reducer] in effect
 
     def _geom(role, s, feff, aperture_mm=0.0, obstruction=0.0, vanes=0, vane_width_frac=0.0):
@@ -325,6 +341,9 @@ def main(argv=None):
         obstruction_by_role[role] = obstruction         # + central obstruction / spider -> obstructed/vaned PSF
         vanes_by_role[role] = vanes
         vane_width_by_role[role] = vane_width_frac
+        qe_by_role[role] = s.qe                         # sensor photometry -> physical exposure model
+        full_well_by_role[role] = s.full_well_e
+        read_noise_by_role[role] = s.read_noise_e
         """The one place geometry is computed: render size / plate scale / FoV / readout window for a
         role from its binning (bin_by_role) and ROI window (roi_by_role), given DB sensor `s`
         at effective focal length `feff`. Startup and every live bin/ROI/optics change call this.
@@ -410,6 +429,7 @@ def main(argv=None):
             roi_window_by_role.pop(role, None)
             aperture_by_role[role] = obstruction_by_role[role] = vane_width_by_role[role] = 0.0
             vanes_by_role[role] = 0
+            qe_by_role[role] = full_well_by_role[role] = read_noise_by_role[role] = 0.0
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
     # Per-role sim residual-blur sigma (px): lens softness/defocus atop the physical Airy PSF -- a
@@ -441,6 +461,10 @@ def main(argv=None):
                             '--sky-central-obstruction', str(obstruction_by_role.get(role, 0.0)),
                             '--sky-spider-vanes', str(vanes_by_role.get(role, 0)),
                             '--sky-vane-width-frac', str(vane_width_by_role.get(role, 0.0)),
+                            '--sky-qe', str(qe_by_role.get(role, 0.0)),
+                            '--sky-full-well-e', str(full_well_by_role.get(role, 0.0)),
+                            '--sky-read-noise-e', str(read_noise_by_role.get(role) or 2.0),
+                            '--sky-sky-mag', str(bortle_to_sky_mag(args.sky_bortle)),
                             '--sky-psf-wavelength-nm', str(args.sky_psf_wavelength_nm),
                             '--sky-seeing-r0-m', str(args.sky_seeing_r0_m)]
             if psf_sigma_by_role.get(role) is not None:   # else the cam auto-picks (0 if aperture known, else 1.3)
@@ -861,11 +885,14 @@ def main(argv=None):
             if p in ('guide', 'main', 'auto'):
                 track_pref = p
                 print(f"[backend] track source preference = {track_pref}", flush=True)
-        elif t == 'set_sky_render':                   # global sim-truth atmosphere: seeing r0 (one sky, all cams)
+        elif t == 'set_sky_render':                   # global sim-truth atmosphere: seeing r0 + sky brightness
             if 'r0_m' in cmd:
                 args.sky_seeing_r0_m = max(0.0, float(cmd['r0_m']))
-            print(f"[backend] sky seeing r0 = {args.sky_seeing_r0_m}m", flush=True)
-            for r in roles:                            # rebuild each live sky cam's PSF (built at launch)
+            if 'bortle' in cmd:
+                args.sky_bortle = int(max(1, min(9, round(float(cmd['bortle'])))))
+            print(f"[backend] sky render: seeing r0 = {args.sky_seeing_r0_m}m, Bortle {args.sky_bortle} "
+                  f"({bortle_to_sky_mag(args.sky_bortle):.1f} mag/arcsec^2)", flush=True)
+            for r in roles:                            # rebuild each live sky cam (PSF + sky rate set at launch)
                 if sources.get(r) == 'sky' and is_connected(r):
                     restart_cam(r, stop_first=True)
         elif t == 'untrack':                          # "Unlock": drop the lock entirely + halt the mount

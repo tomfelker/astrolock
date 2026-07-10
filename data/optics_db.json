@@ -24,7 +24,7 @@
     {"name": "ZWO ASI664MC", "res_x": 2704, "res_y": 1546, "pixel_um": 2.9, "bayer": "RGGB", "source": "Sony IMX664, 1/1.8\" color"},
     {"name": "ZWO ASI676MC", "res_x": 3552, "res_y": 3552, "pixel_um": 2.0, "bayer": "RGGB", "source": "Sony IMX676, 1/1.6\" square color"},
     {"name": "ZWO ASI676MM", "res_x": 3552, "res_y": 3552, "pixel_um": 2.0, "mono": true, "source": "Sony IMX676, 1/1.6\" square mono"},
-    {"name": "ZWO ASI678MC", "res_x": 3840, "res_y": 2160, "pixel_um": 2.0, "bayer": "RGGB", "source": "Sony IMX678, 1/1.8\" color (ZWO 'MC'=color, 'MM'=mono)"},
+    {"name": "ZWO ASI678MC", "res_x": 3840, "res_y": 2160, "pixel_um": 2.0, "bayer": "RGGB", "qe": 0.80, "full_well_e": 12000, "read_noise_e": 1.5, "source": "Sony IMX678, 1/1.8\" color (ZWO 'MC'=color, 'MM'=mono); ~80% peak QE, ~12ke full well, ~1.5e read noise (approx, gain-dependent)"},
     {"name": "ZWO ASI678MM", "res_x": 3840, "res_y": 2160, "pixel_um": 2.0, "mono": true, "source": "Sony IMX678, 1/1.8\" mono"},
     {"name": "ZWO ASI715MC", "res_x": 3864, "res_y": 2192, "pixel_um": 1.45, "bayer": "RGGB", "source": "Sony IMX715, 1/2.8\" color"},
     {"name": "ZWO ASI220MM Mini", "res_x": 1920, "res_y": 1080, "pixel_um": 4.0, "mono": true, "source": "SmartSens SC2210, 1/1.8\" mono (guide camera)"},

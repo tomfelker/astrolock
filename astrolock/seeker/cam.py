@@ -311,6 +311,8 @@ def _open_sky(args, state_path=None, mount_path=None):
                        aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm,
                        central_obstruction=args.sky_central_obstruction, spider_vanes=args.sky_spider_vanes,
                        vane_width_frac=args.sky_vane_width_frac,
+                       qe=args.sky_qe, full_well_e=args.sky_full_well_e, read_noise_e=args.sky_read_noise_e,
+                       sky_mag_arcsec2=args.sky_sky_mag,
                        psf_sigma_px=args.sky_psf_sigma_px, seeing_r0_m=args.sky_seeing_r0_m)
     device = resolve_device(getattr(args, 'device', 'auto'))
     sim = SkySim(cfg, device=device)                   # render-only; propagation lives in sky_sim.py
@@ -336,7 +338,8 @@ def _open_sky(args, state_path=None, mount_path=None):
     kt = 't_mono_ns' if follow_mount else 'enc_t_mono_ns'
     ahead_cap = 5.0 if follow_mount else 0.2
     pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt, 'enc_t': None}
-    _live = {'exp': args.sky_exposure_s}                       # exposure (s), live-settable
+    _live = {'exp': args.sky_exposure_s, 'gain_cb': float(args.sky_gain_cb)}   # exposure (s) + gain (cB), live
+    sim.gain_mult = 10.0 ** (_live['gain_cb'] / 200.0)         # centibels -> linear signal multiplier
     S = args.sky_substeps
     fr = (torch.arange(S, dtype=torch.float64) + 0.5) / S      # (S,) substep mid-fractions
     start_ns = time.perf_counter_ns()
@@ -375,12 +378,18 @@ def _open_sky(args, state_path=None, mount_path=None):
         return frame, int(now_ns + 0.5 * exp * 1e9), now_ns + int(exp * 1e9)
 
     caps = [{'name': 'exposure', 'label': 'Exposure', 'kind': 'number', 'unit': 'ms', 'scale': 'log',
-             'min': 0.01, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True}]
+             'min': 0.01, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True},
+            {'name': 'gain', 'label': 'Gain', 'kind': 'number', 'unit': 'cB', 'scale': 'linear',
+             'min': 0.0, 'max': 600.0, 'value': _live['gain_cb'], 'live': True}]
 
     def set_control(name, value):
         if name == 'exposure':
             _live['exp'] = max(1e-5, value / 1000.0)     # down to ~0.01 ms; the sim can render any exposure
             return _live['exp'] * 1000.0
+        if name == 'gain':
+            _live['gain_cb'] = max(0.0, value)
+            sim.gain_mult = 10.0 ** (_live['gain_cb'] / 200.0)   # +60 cB (=6 dB) doubles the signal
+            return _live['gain_cb']
         return None
     controls = {'source': 'sky', 'controls': caps, 'set': set_control}
     meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
@@ -483,6 +492,14 @@ def main(argv=None):
                    help="sky: number of spider vanes (Newtonian secondary support); adds diffraction spikes")
     p.add_argument('--sky-vane-width-frac', type=float, default=0.0,
                    help="sky: spider-vane width as a fraction of the aperture diameter")
+    p.add_argument('--sky-qe', type=float, default=0.0,
+                   help="sky: sensor peak quantum efficiency (0..1); >0 enables the physical flux model "
+                        "(aperture area x QE x throughput x mag) instead of a fixed flux")
+    p.add_argument('--sky-full-well-e', type=float, default=0.0,
+                   help="sky: sensor full-well capacity (electrons); the 12-bit ADC saturates here")
+    p.add_argument('--sky-read-noise-e', type=float, default=2.0, help="sky: sensor read noise (electrons RMS)")
+    p.add_argument('--sky-sky-mag', type=float, default=21.0,
+                   help="sky: sky surface brightness (mag/arcsec^2), from the Bortle zone (darker = higher)")
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky: wavelength for the Airy disc (nm)")
     p.add_argument('--sky-psf-sigma-px', type=float, default=None,
@@ -495,6 +512,9 @@ def main(argv=None):
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky: scripted az slew (deg/s) for streaks")
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky: scripted alt slew (deg/s)")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky: simulated exposure (s)")
+    p.add_argument('--sky-gain-cb', type=float, default=0.0,
+                   help="sky: sensor gain in centibels (ZWO-style, 0.1 dB units; +60 cB doubles signal). "
+                        "Amplifies electrons->ADU so you can brighten without a longer exposure (keeps fps)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
     p.add_argument('--sky-almanac', default=None,
                    help="sky: shared source-direction almanac (JSONL) published by sky_sim")

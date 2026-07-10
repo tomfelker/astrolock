@@ -335,7 +335,7 @@ def main(argv=None):
               'pip_h': S(200), 'big_role': ROLES[0], '_sig': None}
     boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
     track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True}   # Tracking panel state; backend defaults
-    sim_ui = {'r0': 0.0}                                  # Simulation panel: global seeing r0 (m); backend default
+    sim_ui = {'r0': 0.0, 'bortle': 4}                     # Simulation panel: seeing r0 (m) + Bortle sky class; backend defaults
     # (per-camera defocus/lens-softness is a sky-cam 'Defocus' control, rendered from backend caps like bin/ROI)
     # Focus tab: which cam to focus, whether we want it running (drives the big-pane star view), and the
     # rolling metric series tailed from <role>_focus.frames.jsonl for the graphs.
@@ -1217,7 +1217,7 @@ def main(argv=None):
             'boresight': [boresight_ui['x'], boresight_ui['y']],
             'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
                          'auto_switch': track_ui['auto_switch']},
-            'sim': {'r0': sim_ui['r0']},                # per-camera defocus rides with the cam caps, not here
+            'sim': {'r0': sim_ui['r0'], 'bortle': sim_ui['bortle']},   # per-cam defocus rides with the cam caps
         }
 
     def apply_settings(data):
@@ -1273,6 +1273,9 @@ def main(argv=None):
         if 'r0' in sim and dpg.does_item_exist('sim_r0'):
             dpg.set_value('sim_r0', f"{float(sim['r0']):g}")
             _sim_render_input()                         # clamp + push to the backend
+        if 'bortle' in sim and dpg.does_item_exist('sim_bortle'):
+            dpg.set_value('sim_bortle', int(sim['bortle']))
+            _sim_bortle_input()                         # clamp + push to the backend
 
     def _settings_refresh(select=None):
         dpg.configure_item('settings_combo', items=settings_store.list_settings())
@@ -1359,6 +1362,13 @@ def main(argv=None):
             dpg.set_value('sim_r0', f"{sim_ui['r0']:g}")
         if send:
             _send({'type': 'set_sky_render', 'r0_m': sim_ui['r0']})
+
+    def _sim_bortle_input(send=True):
+        if dpg.does_item_exist('sim_bortle'):
+            sim_ui['bortle'] = int(max(1, min(9, dpg.get_value('sim_bortle'))))
+            dpg.set_value('sim_bortle', sim_ui['bortle'])
+        if send:
+            _send({'type': 'set_sky_render', 'bortle': sim_ui['bortle']})
 
     # ---- Focus tab: start/stop the focus process + tail its metrics into the graphs ------------
     def _focus_reset_series():
@@ -1503,6 +1513,14 @@ def main(argv=None):
             _tip("Atmospheric seeing as the Fried parameter r0 (m): bigger = steadier air. 0 = off; "
                  "~0.05 poor, ~0.2 excellent. One sky, so it blurs all sim cameras (FWHM ~ 0.98*lambda/r0). "
                  "Per-camera lens softness is the Defocus knob in each camera's settings.", item=_slbl)
+            with dpg.group(horizontal=True):
+                _blbl = dpg.add_text("Bortle:")
+                dpg.add_input_int(tag='sim_bortle', width=S(80), min_value=1, max_value=9, min_clamped=True,
+                                  max_clamped=True, step=1, default_value=sim_ui['bortle'], on_enter=True,
+                                  callback=lambda *_: _sim_bortle_input())
+            _tip("Bortle dark-sky class 1..9 (sky brightness): 1 = pristine, 9 = inner city. Sets the sim "
+                 "sky background per pixel (needs a physical sensor -- QE / full-well in the optics DB). "
+                 "Darken the sky so a bright star's overexposed diffraction spikes clear the noise.", item=_blbl)
             dpg.add_text("planned: sim time & location; target overlays",
                          color=(120, 125, 140), wrap=S(230))
         with dpg.tree_node(label="Cameras", default_open=True):

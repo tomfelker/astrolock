@@ -50,10 +50,18 @@ class SkySimConfig:
     psf_wavelength_nm: float = 550.0          # wavelength for the Airy disc (green mid-band)
     seeing_r0_m: float = 0.0                  # atmospheric Fried parameter r0 (m); >0 adds a seeing blur
                                               # (FWHM ~ 0.98*lambda/r0). Typical: 0.05 poor .. 0.2 excellent
+    # Fixed-flux fallback (used when the optics/sensor aren't physically specified below).
     mag_flux_scale: float = 4.0e6             # electrons/s for a mag-0 source
     sky_bg_rate_e: float = 80.0              # sky background electrons / pixel / s
-    read_noise_e: float = 2.0
+    read_noise_e: float = 2.0                 # read noise (electrons RMS); overridden by the sensor's if known
     adu_per_e: float = 0.05                   # gain: electrons -> 12-bit ADU
+    # Physical photometry: when aperture_mm > 0 AND qe > 0, mag_flux_scale / sky_bg_rate_e / adu_per_e are
+    # DERIVED from real units in __init__ (aperture area, QE, throughput, plate scale, sky brightness, well).
+    qe: float = 0.0                           # sensor peak quantum efficiency (e-/photon); 0 -> fixed fallback
+    full_well_e: float = 0.0                  # full-well capacity (e-): ADC saturates here; 0 -> keep adu_per_e
+    zero_point_photons: float = 1.0e6         # photons/s/cm^2 for a mag-0 star (broadband) -- the flux zero point
+    system_throughput: float = 0.5            # optics + atmosphere transmission (0..1)
+    sky_mag_arcsec2: float = 21.0             # sky surface brightness (mag/arcsec^2), from the Bortle zone
     noise_refresh: int = 0                    # frames between redraws of the reused unit-noise buffer
                                               # (0 = never; the buffer is cropped at a random offset each
                                               # frame, which is ~free vs drawing randn per pixel)
@@ -179,27 +187,27 @@ def aperture_psf(size, r_null_px, obstruction=0.0, vanes=0, vane_width_frac=0.0,
     return crop / crop.sum()
 
 
-def _kernel_to_otf(psf, sz):
-    """rfft2 of a small centred square PSF `psf` embedded wrap-centred into an sz=(H,W) frame -- so it
-    convolves with no shift and no square-kernel boundary, matching how _airy_otf builds full-frame."""
-    H, W = sz
-    N = psf.shape[0]
-    k = torch.fft.ifftshift(psf)                               # peak -> (0,0), wrapping within N x N
-    full = torch.zeros(H, W, dtype=psf.dtype, device=psf.device)
-    a, b = (N + 1) // 2, N // 2                                # the [0:a] / [a:N] blocks -> the frame corners
-    full[:a, :a] = k[:a, :a]
-    full[:a, W - b:] = k[:a, a:]
-    full[H - b:, :a] = k[a:, :a]
-    full[H - b:, W - b:] = k[a:, a:]
-    return torch.fft.rfft2(full)
-
-
 class SkySim:
     def __init__(self, config=None, device='cpu'):
         self.cfg = config or SkySimConfig()
         self.device = device
         c = self.cfg
         self.f_px = c.focal_length_mm / (c.pixel_pitch_um * 1e-3)   # pixels per radian-ish
+        # Photometry: derive the flux zero point, sky rate, and ADC gain from real units when the optics +
+        # sensor are physically specified; else keep the config's fixed fallbacks. A point source's flux is
+        # plate-scale-independent (all in the PSF) but the sky is per arcsec^2, so it scales with the pixel
+        # solid angle -- a narrow cam sees a darker per-pixel sky, which is what lets faint spikes clear it.
+        self.mag_flux_scale, self.sky_bg_rate_e = c.mag_flux_scale, c.sky_bg_rate_e
+        self.adu_per_e, self.read_noise_e = c.adu_per_e, c.read_noise_e
+        self.gain_mult = 1.0                       # live sensor gain multiplier (centibels: 10^(cB/200))
+        if c.aperture_mm > 0 and c.qe > 0:
+            area_cm2 = math.pi * (c.aperture_mm / 20.0) ** 2 * (1.0 - c.central_obstruction ** 2)  # (D/2 mm)/10=cm
+            zp_e = c.zero_point_photons * area_cm2 * c.qe * c.system_throughput      # e-/s for a mag-0 star
+            plate_arcsec = 206264.806 * (c.pixel_pitch_um * 1e-3) / c.focal_length_mm
+            self.mag_flux_scale = zp_e
+            self.sky_bg_rate_e = zp_e * (10.0 ** (-0.4 * c.sky_mag_arcsec2)) * plate_arcsec ** 2
+            if c.full_well_e > 0:
+                self.adu_per_e = 4095.0 / c.full_well_e     # 12-bit ADC saturates exactly at the full well
         self.cx, self.cy = (c.boresight_px if c.boresight_px
                             else (c.width / 2.0, c.height / 2.0))
         # hidden tripod rotation: mount-frame ENU -> true ENU
@@ -274,17 +282,22 @@ class SkySim:
         inten = _airy_intensity(xx, yy, r_null_px)
         return torch.fft.rfft2((inten / inten.sum()))
 
-    def _aperture_otf(self, sz, r_null_px, grid=256):
-        """OTF for an obstructed / vaned pupil: build the diffraction PSF numerically (|FFT(pupil)|^2) on
-        a square grid at camera-pixel scale, then embed it wrap-centred into the frame and rfft2 (matching
-        _airy_otf). Falls back to the analytic clear Airy if the aperture would overrun the grid."""
+    def _aperture_otf(self, sz, r_null_px):
+        """OTF for an obstructed / vaned pupil, built FULL-FRAME: the diffraction PSF |FFT(pupil)|^2 on a
+        square grid spanning the frame's larger dimension, at camera-pixel scale -- so thin spider vanes
+        span several pupil samples (at a small fixed grid a ~1mm vane on a 200mm aperture is sub-pixel and
+        vanishes, killing the spikes) and their spikes reach across the frame. Cropped to the frame + rfft2,
+        matching _airy_otf. Falls back to the analytic Airy only if even the full frame is undersampled."""
         c = self.cfg
-        grid = min(grid, sz[0], sz[1])                             # the embed needs grid <= min(H, W)
-        if grid < 8 or 1.2196699 * grid / r_null_px >= grid - 2:   # undersampled: PSF is sub-pixel -> Airy
+        H, W = sz
+        S = _next_fast_len(max(H, W))                             # square so the circular pupil isn't distorted
+        if 1.2196699 * S / r_null_px >= S - 2:                    # aperture overruns even the full frame -> Airy
             return self._airy_otf(sz, r_null_px)
-        psf = _aperture_psf_full(grid, r_null_px, c.central_obstruction, c.spider_vanes,
+        psf = _aperture_psf_full(S, r_null_px, c.central_obstruction, c.spider_vanes,
                                  c.vane_width_frac, self.device)
-        return _kernel_to_otf(psf, sz)
+        y0, x0 = (S - H) // 2, (S - W) // 2                       # central crop back to the frame
+        psf = psf[y0:y0 + H, x0:x0 + W]
+        return torch.fft.rfft2(torch.fft.ifftshift(psf / psf.sum()))
 
     def _gauss_otf(self, sz, sigma):
         """rfft2 of a full-frame centred Gaussian of stddev `sigma` px."""
@@ -400,7 +413,7 @@ class SkySim:
                 px = self.cx + self.f_px * (X * cphi + Y * sphi)      # (T, S)
                 py = self.cy - self.f_px * (-X * sphi + Y * cphi)
                 vis = denom > 0
-                flux = c.mag_flux_scale * (10.0 ** (-0.4 * mag)) * exposure_s / S   # (T,)
+                flux = self.mag_flux_scale * (10.0 ** (-0.4 * mag)) * exposure_s / S   # (T,)
                 flux = flux[:, None].expand(-1, S)
                 self._splat(fb, px[vis], py[vis], flux[vis])
 
@@ -412,7 +425,7 @@ class SkySim:
         dev = fb.device
         noise = self._unit_noise(fb.shape[0], fb.shape[1])
         adu = self._apply_tail(fb, noise,
-                               torch.tensor(c.sky_bg_rate_e * exposure_s, dtype=torch.float32, device=dev),
-                               torch.tensor(c.read_noise_e ** 2, dtype=torch.float32, device=dev),
-                               torch.tensor(c.adu_per_e, dtype=torch.float32, device=dev))
+                               torch.tensor(self.sky_bg_rate_e * exposure_s, dtype=torch.float32, device=dev),
+                               torch.tensor(self.read_noise_e ** 2, dtype=torch.float32, device=dev),
+                               torch.tensor(self.adu_per_e * self.gain_mult, dtype=torch.float32, device=dev))
         return (adu << 4).cpu().numpy().astype(np.uint16)     # 12-bit -> 0xfff0 container
