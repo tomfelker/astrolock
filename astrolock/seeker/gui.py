@@ -95,25 +95,45 @@ def _gamma_lut(white_int, gain, gamma, device):
     return lut
 
 
-def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0), device=None):
+def _downscale_int(a, d):
+    """Box-average an int plane by an integer factor d (crop to a multiple of d), staying integer -- much
+    cheaper than downscaling the float RGBA, and it shrinks the tonemap + upload that follow."""
+    if d <= 1:
+        return a
+    if d == 2:                                       # cheap strided 2x2 average -- no reshape copy
+        h, w = a.shape[0] & ~1, a.shape[1] & ~1
+        a = a[:h, :w]
+        return (a[0::2, 0::2] + a[1::2, 0::2] + a[0::2, 1::2] + a[1::2, 1::2]) // 4
+    h, w = a.shape
+    a = a[:(h // d) * d, :(w // d) * d]
+    return a.reshape(h // d, d, w // d, d).sum(dim=(1, 3)) // (d * d)
+
+
+def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0), device=None, downscale=1, prof=None):
     """
     Raw frame (mosaic or mono) -> (w, h, (h,w,4) float32 RGBA on CPU, for the dpg texture).
     All compute is torch and device-parameterized (GPU-ready); torch has no uint16, so the frame is
     cast to int32 at the single ingest boundary, then everything stays in torch until the final
-    .cpu().numpy() for the upload. Debayers Bayer to half-res RGB (4-plane split), applies
-    display-only WB (R,B gains -- stored data stays pristine), maps the full container range to
-    [0,1] with NO auto-stretch, applies gamma -- WB+gamma via a cached LUT, not a per-pixel pow.
+    .cpu().numpy() for the upload. Order (cheap int work first, then the one float pass): Bayer 4-plane
+    stack -> integer box-downscale (``downscale``, to ~display size) -> WB+gamma tonemap via a cached LUT
+    -> RGBA. Display-only WB (R,B gains, data stays pristine); full container range mapped to [0,1], no
+    auto-stretch. dpg raw textures are float-only, so we can't hand it the u16 mosaic -- hence this path.
+    ``prof`` (a dict, if given) is filled with per-stage ms for the GUI profiler.
     """
     device = device or _DEVICE
     white_int = int(np.iinfo(frame_raw.dtype).max) if np.issubdtype(frame_raw.dtype, np.integer) else 1
+    t0 = time.perf_counter()
     frame = torch.from_numpy(np.ascontiguousarray(frame_raw).astype(np.int32, copy=False)).to(device)
-
+    t1 = time.perf_counter()
     if bayer.is_bayer(color_id):
         planes = (frame[0::2, 0::2], frame[0::2, 1::2], frame[1::2, 0::2], frame[1::2, 1::2])
         ri, (g0, g1), bi = bayer.rgb_plane_indices(color_id)
-        chans = ((planes[ri], wb[0]), ((planes[g0] + planes[g1]) // 2, 1.0), (planes[bi], wb[1]))
+        chans = [(planes[ri], wb[0]), ((planes[g0] + planes[g1]) // 2, 1.0), (planes[bi], wb[1])]
     else:
-        chans = ((frame, 1.0),)
+        chans = [(frame, 1.0)]
+    if downscale > 1:                                                  # int box-downscale (before the float pass)
+        chans = [(_downscale_int(idx, downscale), gain) for idx, gain in chans]
+    t2 = time.perf_counter()
 
     h, w = chans[0][0].shape
     rgba = torch.ones((h, w, 4), dtype=torch.float32, device=device)    # alpha pre-filled to 1.0
@@ -123,7 +143,14 @@ def prepare_rgba(frame_raw, color_id, gamma, wb=(1.0, 1.0), device=None):
             rgba[..., 0] = rgba[..., 1] = rgba[..., 2] = disp
         else:
             rgba[..., c] = disp
-    return w, h, rgba.cpu().numpy()                                     # CPU only at the end, for dpg
+    t3 = time.perf_counter()
+    out = rgba.cpu().numpy()                                            # CPU only at the end, for dpg
+    if prof is not None:
+        prof['ingest'] = (t1 - t0) * 1e3
+        prof['stack'] = (t2 - t1) * 1e3
+        prof['tonemap'] = (t3 - t2) * 1e3
+        prof['tocpu'] = (time.perf_counter() - t3) * 1e3
+    return w, h, out
 
 
 def draw_box(rgba, cx, cy, half, color):
@@ -328,7 +355,12 @@ def main(argv=None):
     perf = {'gui': _Meter(), 'mount': _Meter(), 'focus': _Meter(), 'frame': 0,   # GUI/mount/focus rates
             'cam': {r: _Meter() for r in roles},                  # per-role frames *produced* / s
             'det': {r: _Meter() for r in roles},                  # per-role detector frames processed / s
-            'idx': {}}                                            # role -> last committed frame index seen
+            'idx': {},                                            # role -> last committed frame index seen
+            'ms': {}}                                             # name -> EMA of a timed section (ms), for the profiler
+
+    def _prof(name, ms):                                          # exponential moving average of a timing (ms)
+        m = perf['ms']
+        m[name] = ms if name not in m else m[name] * 0.9 + ms * 0.1
     view_settings = {}        # role -> display prefs {zoom, reticles, histogram}; persists across cams
     cam_ctrl_val = {}         # (role, control name) -> current value; the GUI owns it once a control is shown
     layout = {'panel_open': True, 'pip_open': True, 'pip_debug': False, 'panel_w': S(PANEL_W),
@@ -426,6 +458,15 @@ def main(argv=None):
     def _active_slots():
         return ['big'] + ((layout.get('pip_slots') or []) if layout['pip_open'] else [])
 
+    def _pane_size_for(stream):
+        """(w, h) of the drawlist of the active slot showing `stream`, else None (not currently shown) --
+        used to downscale the texture to ~the pane size instead of preparing/uploading it at full res."""
+        for nm in _active_slots():
+            if _slot_stream(nm) == stream:
+                _, sz = _item_rect(f"dl_{nm}")
+                return sz
+        return None
+
     def _zoom_step(role, delta):
         s = view_settings.setdefault(role, _default_settings())
         i = ZOOM_MULTS.index(s['zoom']) if s['zoom'] in ZOOM_MULTS else 0
@@ -471,10 +512,20 @@ def main(argv=None):
             pseg, pidx = perf['idx'].get(role, (seg, idx))
             perf['cam'][role].hit(idx - pidx if (pseg == seg and idx >= pidx) else 0)
             perf['idx'][role] = (seg, idx)
+        # Downscale to ~the pane size (in the cheap int domain, inside prepare_rgba) instead of preparing +
+        # uploading a full-res float texture the GPU would only shrink. Keep >= ~1 texel per pane pixel at
+        # the current zoom (so fit is crisp and zoom-in stays sharp); no pane shown -> no downscale.
+        nb = 2 if bayer.is_bayer(f.header.color_id) else 1
+        nw, nh = f.header.image_width // nb, f.header.image_height // nb
+        pane = _pane_size_for(role)
+        z = view_settings.get(role, {}).get('zoom', 1.0) or 1.0
+        ds = 1
+        if pane is not None:
+            ds = max(1, int(_floor_pow2(min(nw / max(1.0, pane[0] * z), nh / max(1.0, pane[1] * z)))))
         cam = cams.get(role)
         if cam is None:
             fh0, fw0 = frame.shape[0], frame.shape[1]
-            w, h, _rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device)
+            w, h, _rgba = prepare_rgba(frame, f.header.color_id, args.gamma, wb, device=device, downscale=ds)
             tex = f"tex_{role}_0"
             if not dpg.does_item_exist(tex):
                 with dpg.texture_registry():
@@ -512,7 +563,10 @@ def main(argv=None):
             except (IndexError, ValueError):
                 return False                             # rollover race / not yet readable -- retry next tick
         fh, fw = disp.shape[0], disp.shape[1]
-        w, h, rgba = prepare_rgba(disp, f.header.color_id, args.gamma, wb, device=device)
+        _prof_stage, _t = {}, time.perf_counter()
+        w, h, rgba = prepare_rgba(disp, f.header.color_id, args.gamma, wb, device=device,
+                                  downscale=ds, prof=_prof_stage)
+        _tp = time.perf_counter()
         if (w, h) != (cam['w'], cam['h']):          # frame size changed (source/optics switch) -> a
             old = cam['tex']                          # fresh texture. Use a new tag so the string alias
             cam['texver'] += 1                        # never collides -- delete_item leaves the alias
@@ -524,6 +578,11 @@ def main(argv=None):
                 dpg.delete_item(old)                  # safe: draw_slot re-points its draw_image this frame
             cam.update(w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh, color_id=f.header.color_id)
         dpg.set_value(cam['tex'], rgba.ravel())
+        for _k, _v in _prof_stage.items():           # profiler: prepare_rgba stages + prepare/upload totals
+            _prof(_k, _v)
+        _prof('prepare', (_tp - _t) * 1e3)
+        _prof('upload', (time.perf_counter() - _tp) * 1e3)
+        _prof('downscale', float(ds))
         cam['last_idx'] = show_idx
         # The histogram inset is off by default; only pay for it (a full-frame subsample + np.histogram
         # every frame) when it's actually enabled for this role. Otherwise skip it entirely.
@@ -1801,6 +1860,14 @@ def main(argv=None):
                 lines.append(f"{r.capitalize()} Detector: {s}")
         if st.get('status'):
             lines.append(f"Backend: {st['status']}")
+        # Profiler: EMA ms of the hot GUI sections (per prepared frame) -- where a lagging GUI spends time.
+        ms = perf['ms']
+        if ms:
+            g = ms.get
+            lines.append(f"prep {g('prepare', 0):4.1f}  upload {g('upload', 0):4.1f}  "
+                         f"draw {g('draw', 0):4.1f} ms  (down {int(g('downscale', 1))}x)")
+            lines.append(f"  ingest {g('ingest', 0):4.1f} stack {g('stack', 0):4.1f} "
+                         f"tone {g('tonemap', 0):4.1f} tocpu {g('tocpu', 0):4.1f} ms")
         return "\n".join(lines)
 
     def update_control():
@@ -2113,8 +2180,10 @@ def main(argv=None):
             stream = _slot_stream(name)
             if stream not in roles and update_cam(stream):
                 new_work = True
+        _tdraw = time.perf_counter()
         for name in _active_slots():
             draw_slot(name)
+        _prof('draw', (time.perf_counter() - _tdraw) * 1e3)      # all active panes' overlays this frame
 
         if event_driven:
             # Tell the watcher which files to watch (the currently-followed .ser + detection sidecars +
