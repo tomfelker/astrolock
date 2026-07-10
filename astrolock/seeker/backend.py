@@ -64,6 +64,9 @@ def main(argv=None):
     p.add_argument('--playback-ser', default=None, help="playback source: the .ser file to replay")
     p.add_argument('--playback-speed', type=float, default=1.0, help="playback source: speed multiplier")
     p.add_argument('--playback-loop', action='store_true', help="playback source: loop instead of stopping")
+    p.add_argument('--playback-fps', type=float, default=10.0,
+                   help="playback source: frame-rate cap (0 = unlimited); the only pacing for a "
+                        "recording with no timestamp sidecar")
     p.add_argument('--detect-roles', default='guide,main',
                    help="comma-separated roles to run detection on. Default both: the guide runs the "
                         "multi-blob detector (--detector) for acquisition, the main runs its "
@@ -76,6 +79,16 @@ def main(argv=None):
     p.add_argument('--doh-sigma', type=float, default=0.0, help="doh detector: Gaussian scale px (0 = psf default)")
     p.add_argument('--surprise-decay', type=float, default=0.85,
                    help="surprise detector: trail peak-hold decay (->1 integrates longer for fainter trails)")
+    p.add_argument('--surprise-blur-px', type=float, default=1.5,
+                   help="surprise detector: spatial low-pass sigma (px) on the surprisal map (0 = off)")
+    p.add_argument('--tile-size', type=int, default=128,
+                   help="surprise detector: tile edge (px) for the per-tile extremum pass")
+    p.add_argument('--tile-fixed-nsigma', type=float, default=8.0,
+                   help="surprise detector: stdevs from the tile mean to keep a fixed (running-mean) extremum")
+    p.add_argument('--tile-moving-nsigma', type=float, default=5.0,
+                   help="surprise detector: stdevs from the tile mean to keep a moving (surprisal) extremum")
+    p.add_argument('--tile-mask-px', type=int, default=16,
+                   help="surprise detector: mask radius (px) around fixed extrema when hunting movers")
     p.add_argument('--debug-detect-ser', action='store_true',
                    help="have each detector also write <seg>_<role>_debug.ser -- a movie of its detection "
                         "surface, followable in the GUI/any SER viewer for tuning")
@@ -478,7 +491,8 @@ def main(argv=None):
             per_role_sky += ['--roi', ','.join(str(v) for v in roi_window_by_role[role])]   # crop in hardware
         cam_sel = ['--camera-url', camera_url[role]] if (sources[role] == 'zwo' and camera_url[role]) else []
         pb = playback_by_role.get(role) or {}
-        playback_args = (['--playback-ser', pb['ser'], '--playback-speed', str(args.playback_speed)]
+        playback_args = (['--playback-ser', pb['ser'], '--playback-speed', str(args.playback_speed),
+                          '--playback-fps', str(args.playback_fps)]
                          + (['--playback-loop'] if pb.get('loop') else [])
                          if sources[role] == 'playback' and pb.get('ser') else [])
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
@@ -503,6 +517,11 @@ def main(argv=None):
                                      '--stop-file', stop_file,
                                      '--detector', det, '--doh-sigma', str(args.doh_sigma),
                                      '--surprise-decay', str(args.surprise_decay),
+                                     '--surprise-blur-px', str(args.surprise_blur_px),
+                                     '--tile-size', str(args.tile_size),
+                                     '--tile-fixed-nsigma', str(args.tile_fixed_nsigma),
+                                     '--tile-moving-nsigma', str(args.tile_moving_nsigma),
+                                     '--tile-mask-px', str(args.tile_mask_px),
                                      '--ext-nsigma', str(args.ext_nsigma),
                                      '--ext-density', str(args.ext_density),
                                      '--snr', str(args.snr), '--max-candidates', str(args.max_candidates),

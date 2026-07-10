@@ -43,6 +43,31 @@ def test_detect_tracks_moving_blob():
     assert sum(bool(m) for m in moving) >= 15, f"most frames should read as moving: {sum(bool(m) for m in moving)}"
 
 
+def test_tile_targets_fixed_moving_split():
+    # 256x256 = 4 tiles of 128. A star + a dead pixel live in the running mean; a mover and a
+    # twinkle-at-the-star live in the surprisal. The twinkle must NOT become a mover (masked).
+    import torch
+    torch.manual_seed(0)
+    mu = torch.randn(256, 256)
+    mu[40, 40] += 100.0                            # bright star (tile 0,0)
+    mu[200, 60] -= 100.0                           # dead pixel (x=60, y=200; tile 1,0)
+    zs = torch.randn(256, 256)
+    zs[40, 40] += 20.0                             # the star twinkling hard (temporally surprising!)
+    zs[60, 200] += 8.0                             # a real mover (x=200, y=60; tile 0,1)
+    work = mu.clamp(min=0)
+
+    blobs = detect.tile_targets(mu, zs, work, tile_size=128, fixed_nsigma=5.0,
+                                moving_nsigma=5.0, mask_px=8, scale=1.0)
+
+    fixed_bright = [b for b in blobs if not b['moving'] and not b.get('dark')]
+    fixed_dark = [b for b in blobs if not b['moving'] and b.get('dark')]
+    movers = [b for b in blobs if b['moving'] and not b.get('dark')]
+    assert [b['px'] for b in fixed_bright] == [[40.0, 40.0]], fixed_bright
+    assert [b['px'] for b in fixed_dark] == [[60.0, 200.0]], fixed_dark
+    assert [b['px'] for b in movers] == [[200.0, 60.0]], movers   # the twinkle was masked out
+    assert all(b['nsigma'] >= 5.0 for b in blobs)
+
+
 def test_detect_rejects_extended_clutter():
     # Wide-FOV scene: a big bright "rooftop" slab plus one faint-ish point source.
     work = np.zeros((200, 200), np.float32)
@@ -189,6 +214,7 @@ def test_roi_peak_track_mode():
 
 if __name__ == '__main__':
     test_detect_tracks_moving_blob()
+    test_tile_targets_fixed_moving_split()
     test_detect_rejects_extended_clutter()
     test_roundness_rejects_streak()
     test_doh_detects_blobs_rejects_edge()

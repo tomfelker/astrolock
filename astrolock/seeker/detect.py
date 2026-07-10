@@ -185,6 +185,14 @@ class SurpriseModel:
                  separates a fast mover (a 1-frame spike) from slow star drift (tracked + absorbed by
                  the mean). This alone removes stars + terrain -- the surprise map is nearly black.
 
+      blur:      optional spatial Gaussian low-pass (sigma `blur_px`) on the SIGNED surprisal before
+                 the clamp -- the matched filter for an extended mover. A trail lights several
+                 adjacent pixels at once, so the blur integrates them, while independent per-pixel
+                 noise (zero-mean pre-clamp, so it cancels rather than piling into a pedestal)
+                 averages down by ~the kernel norm. The result is divided by that norm, so it stays
+                 in true sigma units: a 3-sigma-per-pixel trail reads ~several sigma, single-pixel
+                 twinkle reads ~1. The glasses-off trick, quantified.
+
       trail:     trail = max(decay * trail, z) -- a decaying peak-hold of the surprise. A mover paints
                  its recent path as a bright comet: each pixel keeps the FULL spike height as the object
                  passes, fading over ~1/(1-decay) frames, so a per-frame few-sigma spike becomes a
@@ -195,12 +203,42 @@ class SurpriseModel:
 
     var_floor_frac ties the noise floor to the typical per-pixel temporal variance (its median across
     the frame), so no absolute-DN tuning is needed. Needs ~1/alpha frames of warm-up before the
-    variance estimate settles. The per-pixel elementwise step (_surprise_step) is torch.compile'd into
-    one fused kernel (see _compiled_fn). See astrolock_seeker.md."""
+    variance estimate settles. The elementwise pieces are torch.compile'd into fused kernels (see
+    _compiled_fn); the blur is two separable 1-D convs. See astrolock_seeker.md."""
 
-    def __init__(self, alpha_mean=0.15, alpha_var=0.08, decay=0.85, var_floor_frac=0.5):
+    def __init__(self, alpha_mean=0.15, alpha_var=0.08, decay=0.85, var_floor_frac=0.5, blur_px=1.5):
         self.a_m, self.a_v, self.decay, self.vff = alpha_mean, alpha_var, decay, var_floor_frac
-        self.mu = self.var = self.trail = None
+        self.blur_px = blur_px
+        self._g = self._g_norm = None                         # blur kernel (built lazily on the work device)
+        self.mu = self.var = self.trail = self.z = None       # z = this frame's surprise map (sigma units)
+        self.zs = None                                        # ...and its SIGNED twin (dark movers dip below 0)
+        self._mu_f = None                                     # matched-filtered mu (lazy, per frame)
+
+    def _kernel(self, device):
+        if self._g is None:
+            radius = max(1, int(4.0 * self.blur_px + 0.5))
+            self._g, _, _ = gaussian_deriv_kernels(self.blur_px, radius, device=device)
+            self._g_norm = float((self._g ** 2).sum())
+        return self._g
+
+    def _blur_unit_noise(self, zs):
+        """Separable Gaussian blur, renormalized so unit-variance input noise stays unit-variance:
+        for kernel k (per axis), independent noise std scales by sqrt(sum k^2) per axis, so divide
+        the 2-D result by sum(k^2) (computed from the actual truncated kernel, so it's exact)."""
+        g = self._kernel(zs.device)
+        return _conv1d_axis(_conv1d_axis(zs, g, 1), g, 0) / self._g_norm
+
+    def mu_filtered(self):
+        """The running mean through the same matched filter (plain flux-preserving blur; no noise
+        renorm -- the tile pass thresholds relative to each tile's own stats, so only the RATIO
+        matters). The detection surface for FIXED targets; read scores/display off the raw mu.
+        Lazy per frame: computed on first call after an update, cached until the next."""
+        if self.blur_px <= 0 or self.mu is None:
+            return self.mu
+        if self._mu_f is None:
+            g = self._kernel(self.mu.device)
+            self._mu_f = _conv1d_axis(_conv1d_axis(self.mu, g, 1), g, 0)
+        return self._mu_f
 
     def update(self, work):
         work = torch.as_tensor(work, dtype=torch.float32)
@@ -208,19 +246,138 @@ class SurpriseModel:
             self.mu = work.clone()
             self.var = torch.full_like(work, float(work.var()) + 1.0)
             self.trail = torch.zeros_like(work)
+            self.z = torch.zeros_like(work)
+            self.zs = torch.zeros_like(work)
             return self.trail
         floor = self.vff * torch.median(self.var) + 1e-6      # 0-d tensor (dynamic; no per-frame recompile)
-        self.trail, self.mu, self.var = _compiled_fn(_surprise_step)(
-            work, self.mu, self.var, self.trail, floor, self.a_m, self.a_v, self.decay)
+        zs, self.mu, self.var = _compiled_fn(_surprise_step)(
+            work, self.mu, self.var, floor, self.a_m, self.a_v)
+        if self.blur_px > 0:
+            zs = self._blur_unit_noise(zs)
+        self.zs = zs
+        self._mu_f = None                                     # mu moved -> refilter on next mu_filtered()
+        self.z, self.trail = _compiled_fn(_trail_step)(zs, self.trail, self.decay)
         return self.trail
 
 
-def _surprise_step(work, mu, var, trail, floor, a_m, a_v, decay):
-    """One SurpriseModel step, elementwise -> one fused kernel: surprise z-score + decaying peak-hold
-    trail + EMA mean/variance updates. Returns (trail, mu, var)."""
+def _surprise_step(work, mu, var, floor, a_m, a_v):
+    """SurpriseModel EMA step, elementwise -> one fused kernel: SIGNED surprise z-score + EMA
+    mean/variance updates. Returns (z_signed, mu, var). (Signed, so the optional spatial blur sees
+    zero-mean noise; the clamp happens in _trail_step after it.)"""
     d = work - mu
-    z = (d / torch.sqrt(var + floor)).clamp(min=0.0)
-    return torch.maximum(decay * trail, z), mu + a_m * d, (1.0 - a_v) * var + a_v * d * d
+    return d / torch.sqrt(var + floor), mu + a_m * d, (1.0 - a_v) * var + a_v * d * d
+
+
+def _trail_step(zs, trail, decay):
+    """Clamp the (possibly blurred) signed surprisal + decaying peak-hold, fused. Returns (z, trail)."""
+    z = zs.clamp(min=0.0)
+    return z, torch.maximum(decay * trail, z)
+
+
+def tile_targets(mu, zs, work, *, tile_size, fixed_nsigma, moving_nsigma, mask_px, scale,
+                 mu_score=None):
+    """
+    Per-tile extremum detector: the acquisition pass for the surprise detector.
+
+    The frame is cut into tile_size^2 tiles and each tile may emit up to 4 targets:
+
+      FIXED bright/dark:  the max / min pixel of ``mu`` (the per-pixel temporal running mean -- a
+                          deeply denoised sky, so stars stand far above a tile's spatial noise),
+                          kept if it sits >= fixed_nsigma spatial stdevs from the tile's mean.
+      MOVING bright/dark: the max / min pixel of ``zs`` (the SIGNED, matched-filtered surprisal;
+                          a dark mover dips negative), kept if >= moving_nsigma stdevs from the
+                          tile's spatial mean -- computed with all fixed extrema masked out,
+                          because a twinkling star IS temporally surprising. The mask dilates
+                          every tile's fixed extrema (kept or not: the tile's brightest star is
+                          the twinkle risk even below threshold) by mask_px, and it's GLOBAL, so
+                          a star's halo can't leak into a neighbouring tile's mover slot.
+
+    One argmax/argmin + mean/var per tile per surface, all batched (a reshape to (tiles, S*S) and
+    per-tile reductions) -- embarrassingly parallel, no global sort, no NMS, no shape cuts. False
+    positives are cheap by design: the user (or the tracker's own gating) picks among candidates,
+    and a tile can never emit more than 4. Thresholds are per-tile ("N stdevs above THIS tile's
+    background"), so vignetting / sky gradients / light pollution self-normalize. Edge tiles are
+    replicate-padded, slightly overweighting edge pixels in the stats -- harmless.
+
+    Returns blob dicts in WORK coords (caller scales to frame coords): 'moving' True/False,
+    'dark' True on the minima, 'nsigma' = stdevs from the tile mean, 'score' = absolute
+    brightness of that pixel (from ``mu_score`` -- the raw running mean, when ``mu`` itself is
+    a matched-filtered surface -- for fixed; the live frame for movers).
+    """
+    F = torch.nn.functional
+    mu = torch.as_tensor(mu, dtype=torch.float32)
+    zs = torch.as_tensor(zs, dtype=torch.float32)
+    work = torch.as_tensor(work, dtype=torch.float32)
+    mu_score = mu if mu_score is None else torch.as_tensor(mu_score, dtype=torch.float32)
+    H, W = mu.shape
+    S = int(tile_size)
+    ny, nx = (H + S - 1) // S, (W + S - 1) // S
+    ph, pw = ny * S - H, nx * S - W
+    T = ny * nx
+    dev = mu.device
+
+    def pad(img):
+        return F.pad(img[None, None], (0, pw, 0, ph), mode='replicate')[0, 0] if (ph or pw) else img
+
+    def tiles(img):
+        return img.reshape(ny, S, nx, S).permute(0, 2, 1, 3).reshape(T, S * S)
+
+    # ---- fixed pass: extrema of the running mean vs the tile's spatial stats -------------------
+    tm = tiles(pad(mu))
+    fmean = tm.mean(dim=1)
+    fstd = tm.std(dim=1) + 1e-6
+    fmax, imax = tm.max(dim=1)
+    fmin, imin = tm.min(dim=1)
+    f_hi = (fmax - fmean) / fstd
+    f_lo = (fmean - fmin) / fstd
+
+    # ---- mask around every fixed extremum: separable square dilation on the padded canvas ------
+    tid = torch.arange(T, device=dev)
+    tid2 = tid.repeat(2)
+    ii2 = torch.cat([imax, imin])
+    my = (tid2 // nx) * S + ii2 // S
+    mx = (tid2 % nx) * S + ii2 % S
+    mask = torch.zeros(ny * S, nx * S, dtype=torch.float32, device=dev)
+    mask[my, mx] = 1.0
+    r, k = int(mask_px), 2 * int(mask_px) + 1
+    mask = F.max_pool2d(mask[None, None], (k, 1), stride=1, padding=(r, 0))
+    mask = F.max_pool2d(mask, (1, k), stride=1, padding=(0, r))[0, 0] > 0
+
+    # ---- moving pass: extrema of the signed surprisal, fixed extrema excluded ------------------
+    tz = tiles(pad(zs))
+    valid = tiles(mask.logical_not())
+    cnt = valid.sum(dim=1).clamp(min=1)
+    zmean = (tz * valid).sum(dim=1) / cnt
+    zstd = ((((tz - zmean[:, None]) * valid) ** 2).sum(dim=1) / cnt).sqrt() + 1e-6
+    ninf = torch.tensor(float('-inf'), device=dev)
+    zmax, jmax = torch.where(valid, tz, ninf).max(dim=1)
+    zmin, jmin = torch.where(valid, tz, -ninf).min(dim=1)
+    m_hi = (zmax - zmean) / zstd
+    m_lo = (zmean - zmin) / zstd
+
+    out = []
+
+    def emit(keep, idx, sig, moving, dark, surf):
+        sel = torch.nonzero(keep, as_tuple=False).squeeze(1)
+        if sel.numel() == 0:
+            return
+        ii = idx[sel]
+        # tile-local -> image coords; clamp maps a replicate-padded pick back onto the real edge px
+        y = ((tid[sel] // nx) * S + ii // S).clamp(max=H - 1)
+        x = ((tid[sel] % nx) * S + ii % S).clamp(max=W - 1)
+        sc = surf[y, x] / scale
+        for xx, yy, ss, gg in zip(x.tolist(), y.tolist(), sc.tolist(), sig[sel].tolist()):
+            out.append({'px': [float(xx), float(yy)], 'score': round(ss, 4),
+                        'nsigma': round(gg, 1), 'moving': moving,
+                        **({'dark': True} if dark else {})})
+
+    emit(f_hi >= fixed_nsigma, imax, f_hi, False, False, mu_score)
+    emit(f_lo >= fixed_nsigma, imin, f_lo, False, True, mu_score)
+    emit(m_hi >= moving_nsigma, jmax, m_hi, True, False, work)
+    emit(m_lo >= moving_nsigma, jmin, m_lo, True, True, work)
+    for i, b in enumerate(out):
+        b['id'] = i
+    return out
 
 
 def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_radius,
@@ -434,6 +591,52 @@ def detect_roi_peak(work, roi, coord_scale, *, detector, bg_radius, psf_px, doh_
              'moving': True, 'size_px': psf_px * coord_scale, 'score': float(bp[py, px] / m)}]
 
 
+def surprise_roi_peak(z, roi, coord_scale, *, nsigma, psf_px):
+    """Track-mode detection for the surprise detector: the tile pass collapsed to a single tile.
+    The full-frame matched-filtered surprisal ``z`` is already computed every frame (the model
+    stays warm in track mode), so this is nearly free: crop the predicted ROI, weight by a gentle
+    Gaussian pull toward the predicted centre (the distance component of the score -- a brighter
+    mover elsewhere in the window can't casually steal the lock), take the single argmax, and
+    accept it only if the RAW surprisal there clears ``nsigma`` (z is in true sigma units, so
+    this is an absolute test -- no per-window background estimate needed). Returns one blob in
+    frame coords, or [] (a miss the tracker coasts through)."""
+    z = torch.as_tensor(z, dtype=torch.float32)
+    H, W = z.shape
+    cx, cy, size = roi
+    half = (size / coord_scale) / 2.0
+    ecx, ecy = cx / coord_scale, cy / coord_scale            # expected centre, work coords
+    x0, x1 = max(0, int(ecx - half)), min(W, int(ecx + half) + 1)
+    y0, y1 = max(0, int(ecy - half)), min(H, int(ecy + half) + 1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return []                                            # ROI off the frame
+    sub = z[y0:y1, x0:x1]
+    h, w = sub.shape
+    dev = sub.device
+    yy, xx = torch.meshgrid(torch.arange(h, dtype=torch.float32, device=dev),
+                            torch.arange(w, dtype=torch.float32, device=dev), indexing='ij')
+    sig_b = max(2.0 * psf_px, half / 2.0)                    # gentle pull toward the predicted centre
+    weight = torch.exp(-(((xx - (ecx - x0)) ** 2 + (yy - (ecy - y0)) ** 2)) / (2.0 * sig_b ** 2))
+    pidx = int(torch.argmax(sub * weight))
+    py, px = pidx // w, pidx % w
+    zpk = float(sub[py, px])
+    if zpk < nsigma:
+        return []                                            # nothing surprising near the prediction
+    cr = max(1, int(round(psf_px)))                          # sub-pixel centroid in a +/-psf window
+    wy0, wy1 = max(0, py - cr), min(h, py + cr + 1)
+    wx0, wx1 = max(0, px - cr), min(w, px + cr + 1)
+    patch = sub[wy0:wy1, wx0:wx1]
+    s = float(patch.sum())
+    if s > 0:
+        pyy, pxx = torch.meshgrid(torch.arange(wy0, wy1, dtype=torch.float32, device=dev),
+                                  torch.arange(wx0, wx1, dtype=torch.float32, device=dev), indexing='ij')
+        cpx, cpy = float((patch * pxx).sum()) / s, float((patch * pyy).sum()) / s
+    else:
+        cpx, cpy = float(px), float(py)
+    return [{'px': [(x0 + cpx) * coord_scale, (y0 + cpy) * coord_scale], 'moving': True,
+             'size_px': psf_px * coord_scale, 'nsigma': round(zpk, 1),
+             'score': round(min(1.0, zpk / 10.0), 4)}]       # same white-at-10-sigma convention as the debug
+
+
 def marginal_target(work, *, nsigma=4.0, density_thresh=0.7):
     """Symmetric single-extended-target detector (satellites, planes, rockets, daytime silhouettes).
 
@@ -516,6 +719,23 @@ def main(argv=None):
                         "longer for the faintest trails, at more latency)")
     p.add_argument('--surprise-var-floor-frac', type=float, default=0.5,
                    help="surprise: noise floor as this fraction of the median per-pixel variance")
+    p.add_argument('--surprise-blur-px', type=float, default=1.5,
+                   help="surprise: spatial Gaussian low-pass sigma (px) on the surprisal map -- "
+                        "integrates a trail's adjacent pixels while averaging independent per-pixel "
+                        "noise down (renormalized, so the map stays in sigma units). 0 = off")
+    p.add_argument('--tile-size', type=int, default=128,
+                   help="surprise: tile edge (px) for the per-tile extremum pass; each tile emits at "
+                        "most 4 targets (fixed bright/dark from the running mean, moving bright/dark "
+                        "from the surprisal)")
+    p.add_argument('--tile-fixed-nsigma', type=float, default=8.0,
+                   help="surprise: keep a tile's fixed (running-mean) extremum only if it's this many "
+                        "spatial stdevs from the tile mean")
+    p.add_argument('--tile-moving-nsigma', type=float, default=5.0,
+                   help="surprise: keep a tile's moving (surprisal) extremum only if it's this many "
+                        "spatial stdevs from the tile mean (fixed extrema masked out)")
+    p.add_argument('--tile-mask-px', type=int, default=16,
+                   help="surprise: mask radius (px) around every tile's fixed extrema when hunting "
+                        "movers, so a twinkling star can't claim the mover slot")
     p.add_argument('--ext-nsigma', type=float, default=3.0,
                    help="extended: two-tailed |value-mean| threshold on the row/col marginals, in sigmas "
                         "(catches bright AND dark targets; lower = includes dimmer target extremities)")
@@ -525,7 +745,8 @@ def main(argv=None):
     p.add_argument('--debug-ser', action='store_true',
                    help="also write the detection surface as <seg>_<role>_debug.ser (+ .frames.jsonl), a "
                         "normalized greyscale movie of exactly what the detector 'sees' -- follow it in "
-                        "the GUI or any SER viewer to tune (esp. the surprise trail).")
+                        "the GUI or any SER viewer to tune. For 'surprise' this is the raw per-frame "
+                        "surprisal (fixed scale: white = 10 sigma), not the peak-hold trail.")
     p.add_argument('--bg-radius', type=int, default=12,
                    help="bandpass: local-background blur radius (px); larger = pass bigger features")
     p.add_argument('--doh-sigma', type=float, default=0.0,
@@ -576,7 +797,8 @@ def main(argv=None):
         if args.detector != 'surprise':
             return None
         return SurpriseModel(args.surprise_alpha_mean, args.surprise_alpha_var,
-                             args.surprise_decay, args.surprise_var_floor_frac)
+                             args.surprise_decay, args.surprise_var_floor_frac,
+                             blur_px=args.surprise_blur_px)
 
     reader, writer = open_segment(cur)
     prev = None
@@ -607,6 +829,7 @@ def main(argv=None):
 
     def process(i):
         nonlocal prev, scale, total
+        t_start = time.perf_counter()                              # whole-frame cost -> proc_ms in the record
         frame = reader.read_frame(i)
         cid = reader.header.color_id
         if scale is None:
@@ -632,27 +855,44 @@ def main(argv=None):
             debug_surface = work                                   # debug-ser shows the analysed frame
             prev = None
         elif state['roi'] is not None:                             # track mode: single peak in the ROI
-            # ROI-peak needs a single-frame surface; 'surprise' is full-frame temporal, so fall back.
-            roi_detector = 'bandpass' if args.detector == 'surprise' else args.detector
-            blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=roi_detector,
-                                    bg_radius=args.bg_radius, psf_px=args.psf_px,
-                                    doh_sigma=args.doh_sigma, snr=args.snr)   # already frame coords
+            if surprise is not None:                               # the tile pass, collapsed to one tile:
+                blobs = surprise_roi_peak(surprise.z, state['roi'], coord_scale,   # centre-weighted argmax
+                                          nsigma=args.tile_moving_nsigma, psf_px=args.psf_px)
+            else:
+                blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=args.detector,
+                                        bg_radius=args.bg_radius, psf_px=args.psf_px,
+                                        doh_sigma=args.doh_sigma, snr=args.snr)   # already frame coords
             prev = None                                            # frame-diff not used in ROI mode
-            debug_surface = trail                                  # in ROI mode the only surface we have
+            debug_surface = surprise.z if surprise is not None else None
             status = "Locked On" if blobs else "Searching"
         else:                                                      # acquisition: full-frame multi-blob
-            bp = trail if surprise is not None else detection_surface(
-                work, detector=args.detector, bg_radius=args.bg_radius,
-                psf_px=args.psf_px, doh_sigma=args.doh_sigma, compiled=True)   # fixed full-frame shape
-            debug_surface = bp
-            blobs = detect_blobs(
-                bp, work, (None if surprise is not None else prev),
-                threshold_rel=args.threshold, max_candidates=args.max_candidates,
-                suppress_radius=args.suppress_radius, min_blob_px=args.min_blob_px,
-                max_size_px=args.max_size_px, psf_px=args.psf_px,
-                snr=args.snr, min_roundness=args.min_roundness,
-                moving_frac=args.moving_frac, scale=scale,
-                tile_grid=args.tile_grid, per_tile=args.per_tile)
+            if surprise is not None:
+                # Tile-extremum pass: fixed targets from the running mean, movers from the signed
+                # matched-filtered surprisal (fixed extrema masked out). Debug shows the RAW
+                # per-frame surprisal (sigma units) -- the map to judge target standout on.
+                blobs = tile_targets(surprise.mu_filtered(), surprise.zs, work,
+                                     tile_size=args.tile_size, fixed_nsigma=args.tile_fixed_nsigma,
+                                     moving_nsigma=args.tile_moving_nsigma,
+                                     mask_px=args.tile_mask_px, scale=scale,
+                                     mu_score=surprise.mu)
+                debug_surface = surprise.z
+                nf = sum(1 for b in blobs if not b['moving'])
+                status = f"{nf} fixed + {len(blobs) - nf} moving"
+            else:
+                bp = detection_surface(
+                    work, detector=args.detector, bg_radius=args.bg_radius,
+                    psf_px=args.psf_px, doh_sigma=args.doh_sigma, compiled=True)   # fixed full-frame shape
+                debug_surface = bp
+                blobs = detect_blobs(
+                    bp, work, prev,
+                    threshold_rel=args.threshold, max_candidates=args.max_candidates,
+                    suppress_radius=args.suppress_radius, min_blob_px=args.min_blob_px,
+                    max_size_px=args.max_size_px, psf_px=args.psf_px,
+                    snr=args.snr, min_roundness=args.min_roundness,
+                    moving_frac=args.moving_frac, scale=scale,
+                    tile_grid=args.tile_grid, per_tile=args.per_tile)
+                prev = bp
+                status = f"Acquired {len(blobs)} target{'' if len(blobs) == 1 else 's'}"
             # Report blobs in the frame's image space. We may analyse a downsampled grid (Bayer ->
             # half-res mono sum), so scale coords back up; consumers then need no idea how we work.
             if coord_scale != 1:
@@ -660,9 +900,8 @@ def main(argv=None):
                     b['px'] = [b['px'][0] * coord_scale, b['px'][1] * coord_scale]
                     if 'size_px' in b:
                         b['size_px'] = b['size_px'] * coord_scale
-            prev = bp
-            status = f"Acquired {len(blobs)} target{'' if len(blobs) == 1 else 's'}"
         writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(),
+                       'proc_ms': round((time.perf_counter() - t_start) * 1e3, 1),
                        'blobs': blobs, 'status': status, **extra})
         # Debug movie of the detection surface: a parallel .ser + commit spine the GUI can follow.
         if args.debug_ser and debug_surface is not None:
@@ -672,7 +911,10 @@ def main(argv=None):
                 dbg['writer'] = ser_mod.SerWriter(dpath, dw, dh, color_id=ser_mod.ColorId.MONO,
                                                   pixel_depth_per_plane=16)
                 dbg['sidecar'] = JsonlWriter(dpath[:-len('.ser')] + '.frames.jsonl')
-            dbg['writer'].write_frame(debug_frame_u16(debug_surface))
+            # Surprisal is already in sigma units -> a FIXED scale (white = 10 sigma), so standout is
+            # judgeable across frames; other surfaces have arbitrary units -> per-frame autoscale.
+            dbg['writer'].write_frame(debug_frame_u16(debug_surface,
+                                                      hi=10.0 if surprise is not None else None))
             dbg['sidecar'].append({'t_mono_ns': time.perf_counter_ns(), 'index': i})
         total += 1
 
@@ -730,15 +972,18 @@ def full_scale(color_id, pixel_depth):
     return base * (4 if bayer.is_bayer(color_id) else 1)
 
 
-def debug_frame_u16(surf):
+def debug_frame_u16(surf, hi=None):
     """Normalize a detection surface (float, possibly negative) to a uint16 greyscale image for the
-    debug .ser: clamp to >=0, scale so the 99.5th percentile hits full white (robust to outliers).
-    16-bit (not 8) -- the surface is *linear*, and the viewer applies gamma, which would band an 8-bit
-    linear image badly."""
+    debug .ser: clamp to >=0, scale so `hi` hits full white. hi=None -> per-frame autoscale to the
+    99.5th percentile (robust to outliers; for surfaces with arbitrary units). Pass a fixed `hi` for
+    a surface with meaningful units (the surprisal z map, in sigmas) so brightness is comparable
+    across frames. 16-bit (not 8) -- the surface is *linear*, and the viewer applies gamma, which
+    would band an 8-bit linear image badly."""
     a = torch.as_tensor(surf, dtype=torch.float32).clamp(min=0)
-    flat = a.reshape(-1)
-    sub = flat[:: max(1, flat.numel() // 100000)]                # subsample for a cheap robust high
-    hi = float(torch.quantile(sub, 0.995)) if sub.numel() else 1.0
+    if hi is None:
+        flat = a.reshape(-1)
+        sub = flat[:: max(1, flat.numel() // 100000)]            # subsample for a cheap robust high
+        hi = float(torch.quantile(sub, 0.995)) if sub.numel() else 1.0
     img = (a / max(hi, 1e-6)).clamp(0, 1) * 65535.0
     return img.round().cpu().numpy()                             # SerWriter casts to uint16
 

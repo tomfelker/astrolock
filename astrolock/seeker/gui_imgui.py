@@ -394,6 +394,7 @@ def main(argv=None):
     perf = {'gui': _Meter(), 'mount': _Meter(), 'focus': _Meter(), 'frame': 0,
             'cam': {r: _Meter() for r in roles},                  # per-role frames *produced* / s
             'det': {r: _Meter() for r in roles},                  # per-role detector frames processed / s
+            'skip': {r: _Meter() for r in roles},                 # per-role frames the detector SKIPPED / s
             'idx': {},                                            # role -> last committed frame index seen
             'ms': {}}                                             # name -> EMA of a timed section (ms)
 
@@ -544,9 +545,14 @@ def main(argv=None):
             cam['blobs'] = rec.get('blobs', [])
             cam['ext'] = rec.get('ext')                         # extended-detector metrics (or None)
             cam['status'] = rec.get('status')                   # detector's freeform status line (or None)
-            cam['det_idx'] = rec.get('index', cam['det_idx'])   # an index into cam['ser_path'] (== seg)
-            if stream in perf['det']:                    # a detection record = one frame the detector ran
-                perf['det'][stream].hit()
+            new_idx = rec.get('index', cam['det_idx'])          # an index into cam['ser_path'] (== seg)
+            if stream in perf['det']:                    # a detection record = one frame the detector ran;
+                perf['det'][stream].hit()                # an index gap = frames it skipped to keep up
+                if 0 <= cam['det_idx'] < new_idx:
+                    perf['skip'][stream].hit(new_idx - cam['det_idx'] - 1)
+                if rec.get('proc_ms') is not None:       # the detector's own whole-frame cost
+                    _prof(f'det:{stream}', float(rec['proc_ms']))
+            cam['det_idx'] = new_idx
         # Pick the frame to show, as an index into `seg`. If a detector is running on this stream, show the
         # frame it last processed (clamped, never ahead) so its boxes match the pixels. Else show newest.
         show_idx = cam['det_idx'] if 0 <= cam['det_idx'] <= idx else idx
@@ -1287,7 +1293,11 @@ def main(argv=None):
         lines.append(row(perf['mount'], 'Mount'))
         for r in det_roles:
             if r in perf['det']:
-                lines.append(row(perf['det'][r], r.capitalize() + ' Detector'))
+                done, skip = perf['det'][r].rate, perf['skip'][r].rate
+                pct = 100.0 * skip / (done + skip) if (done + skip) > 0 else 0.0
+                ms = perf['ms'].get(f'det:{r}')
+                lines.append(row(perf['det'][r], r.capitalize() + ' Detector') + f"  skip {pct:3.0f}%"
+                             + (f" {ms:5.1f} ms" if ms is not None else ""))
         if focus_ui['want']:
             lines.append(row(perf['focus'], 'Focus'))
         # Freeform status lines below -- their own thing, so NOT aligned to the fps columns.
@@ -1310,7 +1320,8 @@ def main(argv=None):
         perf['frame'] += 1
         perf['gui'].hit()
         now = time.perf_counter()
-        for _m in (perf['gui'], perf['mount'], perf['focus'], *perf['cam'].values(), *perf['det'].values()):
+        for _m in (perf['gui'], perf['mount'], perf['focus'], *perf['cam'].values(),
+                   *perf['det'].values(), *perf['skip'].values()):
             _m.sample(now)
 
         # Connect to the backend command socket once its port file appears.

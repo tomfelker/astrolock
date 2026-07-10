@@ -399,8 +399,10 @@ def _open_sky(args, state_path=None, mount_path=None):
 def _open_playback(args):
     """
     Replay an existing .ser as if it were a live camera, paced by its frame timestamps (x
-    --playback-speed). Loops at the end. Lets the whole live pipeline (detect, gui, tracking)
-    run on a recording -- the easy way to review a capture with detections overlaid.
+    --playback-speed) and capped at --playback-fps (the only pacing when the recording has no
+    timestamp sidecar -- otherwise it free-runs and outpaces the detector). Loops at the end.
+    Lets the whole live pipeline (detect, gui, tracking) run on a recording -- the easy way to
+    review a capture with detections overlaid.
     """
     src = ser_mod.SerReader(args.playback_ser)
     h = src.header
@@ -415,10 +417,12 @@ def _open_playback(args):
         if 'bin' in r:
             meta = {'bin': r['bin'], 'roi': r.get('roi', meta['roi'])}
             break
+    interval = 1.0 / args.playback_fps if args.playback_fps > 0 else 0.0
+    cap_note = f" fps<={args.playback_fps:g}" if interval else ""
     print(f"[cam] playback {os.path.basename(args.playback_ser)} {h.image_width}x{h.image_height} "
-          f"{n} frames x{args.playback_speed}", flush=True)
+          f"{n} frames x{args.playback_speed}{cap_note}", flush=True)
 
-    st = {'i': 0, 'wall0': None, 't0': None}
+    st = {'i': 0, 'wall0': None, 't0': None, 'last': None}
 
     def capture():
         if st['i'] >= n:
@@ -434,6 +438,12 @@ def _open_playback(args):
                      - time.perf_counter())
             if delay > 0:
                 time.sleep(delay)
+        if interval:                              # frame-rate cap, on top of any timestamp pacing
+            if st['last'] is not None:
+                delay = st['last'] + interval - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+            st['last'] = time.perf_counter()
         st['i'] = i + 1
         return frame
 
@@ -449,6 +459,10 @@ def main(argv=None):
     p.add_argument('--playback-ser', default=None, help="playback: the .ser file to replay")
     p.add_argument('--playback-speed', type=float, default=1.0, help="playback: speed multiplier")
     p.add_argument('--playback-loop', action='store_true', help="playback: loop instead of stopping at the end")
+    p.add_argument('--playback-fps', type=float, default=10.0,
+                   help="playback: frame-rate cap (0 = unlimited). The only pacing for a recording "
+                        "with no timestamp sidecar, which would otherwise replay as fast as the "
+                        "disk allows and swamp the detector")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--bin', type=int, default=1,
