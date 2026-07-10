@@ -736,6 +736,13 @@ def main(argv=None):
     p.add_argument('--tile-mask-px', type=int, default=16,
                    help="surprise: mask radius (px) around every tile's fixed extrema when hunting "
                         "movers, so a twinkling star can't claim the mover slot")
+    p.add_argument('--track-detector', default='auto', choices=['auto', 'peak', 'surprise', 'extended'],
+                   help="the TRACKING-phase detector (answers 'where is the locked target?' inside the "
+                        "backend's predicted ROI, one answer per frame): 'peak' = centre-weighted "
+                        "single-frame surface peak, 'surprise' = centre-weighted argmax of the "
+                        "matched-filtered surprisal, 'extended' = the full-frame single-large-target "
+                        "test. Default 'auto' follows --detector's family (surprise->surprise, "
+                        "extended->extended, else peak).")
     p.add_argument('--ext-nsigma', type=float, default=3.0,
                    help="extended: two-tailed |value-mean| threshold on the row/col marginals, in sigmas "
                         "(catches bright AND dark targets; lower = includes dimmer target extremities)")
@@ -793,8 +800,14 @@ def main(argv=None):
         writer = JsonlWriter(ser_path[:-len('.ser')] + '.detections.jsonl')
         return reader, writer
 
+    # The track-phase detector: what answers "where is the locked target?" when the backend
+    # broadcasts a predicted ROI. 'auto' follows the acquisition detector's family.
+    track_det = args.track_detector
+    if track_det == 'auto':
+        track_det = args.detector if args.detector in ('surprise', 'extended') else 'peak'
+
     def new_surprise():                                # per-pixel temporal detector (stateful), or None
-        if args.detector != 'surprise':
+        if args.detector != 'surprise' and track_det != 'surprise':
             return None
         return SurpriseModel(args.surprise_alpha_mean, args.surprise_alpha_var,
                              args.surprise_decay, args.surprise_var_floor_frac,
@@ -839,50 +852,66 @@ def main(argv=None):
         # Keep the temporal model current every frame (even in track mode) so its state never goes stale.
         trail = surprise.update(work) if surprise is not None else None
         extra, status = {}, ''                                     # extra record fields + a freeform status line
-        if args.detector == 'extended':                            # symmetric extended-target detector
-            # (marginal + compactness). Full-frame for now; ROI-gating comes with the tracker handoff.
+
+        def run_extended():
+            """The 'detection' phase (main-cam style): full-frame single-large-target,
+            present-or-not (marginal projection + compactness). Returns frame coords."""
             ext = marginal_target(work, nsigma=args.ext_nsigma, density_thresh=args.ext_density)
             cs = coord_scale
             com_f = [ext['com'][0] * cs, ext['com'][1] * cs]
             bbox_f = [v * cs for v in ext['bbox']]
-            blobs = ([{'px': com_f, 'bbox': bbox_f, 'moving': True,
-                       'score': round(ext['peak'] / (scale or 1.0), 4)}] if ext['present'] else [])
-            extra = {'ext': {'present': ext['present'], 'com': com_f, 'bbox': bbox_f,
-                             'density': [round(d, 3) for d in ext['density']],
-                             'mass': [round(m, 1) for m in ext['mass']]}}
-            status = (f"{'Target' if ext['present'] else 'No Target'} "
-                      f"(Density X: {ext['density'][0]:.2f}, Y: {ext['density'][1]:.2f})")
-            debug_surface = work                                   # debug-ser shows the analysed frame
+            bl = ([{'px': com_f, 'bbox': bbox_f, 'moving': True,
+                    'score': round(ext['peak'] / (scale or 1.0), 4)}] if ext['present'] else [])
+            ex = {'ext': {'present': ext['present'], 'com': com_f, 'bbox': bbox_f,
+                          'density': [round(d, 3) for d in ext['density']],
+                          'mass': [round(m, 1) for m in ext['mass']]}}
+            st = (f"{'Target' if ext['present'] else 'No Target'} "
+                  f"(Density X: {ext['density'][0]:.2f}, Y: {ext['density'][1]:.2f})")
+            return bl, ex, st
+
+        # ---- phase dispatch ------------------------------------------------------------------
+        # acquisition: no lock -> full-frame, many candidates (the user picks one).
+        # tracking:    the backend broadcasts a predicted ROI for this role -> one answer,
+        #              found by the per-phase --track-detector.
+        # detection:   'extended' -- the main-cam single-large-target present-or-not test; as an
+        #              *acquisition* detector it runs full-frame in every phase (its ROI-gated
+        #              form is just the same test, so 'extended' as a track detector is identical).
+        if args.detector == 'extended' or (state['roi'] is not None and track_det == 'extended'):
+            blobs, extra, status = run_extended()
+            debug_surface, debug_hi = work, None                   # debug-ser shows the analysed frame
             prev = None
-        elif state['roi'] is not None:                             # track mode: single peak in the ROI
-            if surprise is not None:                               # the tile pass, collapsed to one tile:
+        elif state['roi'] is not None:                             # tracking: one answer near the prediction
+            if track_det == 'surprise':                            # the tile pass, collapsed to one tile:
                 blobs = surprise_roi_peak(surprise.z, state['roi'], coord_scale,   # centre-weighted argmax
                                           nsigma=args.tile_moving_nsigma, psf_px=args.psf_px)
-            else:
-                blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=args.detector,
+            else:                                                  # 'peak': single-frame surface peak
+                roi_det = args.detector if args.detector in ('bandpass', 'doh') else 'bandpass'
+                blobs = detect_roi_peak(work, state['roi'], coord_scale, detector=roi_det,
                                         bg_radius=args.bg_radius, psf_px=args.psf_px,
                                         doh_sigma=args.doh_sigma, snr=args.snr)   # already frame coords
             prev = None                                            # frame-diff not used in ROI mode
             debug_surface = surprise.z if surprise is not None else None
+            debug_hi = 10.0                                        # z is sigma units: white = 10 sigma
             status = "Locked On" if blobs else "Searching"
         else:                                                      # acquisition: full-frame multi-blob
-            if surprise is not None:
-                # Tile-extremum pass: fixed targets from the running mean, movers from the signed
-                # matched-filtered surprisal (fixed extrema masked out). Debug shows the RAW
-                # per-frame surprisal (sigma units) -- the map to judge target standout on.
+            if args.detector == 'surprise':    # key on the choice, not the model -- the SurpriseModel
+                # may exist purely for the track phase (--track-detector surprise) while acquisition
+                # runs another surface. Tile-extremum pass: fixed targets from the running mean,
+                # movers from the signed matched-filtered surprisal (fixed extrema masked out).
+                # Debug shows the RAW per-frame surprisal (sigma units).
                 blobs = tile_targets(surprise.mu_filtered(), surprise.zs, work,
                                      tile_size=args.tile_size, fixed_nsigma=args.tile_fixed_nsigma,
                                      moving_nsigma=args.tile_moving_nsigma,
                                      mask_px=args.tile_mask_px, scale=scale,
                                      mu_score=surprise.mu)
-                debug_surface = surprise.z
+                debug_surface, debug_hi = surprise.z, 10.0        # sigma units: white = 10 sigma
                 nf = sum(1 for b in blobs if not b['moving'])
                 status = f"{nf} fixed + {len(blobs) - nf} moving"
             else:
                 bp = detection_surface(
                     work, detector=args.detector, bg_radius=args.bg_radius,
                     psf_px=args.psf_px, doh_sigma=args.doh_sigma, compiled=True)   # fixed full-frame shape
-                debug_surface = bp
+                debug_surface, debug_hi = bp, None                 # arbitrary units: autoscale
                 blobs = detect_blobs(
                     bp, work, prev,
                     threshold_rel=args.threshold, max_candidates=args.max_candidates,
@@ -911,10 +940,9 @@ def main(argv=None):
                 dbg['writer'] = ser_mod.SerWriter(dpath, dw, dh, color_id=ser_mod.ColorId.MONO,
                                                   pixel_depth_per_plane=16)
                 dbg['sidecar'] = JsonlWriter(dpath[:-len('.ser')] + '.frames.jsonl')
-            # Surprisal is already in sigma units -> a FIXED scale (white = 10 sigma), so standout is
-            # judgeable across frames; other surfaces have arbitrary units -> per-frame autoscale.
-            dbg['writer'].write_frame(debug_frame_u16(debug_surface,
-                                                      hi=10.0 if surprise is not None else None))
+            # A surprisal surface is in true sigma units -> FIXED scale (debug_hi, white = 10 sigma)
+            # so standout is judgeable across frames; other surfaces autoscale per frame (hi=None).
+            dbg['writer'].write_frame(debug_frame_u16(debug_surface, hi=debug_hi))
             dbg['sidecar'].append({'t_mono_ns': time.perf_counter_ns(), 'index': i})
         total += 1
 
