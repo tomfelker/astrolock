@@ -7,6 +7,9 @@ pyserial
 skyfield
 torch
 pandas
-dearpygui
+dearpygui       # legacy seeker GUI (astrolock.seeker.gui; --gui-impl dpg)
+imgui-bundle    # seeker GUI (astrolock.seeker.gui_imgui): Dear ImGui + ImPlot python bindings
+moderngl        # seeker GUI: GPU debayer/WB/gamma of raw camera frames
+glfw            # seeker GUI: window + event loop (post_empty_event wake on new frames)
 zwoasi
 

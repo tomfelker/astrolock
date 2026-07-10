@@ -11,9 +11,10 @@ half-res mono for detection.
 Plane positions within a 2x2 cell: ul ur / ll lr.
 """
 
-import torch
-
 from astrolock.seeker import ser
+
+# torch is imported lazily inside the functions that stack planes: the GUI (which tonemaps on the
+# GPU via GL) only needs the pure layout helpers here, and shouldn't pay torch's import time.
 
 
 def is_bayer(color_id):
@@ -55,6 +56,7 @@ def debayer_to_rgb(mosaic, color_id):
     Decode a raw Bayer mosaic to a half-resolution float32 RGB image (H//2, W//2, 3).
     The two green sites are averaged. No interpolation -- this is the 4-plane split recombined.
     """
+    import torch
     layout = _LAYOUT.get(int(color_id))
     if layout is None:
         raise ValueError(f"not a Bayer color_id: {color_id}")

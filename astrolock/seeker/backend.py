@@ -225,6 +225,9 @@ def main(argv=None):
     p.add_argument('--wb-b', type=float, default=1.98, help="GUI display-only WB gain for blue (1 = none)")
     p.add_argument('--gui', dest='gui', action='store_true', default=True)
     p.add_argument('--no-gui', dest='gui', action='store_false')
+    p.add_argument('--gui-impl', default='imgui', choices=['imgui', 'dpg'],
+                   help="which GUI front end to launch: 'imgui' (imgui-bundle + moderngl, the default) "
+                        "or 'dpg' (the legacy Dear PyGui one)")
     p.add_argument('--duration', type=float, default=0.0, help="stop after N seconds (0 = until Ctrl-C)")
     p.add_argument('--keep', action='store_true', help="keep all captured files on exit")
     p.add_argument('--list-optics', action='store_true',
@@ -576,7 +579,8 @@ def main(argv=None):
         launch_cam(role)
         if role in detect_roles:
             launch_detect(role)
-    gui_proc = _spawn('astrolock.seeker.gui',
+    gui_module = 'astrolock.seeker.gui_imgui' if args.gui_impl == 'imgui' else 'astrolock.seeker.gui'
+    gui_proc = _spawn(gui_module,
                       ['--session', session_dir, '--wb-r', str(args.wb_r), '--wb-b', str(args.wb_b),
                        '--device', args.device]) \
         if args.gui else None

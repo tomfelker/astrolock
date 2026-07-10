@@ -40,7 +40,7 @@ Useful flags (all on `astrolock.seeker.backend`):
   `--track-max-px-s`, `--track-zenith-zone-deg`, … — mount + controller tuning.
 
 Components are runnable standalone too (e.g. `python -m astrolock.seeker.cam --source sky`,
-`python -m astrolock.seeker.gui --session sessions/<ts>` to replay a recorded session). Tests:
+`python -m astrolock.seeker.gui_imgui --session sessions/<ts>` to replay a recorded session; `--gui-impl dpg` for the legacy Dear PyGui front end). Tests:
 `python -m astrolock.seeker.tests.<name>` (ser, bayer, cam_follower, detect, gui_prep,
 cam_control, controller, skysim).
 
