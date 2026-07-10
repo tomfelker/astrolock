@@ -14,7 +14,7 @@ the two views you actually need while tuning a detector on real sky:
                detection summary. Pass the same --detector/--snr/--bg-radius/... flags as detect.py; whatever
                you tune here transfers verbatim to the live tracker.
 
-Renders go to --out (PNG). Everything is CPU torch + PIL, no dpg/sockets, so it runs anywhere.
+Renders go to --out (PNG). Everything is CPU torch + PIL, no GUI/sockets, so it runs anywhere.
 
     python -m astrolock.seeker.detect_probe movermap FILE.ser --out out/
     python -m astrolock.seeker.detect_probe detect  FILE.ser --frames 40:70 --detector doh --snr 6 --out out/

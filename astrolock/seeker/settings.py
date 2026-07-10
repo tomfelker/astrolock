@@ -4,7 +4,7 @@ Persistent settings store for AstroLock Seeker.
 Named JSON files under a per-user config directory -- ``%APPDATA%\\astrolock`` on Windows,
 ``~/.astrolock`` elsewhere. Both the GUI (live, via the Settings tab) and the backend (at launch,
 later) read/write these, so a saved set fully describes a rig: mount, cameras, optics, owned gear,
-and display preferences. This module is deliberately dependency-free (no torch / dpg) so either
+and display preferences. This module is deliberately dependency-free (no torch / GUI toolkit) so either
 process can import it.
 
     from astrolock.seeker import settings

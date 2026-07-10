@@ -40,8 +40,8 @@ Useful flags (all on `astrolock.seeker.backend`):
   `--track-max-px-s`, `--track-zenith-zone-deg`, … — mount + controller tuning.
 
 Components are runnable standalone too (e.g. `python -m astrolock.seeker.cam --source sky`,
-`python -m astrolock.seeker.gui_imgui --session sessions/<ts>` to replay a recorded session; `--gui-impl dpg` for the legacy Dear PyGui front end). Tests:
-`python -m astrolock.seeker.tests.<name>` (ser, bayer, cam_follower, detect, gui_prep,
+`python -m astrolock.seeker.gui_imgui --session sessions/<ts>` to replay a recorded session). Tests:
+`python -m astrolock.seeker.tests.<name>` (ser, bayer, cam_follower, detect,
 cam_control, controller, skysim).
 
 ## Why this can be simple
@@ -73,7 +73,7 @@ against old captures. Only the live-control path (GUI ⇄ backend) uses a socket
 | `astrolock_seeker_cam`     | One instance **per camera**. Captures continuously to a `.ser` file plus a per-frame metadata sidecar. Knows nothing about tracking. |
 | `astrolock_seeker_detect`  | One instance **per camera of interest** (guide, at least). Reads a `.ser` (tailing live files, rolling to newer ones), finds bright/moving blobs, and writes a `detections` sidecar. Pure image→json; no mount, no sky model. |
 | `astrolock_seeker_backend` | The brain. Launches & monitors the cams (and detectors), consumes the latest **detections**, runs target selection + the control loop, drives the mount over serial, and broadcasts state. |
-| `astrolock_seeker_gui`     | Dear PyGui frontend. Reads `.ser` tails for live views and `detections`/`state` sidecars for overlays; sends live commands to the backend. Also a standalone **playback** viewer. |
+| `astrolock_seeker_gui`     | Dear ImGui (imgui-bundle + moderngl) frontend. Reads `.ser` tails for live views and `detections`/`state` sidecars for overlays; sends live commands to the backend. Also a standalone **playback** viewer. |
 
 The data flow is a chain: `cam` writes `.ser` + `.frames.jsonl`; `detect` reads those and
 writes `.detections.jsonl`; `backend` reads detections, drives the mount, and writes
@@ -92,7 +92,7 @@ New package `astrolock/seeker/`, runnable as:
 - `python -m astrolock.seeker.cam --config ...`
 - `python -m astrolock.seeker.detect --config ... --ser ...`
 - `python -m astrolock.seeker.backend --session ...`
-- `python -m astrolock.seeker.gui --session ...`
+- `python -m astrolock.seeker.gui_imgui --session ...`
 
 (The module names map to the `astrolock_seeker_{cam,detect,backend,gui}` shorthand.) The
 shared follower/SER/CV helpers are plain library modules in the same package, imported by
@@ -117,7 +117,7 @@ modes):
   lock-on tone.
 
 The old Tkinter GUI under `astrolock/gui/` is considered **deprecated** for this effort;
-Seeker's GUI is Dear PyGui and separate.
+Seeker's GUI is Dear ImGui (imgui-bundle) and separate.
 
 ## SER as IPC + archive
 
@@ -390,7 +390,7 @@ zeroed (chasing the singularity is futile) while altitude tips over and the loop
 the far side — so it tracks straight through a near-zenith pass. **Not yet built:** boresight
 calibration (hold the target at a calibrated boresight pixel rather than the frame centre).
 
-### `astrolock_seeker_gui` (Dear PyGui)
+### `astrolock_seeker_gui` (Dear ImGui / imgui-bundle)
 
 - Live views of guide + main from the `.ser` tails (as a follower).
 - Overlays, each from a file so they replay identically: candidate **boxes** from
@@ -632,7 +632,7 @@ file-driven pipeline.
    tail+rollover follower. Validate by re-reading a capture written live.
 2. **`seeker_detect` offline.** Run `detect` on an existing `.ser` → `detections.jsonl`.
    Tune thresholds/subtraction against real old captures. No cameras, mount, or backend.
-3. **`seeker_gui` playback.** Dear PyGui viewer that follows a `.ser` and draws boxes from
+3. **`seeker_gui` playback.** GUI viewer that follows a `.ser` and draws boxes from
    `detections.jsonl` (and overlays from `state.jsonl` when present). Works on old sessions;
    this is the main detection-tuning UI.
 4. **Live capture plumbing.** `seeker_cam` capturing real ASI cameras (two instances);
@@ -803,8 +803,8 @@ Captured ideas, not yet scheduled. Grouped by area.
   - **all torch, device-parameterized**: `detect_blobs` is fully vectorized in torch (batched
     window metrics for every candidate at once — no Python per-pixel loop; only the final
     ≤`max-candidates` results cross to Python). Runs on `--device` (CPU now, CUDA later) and is
-    `torch.compile`-able. Likewise the GUI `prepare_rgba` (int32 ingest → torch debayer + gamma LUT
-    → CPU only for the dpg upload). [open: small scale-space? GPU once a CUDA torch is installed.]
+    `torch.compile`-able. (The GUI's debayer + gamma runs as a GL fragment shader on the raw
+    mosaic upload.) [open: small scale-space? GPU once a CUDA torch is installed.]
 - **Candidate pipeline: PSF-scale band-pass → determinant of the Hessian.** Band-pass matched to
   the PSF (low-pass to cut the highest frequency = 1px noise; high-pass to cut frequencies below
   the PSF = background / large structure), then the determinant of the Hessian to keep round blobs

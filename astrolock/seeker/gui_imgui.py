@@ -1,13 +1,13 @@
 """
-astrolock_seeker_gui (imgui-bundle edition): Dear ImGui + moderngl viewer.
+astrolock_seeker_gui: Dear ImGui (imgui-bundle) + moderngl viewer.
 
-The same fixed, self-tiling layout as the Dear PyGui original (astrolock.seeker.gui): a large
-'big' pane top-left showing a selected stream, a docked settings/telemetry panel on the right
-(drag-resizable), and a strip of PIP panes along the bottom. Roles (guide, main) are decoupled
-from slots. Each pane letterboxes its stream (preserve aspect, centred) at a power-of-two scale;
-zoom in further (crops, with edge indicators). Everything reflows on viewport resize.
+A fixed, self-tiling layout (not free-floating windows): a large 'big' pane top-left showing a
+selected stream, a docked settings/telemetry panel on the right (drag-resizable), and a strip of
+PIP panes along the bottom. Roles (guide, main) are decoupled from slots. Each pane letterboxes
+its stream (preserve aspect, centred) at a power-of-two scale; zoom in further (crops, with edge
+indicators). Everything reflows on viewport resize.
 
-What this port buys over the dpg one:
+What this buys over the retired Dear PyGui front end it replaced:
   * The raw u16/u8 SER mosaic goes straight to the GPU (double-buffered R16UI textures); a
     fragment shader does the Bayer 4-plane stack + WB + gamma into an RGBA8 offscreen target
     that ImGui samples at any zoom. The ~30ms/frame CPU tonemap + 32MB float upload is gone.
@@ -143,8 +143,8 @@ def _waker(glfw_mod, wake, stop):
         a segment rolled over), means new pixels to draw;
       * state file -- only a *meaningful* field change wakes us. The backend rewrites state at ~20 Hz
         even when parked, so we diff with the volatile fields stripped, else the GUI would never idle.
-    glfw.post_empty_event() is documented thread-safe, and portable -- this replaces the old dpg
-    port's Windows-only PostThreadMessageW hack."""
+    glfw.post_empty_event() is documented thread-safe, and portable -- this replaces the retired
+    dpg front end's Windows-only PostThreadMessageW hack."""
     sizes = {}
     cur_sp = None
     state_pos = 0
@@ -204,7 +204,7 @@ void main() {
 """
 
 # Bayer: output pixel (x,y) <- the 2x2 cell at (2x,2y): R and B from their sites, G = mean of the two
-# G sites -- the same lossless 4-plane stack as bayer.py / the dpg GUI's prepare_rgba, on the GPU.
+# G sites -- the same lossless 4-plane stack as bayer.py, on the GPU.
 # WB gains are display-only (data stays pristine); full container range maps to [0,1], no auto-stretch.
 _FS = """#version 330 core
 uniform usampler2D mosaic;
@@ -263,7 +263,7 @@ class _StreamGL:
 
     def upload(self, frame, color_id, gamma, wb):
         """Raw mosaic/mono frame (numpy u16/u8) -> the tonemapped RGBA8 target. Returns (w, h) of the
-        display texture (half-res for Bayer, same as the dpg GUI's 4-plane stack)."""
+        display texture (half-res for Bayer: the 4-plane stack)."""
         h, w = frame.shape[0], frame.shape[1]
         if self.key != (w, h, frame.dtype, int(color_id)):
             self._rebuild(w, h, frame.dtype, color_id)
@@ -669,8 +669,7 @@ def main(argv=None):
 
     def draw_slot(name, X0, Y0, SW, SH, dl):
         """Draw the slot's assigned stream letterboxed + centred, with overlays, at the pane's size.
-        All geometry is computed in pane-local coords (like the dpg drawlist) and mapped to screen
-        space through A()."""
+        All geometry is computed in pane-local coords and mapped to screen space through A()."""
         def A(x, y):
             return (X0 + x, Y0 + y)
 

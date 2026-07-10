@@ -7,8 +7,7 @@ pipeline of small, file-driven processes:
     astrolock.seeker.cam      - per-camera capture to .ser + .frames.jsonl
     astrolock.seeker.detect   - bright/moving blob detection -> .detections.jsonl
     astrolock.seeker.backend  - orchestrator + control loop
-    astrolock.seeker.gui_imgui - imgui-bundle + moderngl front end (live + playback; the default)
-    astrolock.seeker.gui      - legacy Dear PyGui front end (--gui-impl dpg)
+    astrolock.seeker.gui_imgui - Dear ImGui (imgui-bundle) + moderngl front end (live + playback)
 
 plus shared library modules (ser, follower, session) imported by whichever processes
 need them.
