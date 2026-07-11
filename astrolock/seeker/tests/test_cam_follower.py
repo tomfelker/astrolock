@@ -34,7 +34,7 @@ def test_cam_to_follower():
     frames_path = glob.glob(os.path.join(out, '*_guide.frames.jsonl'))[0]
     recs = sidecar.read_complete_lines(frames_path)
     assert len(recs) == 20
-    assert 't_mono_ns' in recs[0] and 't_utc' in recs[0] and 'important' in recs[0]
+    assert 't_mono_ns' in recs[0] and 't_utc' in recs[0] and 'store' in recs[0]
 
     # Cross-file guard: an extra sidecar line with no matching .ser frame must not count.
     with open(frames_path, 'a', encoding='utf-8') as fp:

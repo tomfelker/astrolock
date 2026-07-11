@@ -274,6 +274,8 @@ def main(argv=None):
     p.add_argument('--no-gui', dest='gui', action='store_false')
     p.add_argument('--duration', type=float, default=0.0, help="stop after N seconds (0 = until Ctrl-C)")
     p.add_argument('--keep', action='store_true', help="keep all captured files on exit")
+    p.add_argument('--recordings-dir', default='recordings',
+                   help="archive directory for the recorder processes (never cleaned up)")
     p.add_argument('--list-optics', action='store_true',
                    help="list the sensors / optics / reducers in the DB (the valid names for "
                         "--{role}-sensor / --{role}-optic / --{role}-reducer) and exit")
@@ -335,7 +337,12 @@ def main(argv=None):
     # the GUI. Seeded from the launch args; launch_cam builds the per-role --playback-* flags.
     playback_by_role = {role: {'ser': args.playback_ser, 'loop': bool(args.playback_loop)} for role in roles}
     estop = False
-    recording = {role: False for role in roles}   # per-role: each cam records independently
+    recording = {role: False for role in roles}   # per-role: a recorder process is running
+    rec_procs = {}                                # role -> recorder subprocess
+
+    def _recorder_alive(role):
+        pr = rec_procs.get(role)
+        return pr is not None and pr.poll() is None
     gui_quit = False        # set when the GUI tells us it's closing (faster than watching it exit)
 
     # Auto-tracking state (sky-space closed loop).
@@ -542,10 +549,9 @@ def main(argv=None):
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
-            '--important', '1' if recording[role] else '0', '--control-file', cf,
+            '--control-file', cf,
             *cam_sel, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
         ])
-        control_writers[role].append({'important': 1 if recording[role] else 0})
         if cam_control_vals.get(role):                 # re-apply live control values across a relaunch
             control_writers[role].append({'controls': dict(cam_control_vals[role])})
 
@@ -806,14 +812,11 @@ def main(argv=None):
             sides = sorted(glob.glob(os.path.join(session_dir, f'*_{name}.frames.jsonl')))
             for fp in sides[:-2]:
                 stem = fp[:-len('.frames.jsonl')]
-                important = any(r.get('important')
-                                for r in sidecar.read_complete_lines(fp))
-                if not important:
-                    for ext in ('.ser', '.frames.jsonl', '.detections.jsonl'):
-                        try:
-                            os.remove(stem + ext)
-                        except OSError:
-                            pass
+                for ext in ('.ser', '.frames.jsonl', '.detections.jsonl'):
+                    try:                                  # all live-session artifacts are ephemeral
+                        os.remove(stem + ext)             # (recordings live in --recordings-dir)
+                    except OSError:
+                        pass
 
     def connect_mount(url):
         """Replace the current mount driver with a fresh one for `url` ('sim' or a celestron URL),
@@ -986,15 +989,24 @@ def main(argv=None):
                 stop_focus()
                 print("[backend] focus stopped", flush=True)
         elif t == 'record':
+            # Recording is a separate PROCESS per role (astrolock.seeker.recorder): it tails the
+            # role's shm stream and archives every frame to recordings/ at drive pace -- the cam
+            # never touches the disk, and the held shm sections are the write-behind buffer. The
+            # cam process isn't told anything; there is no 'important' concept anymore.
             on = bool(cmd.get('on', False))
             r = cmd.get('role')
             targets = [r] if r in roles else roles    # a named role, else all (back-compat)
             for role in targets:
+                if on and not _recorder_alive(role):
+                    rs = os.path.join(session_dir, f'stop_rec_{role}')
+                    if os.path.exists(rs):
+                        os.remove(rs)
+                    rec_procs[role] = _spawn('astrolock.seeker.recorder',
+                                             ['--session', session_dir, '--role', role,
+                                              '--out-dir', args.recordings_dir, '--stop-file', rs])
+                elif not on and _recorder_alive(role):
+                    open(os.path.join(session_dir, f'stop_rec_{role}'), 'w').close()
                 recording[role] = on
-                # Record: whole pass in one important file (stop rolling). Stop: resume rolling,
-                # which finalizes the (now over-length) pass file and starts a fresh throwaway.
-                control_write(role, {'important': 1 if on else 0,
-                                     'frame_limit': -1 if on else args.segment_frames})
             print(f"[backend] recording {'ON' if on else 'off'} for {', '.join(targets)}", flush=True)
         elif t == 'capture':
             role = cmd.get('role')
@@ -1234,7 +1246,7 @@ def main(argv=None):
                 'enc_alt_deg': round(math.degrees(st['alt_rad']), 4),
                 'rate_az_deg_s': round(math.degrees(st['rate_az_rad_s']), 4),
                 'rate_alt_deg_s': round(math.degrees(st['rate_alt_rad_s']), 4),
-                'recording': dict(recording),           # per-role: {role: bool}
+                'recording': {r: _recorder_alive(r) for r in roles},   # recorder process alive
                 'tracking': tracking,                   # "locked": the tracker has a target
                 'following': bool(tracking and follow_enabled and delay_left <= 0),   # actively slewing
                 'follow_enabled': follow_enabled,       # the persistent user intent (GUI checkbox)
@@ -1305,6 +1317,8 @@ def main(argv=None):
             control_writers[role].close()
         open(stop_file, 'w').close()               # tell detectors to exit
         open(focus_stop, 'w').close()              # and the focus process, if one is running
+        for role in rec_procs:                     # recorders: drain what's committed, finalize, exit
+            open(os.path.join(session_dir, f'stop_rec_{role}'), 'w').close()
         if gui_proc is not None and gui_proc.poll() is None:
             gui_proc.terminate()
         cmd_server.close()
@@ -1320,7 +1334,7 @@ def main(argv=None):
         # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow
         # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
         _reap(list(cam_procs.values()) + list(detect_procs.values())
-              + [focus_proc, gui_proc, sky_sim_proc])
+              + list(rec_procs.values()) + [focus_proc, gui_proc, sky_sim_proc])
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
         print("[backend] done", flush=True)
@@ -1361,27 +1375,13 @@ def _reap(procs, graceful_s=4.0, kill_s=3.0):
 
 
 def _cleanup(session_dir, keep, clean):
-    """Delete .ser segments with no important frames; remove the session if nothing remains."""
+    """Remove the live-IPC session dir: it holds only ephemera (sidecars/detections/state) --
+    recordings are archived elsewhere by the recorder and are never touched."""
     if keep:
         print(f"[backend] kept session {session_dir} (--keep)", flush=True)
-        return
-    kept = 0
-    for fp in glob.glob(os.path.join(session_dir, '*.frames.jsonl')):
-        stem = fp[:-len('.frames.jsonl')]
-        important = any(r.get('important') for r in sidecar.read_complete_lines(fp))
-        if important:
-            kept += 1
-        else:
-            for ext in ('.ser', '.frames.jsonl', '.detections.jsonl'):
-                try:
-                    os.remove(stem + ext)
-                except OSError:
-                    pass
-    if kept == 0 and clean:
+    elif clean:
         shutil.rmtree(session_dir, ignore_errors=True)
-        print(f"[backend] removed session {session_dir} (nothing important)", flush=True)
-    else:
-        print(f"[backend] kept session {session_dir} ({kept} important segment(s))", flush=True)
+        print(f"[backend] removed session {session_dir}", flush=True)
 
 
 if __name__ == '__main__':

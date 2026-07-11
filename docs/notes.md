@@ -212,3 +212,14 @@ Other issues:
 - Somehow, "follow target" defaulted to off.  (Or maybe it was off after clicking Stop Moving?), so at one point I selected a plane and it did nothing.
 - My boresight was way off (I think the dovetail for the guide cam isn't sitting correctly, I need to hit it with a file).  This makes it hard to zero in because when you zoom the guide cam in, it zooms at the center, not at the main cam location.
 - When the framerate dips while you're slewing, it can leave the scope slewing with no input.  Our manual slew commands should probably come with a timeout, so the backend can act as if you released the key even if the GUI goes AWOL.
+
+Came back out later in the night, with the shared memory fixes:
+- IR-pass filter cuts tons of light, and seeing was still horrible - maybe color would be better for the main cam.
+- Boresight was way off, but using the red dot, I was able to point the main scope at what turned out to be saturn, and set boresight from there.  Saved 'tomu' and 'tomu2' settings files that should contain it.
+- Was able to track two airplanes, worked pretty well (despite them being quite dim).  A bit sketchy-fast with this 55mm guide lens, but with the red dot I was able to hop ahead of them no problem for inital acquisition.  Once boresight was dialed in, no issues getting it in main frame.  Did bump the smoothing a bit, it was a little jerky, because of flasahing lights probably.
+- Tried the focus thing - didn't work too well (couldnt' find the star, EMA seems to decay too much) - saved a big focus sweep of a star video for later experimentation.
+- Saved some saturn shots.  Again, kinda lame without color, and seeing was awful.  What opposition amount are we?
+- Recording still makes the UI a bit hangy (since it's back to reading .ser files).  Need to check if the files are full framerate though.  Maybe we should just always use shm, at least then UI can never block, at just the cost of a memcpy (or, well, we were gonna do that anyway...)
+- Too hard to find the main vs guide cameras - need dividers, some minor UI design stuff
+- seeing was just so horrible
+- ended up leaving the scope and cameras outside, screw the dew, yolo.  zzz

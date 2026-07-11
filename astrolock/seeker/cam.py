@@ -543,8 +543,7 @@ def main(argv=None):
                         "rolls at this even if --frame-limit is longer)")
     p.add_argument('--file-limit', type=int, default=1,
                    help="how many (more) files to capture; exit when 0 (-1 = unlimited)")
-    p.add_argument('--important', type=int, default=1,
-                   help="1 marks frames important (kept); 0 = not recording (auto-deletable)")
+
     p.add_argument('--control-file', default=None,
                    help="JSONL of live setting updates to merge (or '-' for stdin)")
     p.add_argument('--exposure-us', type=int, default=2000, help="zwo only (manual exposure)")
@@ -668,11 +667,11 @@ def main(argv=None):
 
     control = control_mod.ControlReader(args.control_file) if args.control_file else None
     cfg = {'frame_limit': args.frame_limit, 'file_limit': args.file_limit,
-           'important': args.important, 'fps': args.fps}
+           'fps': args.fps}
 
     print(f"[cam:{args.role}] {args.source} {width}x{height} {color_id.name} {pixel_depth}-bit "
           f"frame_limit={cfg['frame_limit']} file_limit={cfg['file_limit']} "
-          f"important={cfg['important']} control={args.control_file} -> {out_dir}", flush=True)
+          f"control={args.control_file} -> {out_dir}", flush=True)
 
     stream = framestream.FrameStream(out_dir, args.role)
     start = time.perf_counter()
@@ -682,14 +681,12 @@ def main(argv=None):
     stop = False
     try:
         while not stop and cfg['file_limit'] != 0:
-            # Idle segments live in shared memory (nothing lands on disk but the sidecar;
-            # sustained full-rate .ser writes grind consumer SSDs into GC stalls -- see
-            # shmser.py). Important (recording) segments are plain disk .ser exactly as before: a
-            # pass is a bounded burst. An 'important' flip rolls the segment, so each is purely
-            # one or the other. A shm segment is committed RAM, so it rolls at --shm-frames even
-            # if --frame-limit is longer (rolling is the design, not a cost).
-            seg_important = bool(cfg['important'])
-            use_shm = args.shm_ser and not seg_important
+            # With --shm-ser the cam is a PURE sensor->shm streamer: nothing lands on disk but
+            # the sidecar (sustained full-rate .ser writes grind consumer SSDs into GC stalls --
+            # see shmser.py). Recording is someone else's job (astrolock.seeker.recorder tails
+            # the stream). A shm segment is committed RAM, so it rolls at --shm-frames even if
+            # --frame-limit is longer (rolling is the design, not a cost).
+            use_shm = bool(args.shm_ser)
             seg_limit = cfg['frame_limit']
             if use_shm and (seg_limit == -1 or seg_limit > args.shm_frames):
                 seg_limit = args.shm_frames
@@ -705,7 +702,7 @@ def main(argv=None):
                         for cmd in control.drain():
                             if cmd.get('stop'):
                                 stop = True
-                            for k in ('frame_limit', 'file_limit', 'important', 'fps'):
+                            for k in ('frame_limit', 'file_limit', 'fps'):
                                 if k in cmd:
                                     cfg[k] = cmd[k]
                             if 'controls' in cmd and controls is not None:   # live camera controls
@@ -714,11 +711,9 @@ def main(argv=None):
                                     applied[_n] = got if got is not None else _v
                                     ctrl_changed = True
                         # Roll to a fresh .ser on a settings change so every segment stays uniform (no
-                        # per-frame resolution/exposure changes to reconstruct), and on an 'important'
-                        # flip (ring <-> disk). Only if we've written something -- an empty just-opened
-                        # segment simply adopts the new value.
-                        if ((ctrl_changed or bool(cfg['important']) != seg_important)
-                                and frames_in_file > 0 and not stop):
+                        # per-frame resolution/exposure changes to reconstruct). Only if we've written
+                        # something -- an empty just-opened segment simply adopts the new value.
+                        if ctrl_changed and frames_in_file > 0 and not stop:
                             break
                     if stop or cfg['file_limit'] == 0:    # {stop} or shutdown -> finalize + exit
                         stop = True
@@ -750,7 +745,6 @@ def main(argv=None):
                     stream.commit(                             # then commit-point line
                         t_mono_ns=cap_t_ns if cap_t_ns is not None else time.perf_counter_ns(),
                         t_utc=session_mod.utc_now_iso(),
-                        important=bool(cfg['important']),
                         **frame_meta,                          # bin + roi (sensor->frame mapping)
                         **({'settings': applied} if applied else {}),   # exposure/gain in effect this segment
                     )

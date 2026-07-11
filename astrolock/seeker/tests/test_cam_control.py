@@ -28,12 +28,12 @@ def test_control_file_drives_cam():
     # 10 frames/file rolls every ~0.17 s at 60 fps -> a handful of segments.
     t = threading.Thread(target=cam.main, args=([
         '--role', 'guide', '--out-dir', out, '--width', '64', '--height', '48', '--fps', '60',
-        '--file-limit', '-1', '--frame-limit', '10', '--important', '0', '--control-file', cf,
+        '--file-limit', '-1', '--frame-limit', '10', '--control-file', cf,
     ],), daemon=True)
     t.start()
 
     time.sleep(0.2)
-    _append(cf, '{"important": 1}')          # start "recording" partway through
+    _append(cf, '{"fps": 60}')               # a live setting change partway through
     time.sleep(0.3)
     _append(cf, '{"stop": true}')            # finish + exit
     t.join(timeout=5.0)
@@ -44,8 +44,8 @@ def test_control_file_drives_cam():
 
     recs = [r for sp in sers
             for r in sidecar.read_complete_lines(sp[:-len('.ser')] + '.frames.jsonl')]
-    assert any(r['important'] for r in recs), "some frames should be important"
-    assert any(not r['important'] for r in recs), "some (pre-record) frames should not be"
+    assert all(r['store'] == 'ser' for r in recs)   # no 'important' concept anymore:
+    # recording is the recorder process's job; the cam just streams (disk here, shm on the rig).
 
 
 if __name__ == '__main__':
