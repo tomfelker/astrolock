@@ -238,10 +238,19 @@ class SerReader:
         self._dtype = _numpy_dtype(self.header.pixel_depth_per_plane, self.header.little_endian)
         self._final_count = (self.header.frame_count
                              if self.header.frame_count != SENTINEL_FRAME_COUNT else None)
+        # A shm MARKER (header-only file; the frames live in a same-named shared-memory section)
+        # redirects reads there -- callers can't tell the difference. See shmser.py.
+        self._shm = None
+        from astrolock.seeker import shmser           # local import: shmser imports this module
+        if shmser.is_shm_header(self.header):
+            self._shm = shmser.ShmSerReader(self.path, self.header)
 
     def frames_on_disk(self):
-        """Number of *complete* frames currently present (header count once finalized, else size)."""
+        """Number of *complete* frames currently present (header count once finalized, else size;
+        for a shm segment, the writer's published total)."""
         import os
+        if self._shm is not None:
+            return self._shm.frames_total()
         if self._final_count is not None:
             return self._final_count
         # Sentinel at open (growing): re-check the count in case the writer just finalized (then a
@@ -264,8 +273,10 @@ class SerReader:
     def read_frame(self, index, to_float=False):
         """
         Return the frame at ``index`` shaped (height, width[, channels]), read-only.
-        Raises IndexError if that frame isn't fully on disk yet.
+        Raises IndexError if that frame isn't fully committed yet.
         """
+        if self._shm is not None:
+            return self._shm.read_frame(index, to_float=to_float)
         available = self.frames_on_disk()
         if index < 0 or index >= available:
             raise IndexError(f"frame {index} not available (have {available})")
@@ -294,6 +305,8 @@ class SerReader:
         return arr
 
     def close(self):
+        if self._shm is not None:
+            self._shm.close()
         self._file.close()
 
     def __enter__(self):

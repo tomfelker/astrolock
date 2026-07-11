@@ -26,6 +26,7 @@ import torch
 from astrolock.seeker import control as control_mod
 from astrolock.seeker import ser as ser_mod
 from astrolock.seeker import session as session_mod
+from astrolock.seeker import shmser
 from astrolock.seeker import sidecar
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
@@ -532,6 +533,14 @@ def main(argv=None):
                         "cpu, or force 'cpu' / 'cuda'. (zwo / synthetic / playback ignore it.)")
     p.add_argument('--frame-limit', type=int, default=-1,
                    help="frames for the current file before rolling over (-1 = unlimited)")
+    p.add_argument('--shm-ser', action='store_true',
+                   help="write non-important segments to a shared-memory section instead of disk "
+                        "(only a 178-byte marker .ser lands on disk; readers redirect transparently). "
+                        "Live pipelines only -- the section dies with its processes, so offline "
+                        "workflows need real files. Recording ('important') always writes to disk.")
+    p.add_argument('--shm-frames', type=int, default=128,
+                   help="shm segments: frames per segment (committed RAM = frames x frame size; "
+                        "rolls at this even if --frame-limit is longer)")
     p.add_argument('--file-limit', type=int, default=1,
                    help="how many (more) files to capture; exit when 0 (-1 = unlimited)")
     p.add_argument('--important', type=int, default=1,
@@ -675,8 +684,23 @@ def main(argv=None):
             seg_ts = session_mod.segment_stamp()
             ser_path = os.path.join(out_dir, session_mod.ser_name(seg_ts, args.role))
             frames_path = os.path.join(out_dir, session_mod.frames_name(seg_ts, args.role))
-            writer = ser_mod.SerWriter(ser_path, width, height,
-                                       color_id=color_id, pixel_depth_per_plane=pixel_depth)
+            # Idle segments live in a shared-memory section (only a 178-byte marker touches the
+            # disk; sustained full-rate .ser writes grind consumer SSDs into GC stalls -- see
+            # shmser.py). Important (recording) segments are plain disk .ser exactly as before: a
+            # pass is a bounded burst. An 'important' flip rolls the segment, so each is purely
+            # one or the other. A shm segment is committed RAM, so it rolls at --shm-frames even
+            # if --frame-limit is longer (rolling is the design, not a cost).
+            seg_important = bool(cfg['important'])
+            use_shm = args.shm_ser and not seg_important
+            seg_limit = cfg['frame_limit']
+            if use_shm and (seg_limit == -1 or seg_limit > args.shm_frames):
+                seg_limit = args.shm_frames
+            if use_shm:
+                writer = shmser.ShmSerWriter(ser_path, width, height, color_id=color_id,
+                                             pixel_depth_per_plane=pixel_depth, cap=seg_limit)
+            else:
+                writer = ser_mod.SerWriter(ser_path, width, height,
+                                           color_id=color_id, pixel_depth_per_plane=pixel_depth)
             sidecar = JsonlWriter(frames_path)
             frames_in_file = 0
             rolled = False
@@ -696,9 +720,11 @@ def main(argv=None):
                                     applied[_n] = got if got is not None else _v
                                     ctrl_changed = True
                         # Roll to a fresh .ser on a settings change so every segment stays uniform (no
-                        # per-frame resolution/exposure changes to reconstruct). Only if we've written
-                        # something -- an empty just-opened segment simply adopts the new value.
-                        if ctrl_changed and frames_in_file > 0 and not stop:
+                        # per-frame resolution/exposure changes to reconstruct), and on an 'important'
+                        # flip (ring <-> disk). Only if we've written something -- an empty just-opened
+                        # segment simply adopts the new value.
+                        if ((ctrl_changed or bool(cfg['important']) != seg_important)
+                                and frames_in_file > 0 and not stop):
                             break
                     if stop or cfg['file_limit'] == 0:    # {stop} or shutdown -> finalize + exit
                         stop = True
@@ -746,7 +772,7 @@ def main(argv=None):
                     #           f"peak {int(frame.max())}, important={cfg['important']}{extra}", flush=True)
                     #     last_status, last_status_n = loop_start, total
 
-                    if cfg['frame_limit'] != -1 and frames_in_file >= cfg['frame_limit']:
+                    if seg_limit != -1 and frames_in_file >= seg_limit:
                         rolled = True
                         break
 

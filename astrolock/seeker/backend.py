@@ -246,6 +246,14 @@ def main(argv=None):
     p.add_argument('--sim-cam-bandwidth-limit', type=float, default=400.0,
                    help="sky source: model of the camera data link (MB/s; default ~USB3, capping "
                         "full-res frames at ~24 fps like the real hardware). 0 = unlimited")
+    p.add_argument('--shm-ser', dest='shm_ser', action='store_true', default=True,
+                   help="non-recording cam segments live in shared memory (default): only a "
+                        "178-byte marker .ser lands on disk, so idle streaming stops grinding the "
+                        "SSD. Recording segments always write real files")
+    p.add_argument('--no-shm-ser', dest='shm_ser', action='store_false',
+                   help="write every segment to disk (the old behavior)")
+    p.add_argument('--shm-frames', type=int, default=128,
+                   help="shm segments: frames per segment (committed RAM; rolls at this cadence)")
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky source: lens focal length (mm)")
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky source: wavelength for the physically-sized Airy-disc PSF (nm)")
@@ -532,6 +540,7 @@ def main(argv=None):
             '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
+            *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
             '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
             '--important', '1' if recording[role] else '0', '--control-file', cf,
             *cam_sel, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
