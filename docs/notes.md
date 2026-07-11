@@ -195,3 +195,20 @@ New Algorithms
                                         find top k closest stars
                                         get permutations
                                                 O((targets^2*observations*k^targets)
+
+
+2026-07-08?
+
+Tried to take the telescope out to record an ISS pass (the one from our example), but ran into issues:
+- Couldn't connect to the cameras due to driver issues
+- Laptop battery didn't last long, and inverter couldn't power it from the Celestron 17 power tank, it sagged too much under load and the inverter gave up.  Will use an extension cord next time.
+
+2026-07-10
+
+Tried to take the telescope out to record a Tiangong pass, but I ran into some issues, including a perf issue that precludes the whole thing from working.  When the real cameras are connected (and I've seen it even with the sim cameras), I occasionally get framerate hitches that take it almost to zero.  It seems progressively worse the longer it runs.  In Task Manager, I see the disk utilization spike to 100% when this happens.
+
+Other issues:
+- I had accidentally configured the wrong optic (well, left it at default), so when slewing to a target, it wouldn't work.  Did seem to work okay once I fixed that.
+- Somehow, "follow target" defaulted to off.  (Or maybe it was off after clicking Stop Moving?), so at one point I selected a plane and it did nothing.
+- My boresight was way off (I think the dovetail for the guide cam isn't sitting correctly, I need to hit it with a file).  This makes it hard to zero in because when you zoom the guide cam in, it zooms at the center, not at the main cam location.
+- When the framerate dips while you're slewing, it can leave the scope slewing with no input.  Our manual slew commands should probably come with a timeout, so the backend can act as if you released the key even if the GUI goes AWOL.
