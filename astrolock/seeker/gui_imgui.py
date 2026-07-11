@@ -408,7 +408,8 @@ def main(argv=None):
               'pip_h': S(200), 'big_role': roles[0] if roles else ROLES[0], 'big_stream': None,
               'pip_map': {}, 'pip_slots': []}
     boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
-    track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True}   # Tracking panel state; backend defaults
+    track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True,   # Tracking panel state; backend defaults
+                'delay': 0.0}                                            # post-lock mount-hold (s)
     sim_ui = {'r0': 0.0, 'bortle': 4}                     # Simulation panel: seeing r0 (m) + Bortle sky class
     focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'path': None, 'tailer': None,
                 't0': None, 'com_mult': 10.0,             # collimation-trail exaggeration on the star view
@@ -421,7 +422,7 @@ def main(argv=None):
     FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
     # Immediate-mode UI state: text-input buffers + selections the panel reads/writes each frame.
-    ui = {'txt': {'bore_x': '0', 'bore_y': '0',
+    ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'track_delay': f"{track_ui['delay']:g}",
                   'sim_r0': f"{sim_ui['r0']:g}", 'track_smooth': f"{track_ui['smoothing']:g}",
                   'focus_alpha': f"{focus_ui['alpha']:g}", 'focus_com_mult': f"{focus_ui['com_mult']:g}",
                   'settings_name': ''},
@@ -1122,7 +1123,8 @@ def main(argv=None):
             'cameras': {role: ui['src'].get(role) for role in roles if ui['src'].get(role)},
             'boresight': [boresight_ui['x'], boresight_ui['y']],
             'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
-                         'auto_switch': track_ui['auto_switch']},
+                         'auto_switch': track_ui['auto_switch'], 'delay': track_ui['delay'],
+                         'follow': bool((ctrl['state'] or {}).get('follow_enabled', True))},
             'sim': {'r0': sim_ui['r0'], 'bortle': sim_ui['bortle']},   # per-cam defocus rides with the cam caps
             'focus': {'com_mult': focus_ui['com_mult'], 'screw_phase': focus_ui['screw_phase'],
                       'rad_per_turn': focus_ui['rad_per_turn'], 'alpha': focus_ui['alpha'],
@@ -1167,6 +1169,13 @@ def main(argv=None):
             _set_track_pref(trk['pref'])                # push to the backend + reflect on the radio
         if 'auto_switch' in trk:
             track_ui['auto_switch'] = bool(trk['auto_switch'])
+        if 'delay' in trk:
+            track_ui['delay'] = max(0.0, float(trk['delay']))
+            ui['txt']['track_delay'] = f"{track_ui['delay']:g}"
+            _send({'type': 'set_track_delay', 'value': track_ui['delay']})
+            ctrl['delay_init'] = True                   # don't let the state-init clobber the loaded value
+        if 'follow' in trk:
+            _send({'type': 'follow', 'on': bool(trk['follow'])})
         sim = data.get('sim') or {}
         if 'r0' in sim:
             sim_ui['r0'] = max(0.0, float(sim['r0']))
@@ -1401,6 +1410,12 @@ def main(argv=None):
         if st is not None and 'mount_init' not in ctrl and st.get('mount_url'):
             ui['mount_sel'] = st['mount_url'] if st['mount_url'] in mount_items else 'sim'
             ctrl['mount_init'] = True
+
+        # One-time init of the track-delay field from the backend's value (settings load may override).
+        if 'delay_init' not in ctrl and st and st.get('track_delay_s') is not None:
+            track_ui['delay'] = float(st['track_delay_s'])
+            ui['txt']['track_delay'] = f"{track_ui['delay']:g}"
+            ctrl['delay_init'] = True
 
         # One-time init of the boresight editor from the backend's value (settings load may override).
         if 'bore_init' not in ctrl and st and st.get('boresight_mrad') is not None:
@@ -1804,13 +1819,25 @@ def main(argv=None):
             _tip("When tracking hands off between cameras, bring the newly-active camera into the main "
                  "pane (as if you'd pressed its ^ button).")
             locked = bool(st.get('tracking'))
-            imgui.begin_disabled(not locked)
-            ch, v = imgui.checkbox("Follow target##follow_chk", bool(st.get('following')))
+            ch, v = imgui.checkbox("Follow target##follow_chk", bool(st.get('follow_enabled', True)))
             if ch:
                 _send({'type': 'follow', 'on': v})
-            imgui.end_disabled()
-            _tip("When locked, slew the mount to keep the target on the boresight. Uncheck to hold the "
-                 "mount but keep the lock (same as Stop Moving); re-check to resume.")
+            _tip("Slew the mount to hold a locked target on the boresight. A persistent setting, usable "
+                 "any time: uncheck BEFORE locking and tracking engages watch-only (the tracker estimates, "
+                 "the mount holds still); re-check to start following.")
+            imgui.text("Track delay:")
+            _tip("After a new lock, hold the mount still for this many seconds while the tracker learns "
+                 "the target's angular velocity -- a better estimate before the catch-up slew means a "
+                 "better chance of re-acquiring if the slew loses the target.")
+            imgui.same_line()
+
+            def _commit_delay(txt):
+                track_ui['delay'] = max(0.0, _flt(txt, track_ui['delay']))
+                _send({'type': 'set_track_delay', 'value': track_ui['delay']})
+                return f"{track_ui['delay']:g}"
+            _input_commit('track_delay', S(48), _commit_delay)
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "s")
             imgui.begin_disabled(not locked)
             if imgui.button("Unlock", (S(200), 0)):
                 _send({'type': 'untrack'})

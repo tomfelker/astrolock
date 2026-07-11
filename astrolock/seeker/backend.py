@@ -203,6 +203,11 @@ def main(argv=None):
     p.add_argument('--track-roi-size', type=int, default=128,
                    help="while tracking, publish a square ROI (this many frame px) around the predicted "
                         "target so detect can work just that window instead of the whole frame. 0 = full-frame.")
+    p.add_argument('--track-delay-s', type=float, default=0.0,
+                   help="after a new lock, hold the mount still for this long while the tracker learns "
+                        "the target's angular velocity -- a better estimate before the catch-up slew "
+                        "means a better chance of re-acquiring if the slew loses it. Live-adjustable "
+                        "in the GUI Tracking panel")
     p.add_argument('--track-sign-az', type=float, default=1.0, help="flip if az moves the image the wrong way")
     p.add_argument('--track-sign-alt', type=float, default=-1.0, help="flip if alt moves the image the wrong way")
     # Camera handoff: guide acquires, then promote the sky-space loop to a finer role (main) running the
@@ -320,7 +325,11 @@ def main(argv=None):
     tracker = None
     tracking = False
     coasting = False          # lost a settled lock -> holding the last rate, still re-acquiring
-    drive_mount = True        # False = "Stop Moving": hold the mount but keep the tracker running
+    # Follow = drive the mount to hold a lock. PERSISTENT user intent (not per-lock): settable any
+    # time from the GUI, so tracking can be engaged watch-only (lock + estimate, mount still).
+    follow_enabled = True
+    track_delay_s = max(0.0, args.track_delay_s)   # hold the mount this long after a new lock (learn v first)
+    track_started_t = 0.0     # perf_counter at the current lock's start (for the delay)
     track_role = None         # the role whose detections currently feed the sky-space model (guide or main)
     track_target = None       # model-predicted target px in the source frame (the smooth blue pipper)
     track_detect_px = None    # raw detection px of the locked target in the source frame (the green marker)
@@ -829,24 +838,22 @@ def main(argv=None):
 
     def apply_command(cmd):
         nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
-        nonlocal track_center, mount_desired_url, drive_mount, track_primary, handoff_fine, handoff_conf
-        nonlocal track_pref, focus_proc, focus_role
+        nonlocal track_center, mount_desired_url, follow_enabled, track_primary, handoff_fine, handoff_conf
+        nonlocal track_pref, focus_proc, focus_role, track_delay_s, track_started_t
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
             return
         if t == 'set_rate':
             tracking = coasting = False               # manual slew overrides auto-track (and coast)
-            drive_mount = True
             mount.set_rates(math.radians(cmd.get('az', 0.0)), math.radians(cmd.get('alt', 0.0)))
             estop = False
         elif t == 'stop':                             # legacy: halt mount + tracking (kept for compat)
             tracking = coasting = False
-            drive_mount = True
             mount.set_rates(0.0, 0.0)
-        elif t == 'follow':                           # Follow on/off: drive the mount to hold the lock, or
-            drive_mount = bool(cmd.get('on', True))   # off = "Stop Moving" -- hold the mount, KEEP the lock
-            if not drive_mount:                       # (the tracker keeps estimating; we just stop driving)
+        elif t == 'follow':                           # Follow on/off: PERSISTENT -- drive the mount to hold
+            follow_enabled = bool(cmd.get('on', True))    # a lock, or watch-only (tracker keeps estimating,
+            if not follow_enabled:                        # the mount holds still). Settable before a lock.
                 mount.set_rates(0.0, 0.0)
         elif t == 'estop':
             tracking = coasting = False               # e-stop halts a coast too
@@ -884,7 +891,9 @@ def main(argv=None):
                     track_seen_index = latest_det_index[role]
                     tracking = True
                     coasting = False
-                    drive_mount = True                        # a fresh lock drives the mount again
+                    track_started_t = time.perf_counter()     # the follow delay counts from here
+                    if not follow_enabled or track_delay_s > 0:
+                        mount.set_rates(0.0, 0.0)             # watch-only / learn-first: hold still
                     track_role = role
                     # Handoff setup: this role is the fallback ('primary'); if a *finer* role runs the
                     # extended detector, watch it to promote once it stably sees the target.
@@ -911,6 +920,9 @@ def main(argv=None):
                 tracker.cy = track_center[1] + boresight['y'] / rpp
             print(f"[backend] boresight -> ({boresight['x'] * 1e3:.3f}, {boresight['y'] * 1e3:.3f}) mrad",
                   flush=True)
+        elif t == 'set_track_delay':                  # hold the mount this long after a new lock
+            track_delay_s = max(0.0, float(cmd.get('value', 0.0)))
+            print(f"[backend] track delay = {track_delay_s:.1f}s", flush=True)
         elif t == 'set_track_smoothing':              # live tracker-tuning: EMA time constant (s)
             v = max(0.0, float(cmd.get('value', args.track_rate_smoothing_s)))
             args.track_rate_smoothing_s = v           # remembered for the next lock...
@@ -934,7 +946,6 @@ def main(argv=None):
                     restart_cam(r, stop_first=True)
         elif t == 'untrack':                          # "Unlock": drop the lock entirely + halt the mount
             tracking = coasting = False
-            drive_mount = True
             handoff_fine, handoff_conf = None, 0.0    # drop any pending main-cam handoff
             mount.set_rates(0.0, 0.0)
         elif t == 'focus':                            # GUI Focus tab: start/stop the focus process on a role
@@ -1096,7 +1107,9 @@ def main(argv=None):
                                   f"alt {math.degrees(st['rate_alt_rad_s']):+6.2f} deg/s | "
                                   f"off ({tpx[0] - tracker.cx:+5.0f},{tpx[1] - tracker.cy:+5.0f})px | "
                                   f"alt {math.degrees(st['alt_rad']):5.1f} | {track_status}", flush=True)
-                        if drive_mount:               # "Stop Moving" holds the mount but keeps tracking
+                        # Drive only when following is on AND the post-lock learn delay has elapsed
+                        # ("Stop Moving" / watch-only / delay all hold the mount but keep tracking).
+                        if follow_enabled and (now - track_started_t) >= track_delay_s:
                             mount.set_rates(raz, ralt)
                         # On 'track' and 'coast' the target estimate keeps moving, so keep publishing it
                         # (the ROI follows, so detect keeps searching and can re-acquire during coast).
@@ -1172,10 +1185,14 @@ def main(argv=None):
                         track_rois[fb] = [round(pp[0]), round(pp[1]), args.track_roi_size]
 
             # Freeform status line for the GUI: what the backend is doing right now.
+            delay_left = (max(0.0, track_delay_s - (now - track_started_t)) if tracking else 0.0)
             if tracking:
                 omega = math.degrees(tracker.target_speed_rad_s()) if tracker is not None else 0.0
-                backend_status = (f"following {track_role}, target {omega:.2f} deg/s"
-                                  + (" (coasting)" if coasting else ""))
+                hold = (" (watch-only: follow off)" if not follow_enabled
+                        else (f" (mount holds {delay_left:.0f}s more)" if delay_left > 0 else ""))
+                backend_status = (f"{'following' if (follow_enabled and delay_left <= 0) else 'tracking'} "
+                                  f"{track_role}, target {omega:.2f} deg/s"
+                                  + (" (coasting)" if coasting else "") + hold)
             elif estop:
                 backend_status = "e-stopped"
             else:
@@ -1194,7 +1211,10 @@ def main(argv=None):
                 'rate_alt_deg_s': round(math.degrees(st['rate_alt_rad_s']), 4),
                 'recording': dict(recording),           # per-role: {role: bool}
                 'tracking': tracking,                   # "locked": the tracker has a target
-                'following': bool(tracking and drive_mount),   # mount is actively slewing to hold the lock
+                'following': bool(tracking and follow_enabled and delay_left <= 0),   # actively slewing
+                'follow_enabled': follow_enabled,       # the persistent user intent (GUI checkbox)
+                'track_delay_s': track_delay_s,         # post-lock mount-hold time (learn velocity first)
+                'track_delay_left': round(delay_left, 1),
                 'track_role': track_role if tracking else None,
                 'track_pref': track_pref,               # GUI radio: guide / main / auto
                 'target_px': track_target if tracking else None,        # model prediction (blue pipper)
