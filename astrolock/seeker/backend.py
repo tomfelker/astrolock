@@ -239,6 +239,13 @@ def main(argv=None):
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky source: scripted alt slew (deg/s)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky source: substeps per exposure")
     p.add_argument('--sky-exposure-s', type=float, default=0.1, help="sky source: simulated exposure (s)")
+    p.add_argument('--sim-cam-noop', action='store_true',
+                   help="sky source: skip the frame simulation (canned noise frame) but keep all the "
+                        "pacing, so the cams write at full commanded speed -- reproduces the real rig's "
+                        "sustained-write disk pressure. Pair with --fps 999 --sky-exposure-s 0.002")
+    p.add_argument('--sim-cam-bandwidth-limit', type=float, default=400.0,
+                   help="sky source: model of the camera data link (MB/s; default ~USB3, capping "
+                        "full-res frames at ~24 fps like the real hardware). 0 = unlimited")
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky source: lens focal length (mm)")
     p.add_argument('--sky-psf-wavelength-nm', type=float, default=550.0,
                    help="sky source: wavelength for the physically-sized Airy-disc PSF (nm)")
@@ -305,7 +312,9 @@ def main(argv=None):
         # from) is added per-launch by sky_follow_flag(), so switching mounts in the GUI re-points them.
         sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                     '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
-                    '--sky-almanac', almanac_path]
+                    '--sky-almanac', almanac_path,
+                    '--sim-cam-bandwidth-limit', str(args.sim_cam_bandwidth_limit)] \
+            + (['--sim-cam-noop'] if args.sim_cam_noop else [])
 
     def sky_follow_flag():
         """Which mount trajectory a sky-sim cam renders from, chosen per-launch from the CURRENT mount:

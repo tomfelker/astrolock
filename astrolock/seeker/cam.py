@@ -314,6 +314,60 @@ def _open_sky(args, state_path=None, mount_path=None):
                        qe=args.sky_qe, full_well_e=args.sky_full_well_e, read_noise_e=args.sky_read_noise_e,
                        sky_mag_arcsec2=args.sky_sky_mag,
                        psf_sigma_px=args.sky_psf_sigma_px, seeing_r0_m=args.sky_seeing_r0_m)
+
+    # Model of the camera's data link (USB3): frames can't be DELIVERED faster than the link
+    # carries their bytes, whatever the exposure allows -- the real rig's effective fps ceiling
+    # (a 16.6MB full-res frame over ~400MB/s = ~24fps, matching the observed hardware).
+    frame_bytes = cfg.width * cfg.height * 2               # 16-bit container, as written to .ser
+    bw_interval = (frame_bytes / (args.sim_cam_bandwidth_limit * 1e6)
+                   if args.sim_cam_bandwidth_limit > 0 else 0.0)
+    _bw = {'last': None}
+
+    def _bw_wait():
+        if bw_interval:
+            if _bw['last'] is not None:
+                d = _bw['last'] + bw_interval - time.perf_counter()
+                if d > 0:
+                    time.sleep(d)
+            _bw['last'] = time.perf_counter()
+
+    _live = {'exp': args.sky_exposure_s, 'gain_cb': float(args.sky_gain_cb)}   # exposure (s) + gain (cB), live
+
+    if args.sim_cam_noop:
+        # I/O-stress mode: keep ALL the pacing (exposure floors fps; the bandwidth model caps it;
+        # --fps still applies in the main loop) but skip the expensive render -- one canned noise
+        # frame, delivered at full commanded speed. Reproduces the real rig's sustained-write
+        # pressure on the disk without the sim's GPU cost throttling it.
+        import numpy as _np
+        noop_frame = _np.random.default_rng(0).integers(150, 400, size=(cfg.height, cfg.width),
+                                                        dtype=_np.uint16)
+        print(f"[cam] sky sim NOOP {cfg.width}x{cfg.height} ({frame_bytes / 1e6:.1f} MB/frame, "
+              f"link {args.sim_cam_bandwidth_limit:g} MB/s -> <= "
+              f"{(1.0 / bw_interval) if bw_interval else float('inf'):.1f} fps)", flush=True)
+
+        def capture_noop():
+            now_ns = time.perf_counter_ns()
+            exp = _live['exp']
+            _bw_wait()
+            return noop_frame, int(now_ns + 0.5 * exp * 1e9), now_ns + int(exp * 1e9)
+
+        caps = [{'name': 'exposure', 'label': 'Exposure', 'kind': 'number', 'unit': 'ms', 'scale': 'log',
+                 'min': 0.01, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True},
+                {'name': 'gain', 'label': 'Gain', 'kind': 'number', 'unit': 'cB', 'scale': 'linear',
+                 'min': 0.0, 'max': 600.0, 'value': _live['gain_cb'], 'live': True}]
+
+        def set_control_noop(name, value):
+            if name == 'exposure':
+                _live['exp'] = max(1e-5, value / 1000.0)
+                return _live['exp'] * 1000.0
+            if name == 'gain':                              # accepted for parity; nothing to brighten
+                _live['gain_cb'] = max(0.0, value)
+                return _live['gain_cb']
+            return None
+        controls = {'source': 'sky', 'controls': caps, 'set': set_control_noop}
+        meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
+        return capture_noop, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta, controls
+
     device = resolve_device(getattr(args, 'device', 'auto'))
     sim = SkySim(cfg, device=device)                   # render-only; propagation lives in sky_sim.py
     almanac = SkyAlmanac(args.sky_almanac)              # shared, system-clock-timed source directions
@@ -338,7 +392,6 @@ def _open_sky(args, state_path=None, mount_path=None):
     kt = 't_mono_ns' if follow_mount else 'enc_t_mono_ns'
     ahead_cap = 5.0 if follow_mount else 0.2
     pose = {'az': az0, 'alt': alt0, 'raz': rate_az, 'ralt': rate_alt, 'enc_t': None}
-    _live = {'exp': args.sky_exposure_s, 'gain_cb': float(args.sky_gain_cb)}   # exposure (s) + gain (cB), live
     sim.gain_mult = 10.0 ** (_live['gain_cb'] / 200.0)         # centibels -> linear signal multiplier
     S = args.sky_substeps
     fr = (torch.arange(S, dtype=torch.float64) + 0.5) / S      # (S,) substep mid-fractions
@@ -371,6 +424,7 @@ def _open_sky(args, state_path=None, mount_path=None):
         almanac.update()
         dirs, mags = almanac.dirs_at(sub_t)
         frame = sim.render(az, alt, pose['raz'], pose['ralt'], dirs, mags, exposure_s=exp, substeps=S)
+        _bw_wait()                              # the data link caps delivery rate, whatever the exposure
         # (frame, stamp, available-at): the sim renders in ~zero wall-clock, but a real camera can't
         # deliver a frame until the exposure ends. Stamp at the exposure midpoint (best time to
         # associate the averaged light with), and tell the loop not to *commit* the frame until the
@@ -530,6 +584,14 @@ def main(argv=None):
                    help="sky: sensor gain in centibels (ZWO-style, 0.1 dB units; +60 cB doubles signal). "
                         "Amplifies electrons->ADU so you can brighten without a longer exposure (keeps fps)")
     p.add_argument('--sky-substeps', type=int, default=6, help="sky: substeps per exposure (streak smoothness)")
+    p.add_argument('--sim-cam-noop', action='store_true',
+                   help="sky: skip the actual frame simulation (one canned noise frame) but keep ALL the "
+                        "pacing -- exposure, --fps, and the bandwidth model -- so the cam writes at full "
+                        "commanded speed. For reproducing sustained-write disk-pressure issues")
+    p.add_argument('--sim-cam-bandwidth-limit', type=float, default=400.0,
+                   help="sky: model the camera's data link (MB/s; default ~USB3): a frame can't be "
+                        "delivered faster than the link carries its bytes, so full-res frames cap at "
+                        "~24 fps like the real hardware. 0 = unlimited")
     p.add_argument('--sky-almanac', default=None,
                    help="sky: shared source-direction almanac (JSONL) published by sky_sim")
     p.add_argument('--sky-follow-state', action='store_true',
