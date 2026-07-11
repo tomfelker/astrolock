@@ -35,8 +35,9 @@ import torch
 
 from astrolock.seeker import bayer, ser as ser_mod, skysim
 from astrolock.seeker.detect import (resolve_device, work_image, full_scale,
-                                     _segments, _committed, _segment_ready, _frame_count)
-from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
+                                     _segments, _committed, _segment_ready)
+from astrolock.seeker import framestream
+from astrolock.seeker.sidecar import JsonlTailer
 
 
 def _effective_crop(header, crop):
@@ -161,6 +162,10 @@ def main(argv=None):
     p.add_argument('--vane-width', type=float, default=0.0, help="spider-vane width / aperture diameter")
     p.add_argument('--poll', type=float, default=0.02, help="seconds between polls when caught up (live)")
     p.add_argument('--stop-file', default=None, help="stop cleanly when this file appears")
+    p.add_argument('--shm-ser', action='store_true',
+                   help="write the star stream to shared-memory segments instead of disk (matches the cams)")
+    p.add_argument('--shm-frames', type=int, default=256,
+                   help="shm star segments: frames per segment (the star crop is tiny)")
     p.add_argument('--device', default='auto',
                    help="torch device: 'auto' (default) = cuda if present else cpu, or force 'cpu'/'cuda'")
     args = p.parse_args(argv)
@@ -179,18 +184,20 @@ def main(argv=None):
     cur = ready[-1] if args.follow else ready[0]
 
     def open_segment(ser_path):
-        reader = ser_mod.SerReader(ser_path)
+        reader = framestream.open_reader(ser_path)          # disk .ser or shm section, transparently
         stem = ser_path[:-len('.ser')]
         crop = _effective_crop(reader.header, args.crop)    # fits the analysis image; writer + EMA agree
-        # Output stream: <seg>_<role>_focus.ser + its .frames.jsonl spine (which also carries metrics).
-        writer = ser_mod.SerWriter(stem + '_focus.ser', crop, crop,
-                                   color_id=ser_mod.ColorId.MONO, pixel_depth_per_plane=16)
-        spine = JsonlWriter(stem + '_focus.frames.jsonl')
+        # Output stream: <seg>_<role>_focus segments (star image + the metrics spine), via the
+        # shared FrameStream interface -- shm-backed when --shm-ser, like the cams.
+        out = framestream.FrameStream(args.session, f'{args.role}_focus')
+        out.open_segment(os.path.basename(stem)[:-(len(args.role) + 1)], crop, crop,
+                         color_id=ser_mod.ColorId.MONO, pixel_depth_per_plane=16,
+                         shm=args.shm_ser, cap=args.shm_frames)
         det = JsonlTailer(stem + '.detections.jsonl')       # where the target is (this role's detector)
         ema = FocusEma(crop, args.search, args.alpha, scale=None)
-        return reader, writer, spine, det, ema
+        return reader, out, det, ema
 
-    reader, writer, spine, det, ema = open_segment(cur)
+    reader, out, det, ema = open_segment(cur)
     latest_blobs = []
     next_index = 0
     scale = None
@@ -200,7 +207,7 @@ def main(argv=None):
     rad_per_px = None            # radians per work px (for the pixel-scale-free CoM offset); None if unknown
 
     def close_segment():
-        reader.close(); writer.close(); spine.close(); det.close()
+        reader.close(); out.close(); det.close()
 
     def process(i):
         nonlocal scale, total, strehl_ref, strehl_done, rad_per_px
@@ -246,8 +253,8 @@ def main(argv=None):
                                   round(metrics['com'][1] * rad_per_px, 9)]
         t = time.perf_counter_ns()
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
-        writer.write_frame(_ema_frame_u16(star_ema, scale, sat if even else None))
-        spine.append({'index': i, 't_mono_ns': t, 'present': present, **metrics})
+        out.write(_ema_frame_u16(star_ema, scale, sat if even else None),
+                  index=i, t_mono_ns=t, present=present, **metrics)
         total += 1
 
     try:
@@ -273,13 +280,13 @@ def main(argv=None):
             if newer:
                 close_segment()
                 cur = newer[-1] if args.follow else newer[0]
-                reader, writer, spine, det, ema = open_segment(cur)
+                reader, out, det, ema = open_segment(cur)
                 latest_blobs = []
                 next_index = 0
                 scale = None
                 continue
 
-            if _frame_count(cur) != ser_mod.SENTINEL_FRAME_COUNT and next_index >= _committed(reader, cur):
+            if reader.finalized() and next_index >= _committed(reader, cur):
                 if not args.follow:
                     break
             time.sleep(args.poll)

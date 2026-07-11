@@ -9,19 +9,20 @@ import os
 
 import numpy as np
 
-from astrolock.seeker import ser, shmser
+from astrolock.seeker import framestream, ser, shmser
 from astrolock.seeker.tests._util import fresh_dir
 
 
-def test_shmser_roundtrip_via_serreader():
+def test_shmser_roundtrip_via_open_reader():
     out = fresh_dir('shmser')
     path = os.path.join(out, '20990101T000000000Z_guide.ser')
     w = shmser.ShmSerWriter(path, 32, 24, color_id=ser.ColorId.MONO,
                             pixel_depth_per_plane=16, cap=8)
-    assert os.path.getsize(path) == ser.HEADER_SIZE      # only the marker touches the disk
+    assert not os.path.exists(path)                      # NOTHING lands on disk
 
-    # A plain SerReader on the marker transparently reads the section.
-    r = ser.SerReader(path)
+    # (No sidecar at this low level -- attach the section directly. framestream.open_reader
+    # resolves via the sidecar's 'store' field; see test_framestream_write_and_retention.)
+    r = shmser.ShmSerReader(path)
     assert r.frames_on_disk() == 0
     for i in range(5):
         w.write_frame(np.full((24, 32), 100 + i, np.uint16))
@@ -44,23 +45,46 @@ def test_shmser_roundtrip_via_serreader():
     except ValueError:
         pass
 
-    # Finalize patches the marker like SerWriter patches the file; an attached reader keeps
-    # the section alive and keeps reading after the writer is gone.
+    # Finalize patches the region header like SerWriter patches the file; an attached reader
+    # keeps the section alive and keeps reading after the writer is gone.
     w.close()
-    assert int(np.frombuffer(open(path, 'rb').read(), np.int32,
-                             count=1, offset=ser.FRAME_COUNT_OFFSET)[0]) == 8
+    assert r.finalized()
     assert int(r.read_frame(7)[0, 0]) == 107
     r.close()
 
     # With the last handle closed the section evaporates: a late reader gets ValueError
     # (the same class as an unreadable/half-written file, which followers already handle).
     try:
-        ser.SerReader(path)
+        shmser.ShmSerReader(path)
         raise AssertionError("dead section should raise")
-    except ValueError:
+    except (ValueError, FileNotFoundError):
         pass
 
 
+def test_framestream_write_and_retention():
+    out = fresh_dir('framestream')
+    st = framestream.FrameStream(out, 'guide')
+    st.open_segment('20990101T000001000Z', 16, 12, shm=True, cap=4)
+    first_ser = st.ser_path
+    for i in range(3):
+        st.write(np.full((12, 16), i, np.uint16), index=i)
+    # Roll: the previous section must SURVIVE the roll (retained by the writer) so a reader
+    # that hadn't attached yet doesn't lose the race.
+    st.open_segment('20990101T000002000Z', 16, 12, shm=True, cap=4)
+    r = framestream.open_reader(first_ser)               # attach AFTER the roll
+    assert r.frames_on_disk() == 3 and r.finalized()
+    assert int(r.read_frame(2)[0, 0]) == 2
+    r.close()
+    st.write(np.zeros((12, 16), np.uint16), index=0)
+    # Discovery: sidecars are the globbable spine, records self-describe the store.
+    assert len(framestream.sidecar_glob(out, 'guide')) == 2
+    from astrolock.seeker import sidecar as sc
+    recs = sc.read_complete_lines(framestream.sidecar_glob(out, 'guide')[0])
+    assert recs and all(rec['store'] == 'shm' for rec in recs)
+    st.close()
+
+
 if __name__ == '__main__':
-    test_shmser_roundtrip_via_serreader()
+    test_shmser_roundtrip_via_open_reader()
+    test_framestream_write_and_retention()
     print("test_shmser: OK")

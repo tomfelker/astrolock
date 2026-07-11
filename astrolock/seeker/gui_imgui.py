@@ -1898,13 +1898,9 @@ def main(argv=None):
         # Tell the watcher which files to watch (the currently-followed .ser + detection sidecars +
         # the backend state file), then block until it (or an OS input event) wakes us. The 0.25s
         # timeout is the idle heartbeat: blink text, meter sampling, tooltip delays.
-        paths = []
-        for fo in followers.values():
-            if fo.ser_path:
-                paths.append(fo.ser_path)
-                # A shm segment's .ser is a fixed-size marker that never grows -- its frames
-                # sidecar is the on-disk thing that grows per frame, so watch that for wakes.
-                paths.append(fo.ser_path[:-len('.ser')] + '.frames.jsonl')
+        # Watch the frames SIDECARS (the on-disk artifact that grows per frame -- a shm
+        # segment's .ser doesn't exist at all) + the detection sidecars.
+        paths = [fo.frames_path for fo in followers.values() if fo.frames_path]
         paths += [c['det_tailer'].path for c in cams.values()]
         wake['paths'] = paths
         wake['state_path'] = ctrl['tailer'].path if ctrl['tailer'] is not None else None

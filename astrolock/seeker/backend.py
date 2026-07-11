@@ -558,6 +558,8 @@ def main(argv=None):
                                     ['--session', session_dir, '--role', role, '--follow',
                                      '--stop-file', stop_file,
                                      '--detector', det, '--track-detector', tdet,
+                                     *(['--shm-ser', '--shm-frames', str(min(64, args.shm_frames))]
+                                       if args.shm_ser else []),
                                      '--track-blur-px', str(args.track_blur_px),
                                      '--track-pull', str(args.track_pull),
                                      '--doh-sigma', str(args.doh_sigma),
@@ -602,6 +604,7 @@ def main(argv=None):
         focus_proc = _spawn('astrolock.seeker.focus',
                             ['--session', session_dir, '--role', role, '--follow',
                              '--stop-file', focus_stop, '--device', args.device,
+                             *(['--shm-ser'] if args.shm_ser else []),
                              '--crop', str(args.focus_crop), '--search', str(args.focus_search),
                              '--alpha', str(args.focus_alpha),
                              # Optics for the Strehl reference (aperture 0 = unknown -> delta ideal).
@@ -792,15 +795,19 @@ def main(argv=None):
             launch_detect(role)                    # safety: detect normally rolls on its own
 
     def delete_old_segments():
-        """Rolling cleanup: drop non-important segments older than the two newest per role."""
+        """Rolling cleanup: drop non-important segments older than the two newest per STREAM --
+        each role's cam stream plus its derived debug/focus streams (which used to leak: their
+        names never matched the '*_<role>.ser' glob). Discovery is by sidecar; a shm segment has
+        no .ser file at all (missing files just skip)."""
         if args.keep:
             return
-        for role in roles:
-            segs = sorted(glob.glob(os.path.join(session_dir, f'*_{role}.ser')))
-            for sp in segs[:-2]:
-                stem = sp[:-len('.ser')]
+        streams = [n for role in roles for n in (role, f'{role}_debug', f'{role}_focus')]
+        for name in streams:
+            sides = sorted(glob.glob(os.path.join(session_dir, f'*_{name}.frames.jsonl')))
+            for fp in sides[:-2]:
+                stem = fp[:-len('.frames.jsonl')]
                 important = any(r.get('important')
-                                for r in sidecar.read_complete_lines(stem + '.frames.jsonl'))
+                                for r in sidecar.read_complete_lines(fp))
                 if not important:
                     for ext in ('.ser', '.frames.jsonl', '.detections.jsonl'):
                         try:
@@ -1359,9 +1366,9 @@ def _cleanup(session_dir, keep, clean):
         print(f"[backend] kept session {session_dir} (--keep)", flush=True)
         return
     kept = 0
-    for ser_path in glob.glob(os.path.join(session_dir, '*.ser')):
-        stem = ser_path[:-len('.ser')]
-        important = any(r.get('important') for r in sidecar.read_complete_lines(stem + '.frames.jsonl'))
+    for fp in glob.glob(os.path.join(session_dir, '*.frames.jsonl')):
+        stem = fp[:-len('.frames.jsonl')]
+        important = any(r.get('important') for r in sidecar.read_complete_lines(fp))
         if important:
             kept += 1
         else:

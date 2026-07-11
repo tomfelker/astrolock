@@ -12,11 +12,8 @@ Rollover/successor chaining across multiple .ser segments is not needed for the 
 """
 
 import collections
-import glob
-import os
 
-from astrolock.seeker import ser as ser_mod
-from astrolock.seeker import sidecar
+from astrolock.seeker import framestream, sidecar
 
 
 # A frame index is only meaningful against the .ser segment it was taken from: index N in one segment
@@ -41,22 +38,23 @@ class SerFollower:
         self._reader = None
 
     def _resolve(self):
-        """Find/refresh the newest .ser for this role; (re)open the reader if needed."""
-        matches = sorted(glob.glob(os.path.join(self.session_dir, f"*_{self.role}.ser")))
+        """Find/refresh the newest segment for this role -- discovered BY SIDECAR (a shm segment
+        has no .ser file; its identity path is virtual) -- and (re)open the reader if needed."""
+        matches = framestream.sidecar_glob(self.session_dir, self.role)
         if not matches:
             return False
         newest = matches[-1]
-        if newest != self._ser_path:
+        if newest != self._frames_path:
             if self._reader is not None:
                 self._reader.close()
-            self._ser_path = newest
-            self._frames_path = newest[:-len('.ser')] + '.frames.jsonl'
+            self._frames_path = newest
+            self._ser_path = framestream.ser_path_of(newest)
             self._reader = None  # opened on demand below
         if self._reader is None:
             try:
-                self._reader = ser_mod.SerReader(self._ser_path)
+                self._reader = framestream.open_reader(self._ser_path)
             except (ValueError, FileNotFoundError):
-                self._reader = None  # header not fully written yet
+                self._reader = None  # header not fully written yet / shm segment gone
                 return False
         return True
 
@@ -108,9 +106,15 @@ class SerFollower:
 
     @property
     def ser_path(self):
-        """Path of the currently-followed .ser (None until a frame exists)."""
+        """Identity of the currently-followed segment ('<stem>.ser'; virtual for a shm segment)."""
         self._resolve()
         return self._ser_path
+
+    @property
+    def frames_path(self):
+        """Path of the currently-followed frames sidecar (the on-disk, growing artifact)."""
+        self._resolve()
+        return self._frames_path
 
     def close(self):
         if self._reader is not None:

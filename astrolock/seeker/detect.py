@@ -24,7 +24,8 @@ import time
 
 import torch
 
-from astrolock.seeker import bayer, ser as ser_mod, sidecar
+from astrolock.seeker import bayer, framestream, ser as ser_mod, sidecar
+from astrolock.seeker import session as session_mod
 from astrolock.seeker.sidecar import JsonlWriter
 
 _DEVICE = torch.device('cpu')        # fallback for direct library calls; the CLI picks via --device
@@ -515,7 +516,8 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
 
 
 def _segments(session, role):
-    return sorted(glob.glob(os.path.join(session, f'*_{role}.ser')))
+    """Segment identities for a role, discovered BY SIDECAR (a shm segment has no .ser file)."""
+    return framestream.segment_paths(session, role)
 
 
 def _committed(reader, ser_path):
@@ -529,11 +531,6 @@ def _segment_ready(ser_path):
     frame. Gate on the commit point -- the sidecar's first complete line, which the cam appends only
     after those bytes are on disk -- so we never open a header-less .ser."""
     return sidecar.count_complete_lines(ser_path[:-len('.ser')] + '.frames.jsonl') >= 1
-
-
-def _frame_count(ser_path):
-    with open(ser_path, 'rb') as f:
-        return ser_mod.unpack_header(f.read(ser_mod.HEADER_SIZE)).frame_count
 
 
 def detect_roi_peak(work, roi, coord_scale, *, detector, bg_radius, psf_px, doh_sigma, snr):
@@ -776,6 +773,11 @@ def main(argv=None):
     p.add_argument('--ext-density', type=float, default=0.7,
                    help="extended: min compactness to call a target present (~1 = tightly clumped target, "
                         "~0.5 = uniform noise), in both axes")
+    p.add_argument('--shm-ser', action='store_true',
+                   help="write the debug stream to shared-memory segments instead of disk (matches "
+                        "the cams; live viewing only -- sections die with their processes)")
+    p.add_argument('--shm-frames', type=int, default=64,
+                   help="shm debug segments: frames per segment (committed RAM)")
     p.add_argument('--debug-ser', action='store_true',
                    help="also write the detection surface as <seg>_<role>_debug.ser (+ .frames.jsonl), a "
                         "normalized greyscale movie of exactly what the detector 'sees' -- follow it in "
@@ -823,7 +825,7 @@ def main(argv=None):
     cur = ready[-1] if args.follow else ready[0]
 
     def open_segment(ser_path):
-        reader = ser_mod.SerReader(ser_path)
+        reader = framestream.open_reader(ser_path)     # disk .ser or shm section, transparently
         writer = JsonlWriter(ser_path[:-len('.ser')] + '.detections.jsonl')
         return reader, writer
 
@@ -837,15 +839,15 @@ def main(argv=None):
     reader, writer = open_segment(cur)
     prev = None
     surprise = new_surprise()
-    dbg = {'writer': None, 'sidecar': None}            # debug detection-surface .ser (lazy, per segment)
+    dbg = {'stream': None}                             # debug detection-surface stream (lazy, per segment)
     next_index = 0
     scale = None
     total = 0
 
     def close_debug():
-        if dbg['writer'] is not None:
-            dbg['writer'].close(); dbg['sidecar'].close()
-            dbg['writer'] = dbg['sidecar'] = None
+        if dbg['stream'] is not None:
+            dbg['stream'].close()
+            dbg['stream'] = None
 
     # Track-mode: tail the backend state for a predicted ROI around the target. When present (this
     # role is being tracked), detect just that small window with a single-peak/centroid pass instead
@@ -954,18 +956,21 @@ def main(argv=None):
         writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(),
                        'proc_ms': round((time.perf_counter() - t_start) * 1e3, 1),
                        'blobs': blobs, 'status': status, **extra})
-        # Debug movie of the detection surface: a parallel .ser + commit spine the GUI can follow.
+        # Debug movie of the detection surface: a parallel stream the GUI follows by name
+        # ('<role>_debug'); shm-backed like the cams when --shm-ser (it's the same sustained-write
+        # hazard), rolling on its own stamps when a shm segment fills.
         if args.debug_ser and debug_surface is not None:
-            if dbg['writer'] is None:
-                dpath = cur[:-len('.ser')] + '_debug.ser'
-                dh, dw = debug_surface.shape
-                dbg['writer'] = ser_mod.SerWriter(dpath, dw, dh, color_id=ser_mod.ColorId.MONO,
-                                                  pixel_depth_per_plane=16)
-                dbg['sidecar'] = JsonlWriter(dpath[:-len('.ser')] + '.frames.jsonl')
+            st = dbg['stream']
+            if st is None:
+                st = dbg['stream'] = framestream.FrameStream(args.session, f'{args.role}_debug')
+            dh, dw = debug_surface.shape
+            if st.ser_path is None or (args.shm_ser and st.frame_count >= args.shm_frames):
+                st.open_segment(session_mod.segment_stamp(), dw, dh, color_id=ser_mod.ColorId.MONO,
+                                pixel_depth_per_plane=16, shm=args.shm_ser, cap=args.shm_frames)
             # A surprisal surface is in true sigma units -> FIXED scale (debug_hi, white = 10 sigma)
             # so standout is judgeable across frames; other surfaces autoscale per frame (hi=None).
-            dbg['writer'].write_frame(debug_frame_u16(debug_surface, hi=debug_hi))
-            dbg['sidecar'].append({'t_mono_ns': time.perf_counter_ns(), 'index': i})
+            st.write(debug_frame_u16(debug_surface, hi=debug_hi),
+                     t_mono_ns=time.perf_counter_ns(), index=i)
         total += 1
 
     try:
@@ -1003,7 +1008,7 @@ def main(argv=None):
                 continue
 
             # No newer segment: live waits; offline exits once this one is finalized.
-            if _frame_count(cur) != ser_mod.SENTINEL_FRAME_COUNT and next_index >= _committed(reader, cur):
+            if reader.finalized() and next_index >= _committed(reader, cur):
                 if not args.follow:
                     break
             time.sleep(args.poll)

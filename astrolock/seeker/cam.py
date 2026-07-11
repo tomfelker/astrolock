@@ -25,8 +25,8 @@ import torch
 
 from astrolock.seeker import control as control_mod
 from astrolock.seeker import ser as ser_mod
+from astrolock.seeker import framestream
 from astrolock.seeker import session as session_mod
-from astrolock.seeker import shmser
 from astrolock.seeker import sidecar
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
@@ -674,6 +674,7 @@ def main(argv=None):
           f"frame_limit={cfg['frame_limit']} file_limit={cfg['file_limit']} "
           f"important={cfg['important']} control={args.control_file} -> {out_dir}", flush=True)
 
+    stream = framestream.FrameStream(out_dir, args.role)
     start = time.perf_counter()
     total = 0
     last_status = start
@@ -681,11 +682,8 @@ def main(argv=None):
     stop = False
     try:
         while not stop and cfg['file_limit'] != 0:
-            seg_ts = session_mod.segment_stamp()
-            ser_path = os.path.join(out_dir, session_mod.ser_name(seg_ts, args.role))
-            frames_path = os.path.join(out_dir, session_mod.frames_name(seg_ts, args.role))
-            # Idle segments live in a shared-memory section (only a 178-byte marker touches the
-            # disk; sustained full-rate .ser writes grind consumer SSDs into GC stalls -- see
+            # Idle segments live in shared memory (nothing lands on disk but the sidecar;
+            # sustained full-rate .ser writes grind consumer SSDs into GC stalls -- see
             # shmser.py). Important (recording) segments are plain disk .ser exactly as before: a
             # pass is a bounded burst. An 'important' flip rolls the segment, so each is purely
             # one or the other. A shm segment is committed RAM, so it rolls at --shm-frames even
@@ -695,13 +693,9 @@ def main(argv=None):
             seg_limit = cfg['frame_limit']
             if use_shm and (seg_limit == -1 or seg_limit > args.shm_frames):
                 seg_limit = args.shm_frames
-            if use_shm:
-                writer = shmser.ShmSerWriter(ser_path, width, height, color_id=color_id,
-                                             pixel_depth_per_plane=pixel_depth, cap=seg_limit)
-            else:
-                writer = ser_mod.SerWriter(ser_path, width, height,
-                                           color_id=color_id, pixel_depth_per_plane=pixel_depth)
-            sidecar = JsonlWriter(frames_path)
+            stream.open_segment(session_mod.segment_stamp(), width, height, color_id=color_id,
+                                pixel_depth_per_plane=pixel_depth,
+                                shm=use_shm, cap=max(1, seg_limit) if use_shm else 64)
             frames_in_file = 0
             rolled = False
             try:
@@ -748,18 +742,18 @@ def main(argv=None):
                     else:
                         frame = make_synthetic_frame(width, height, loop_start - start)
 
-                    writer.write_frame(frame)                 # pixels flushed (may precede the commit line)
+                    stream.write_pixels(frame)                # pixels flushed (may precede the commit line)
                     if avail_ns is not None:                   # hold the commit until the exposure really ends
                         wait = (avail_ns - time.perf_counter_ns()) * 1e-9
                         if wait > 0:
                             time.sleep(wait)
-                    sidecar.append({                           # then commit-point line
-                        't_mono_ns': cap_t_ns if cap_t_ns is not None else time.perf_counter_ns(),
-                        't_utc': session_mod.utc_now_iso(),
-                        'important': bool(cfg['important']),
+                    stream.commit(                             # then commit-point line
+                        t_mono_ns=cap_t_ns if cap_t_ns is not None else time.perf_counter_ns(),
+                        t_utc=session_mod.utc_now_iso(),
+                        important=bool(cfg['important']),
                         **frame_meta,                          # bin + roi (sensor->frame mapping)
                         **({'settings': applied} if applied else {}),   # exposure/gain in effect this segment
-                    })
+                    )
                     frames_in_file += 1
                     total += 1
 
@@ -782,13 +776,13 @@ def main(argv=None):
                         if sleep > 0:
                             time.sleep(sleep)
             finally:
-                writer.close()
-                sidecar.close()
+                pass                                   # rolls finalize in open_segment; exit closes below
             if rolled and not stop and cfg['file_limit'] != -1:
                 cfg['file_limit'] -= 1                 # consumed one of our file budget
     except KeyboardInterrupt:
         print(f"[cam:{args.role}] interrupted", flush=True)
     finally:
+        stream.close()                                # finalize the open segment + release retained shm
         if control is not None:
             control.close()
         print(f"[cam:{args.role}] done, {total} frames total", flush=True)

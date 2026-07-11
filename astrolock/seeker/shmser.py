@@ -15,10 +15,10 @@ Windows named sections are kernel refcounted, session-local, and same-user by de
 disk as plain .ser: a pass is a bounded burst, which SSDs handle; it's the *indefinite* idle
 streaming they can't.
 
-Discovery keeps every glob/rollover path working: the segment's .ser exists on disk as a
-178-byte MARKER -- just the SER header, with 'SHMSER:<frame cap>' in the instrument field --
-and SerReader transparently redirects to the section named by the file's basename. (Later:
-glob the jsonl sidecars instead and let each name its backing file/section.)
+Discovery is by the .frames.jsonl sidecar (see framestream.py) -- NOTHING lands on disk for a
+shm segment. The section is named by the segment's virtual '<stem>.ser' basename and carries
+its own SER header at offset 0 ('SHMSER:<frame cap>' in the instrument field), so a reader
+attaches by name and parses geometry straight from the region.
 
 Region layout:    [SER header][frame 0 .. cap-1 slots, appended in order][total u64]
 
@@ -68,9 +68,9 @@ class _Views:
 
 class ShmSerWriter:
     """Drop-in for SerWriter (write_frame/close/frame_count) writing frames into a shared-memory
-    section; the only disk artifact is the 178-byte marker header at ``path``. Capacity is fixed
-    at ``cap`` frames (it's committed RAM) -- the cam rolls segments at or before that, exactly
-    as it rolls files."""
+    section; NOTHING lands on disk (``path`` is only the identity the section is named after).
+    Capacity is fixed at ``cap`` frames (it's committed RAM) -- the caller rolls segments at or
+    before that, exactly as it rolls files."""
 
     def __init__(self, path, width, height, color_id=ser_mod.ColorId.MONO,
                  pixel_depth_per_plane=16, cap=128, observer='', telescope=''):
@@ -85,8 +85,6 @@ class ShmSerWriter:
             date_time=0, date_time_utc=0)
         self._bytes_per_frame = ser_mod.bytes_per_frame(self.header)
         hdr = ser_mod.pack_header(self.header)
-        with open(self.path, 'wb') as f:                 # the discovery marker (no handle kept open)
-            f.write(hdr)
         size = ser_mod.HEADER_SIZE + self.cap * self._bytes_per_frame + 8
         self._shm = shared_memory.SharedMemory(name=_section_name(self.path), create=True, size=size)
         self._shm.buf[:ser_mod.HEADER_SIZE] = hdr        # region is header-true, like the file would be
@@ -104,35 +102,53 @@ class ShmSerWriter:
         self.frame_count += 1
         self._v.total[0] = self.frame_count               # published AFTER the bytes: the commit point
 
+    def finalize(self):
+        """Patch the region header's frame count (finalize semantics, like SerWriter patching the
+        file): readers see a non-sentinel count and know no more frames are coming."""
+        if self._shm is not None:
+            self._shm.buf[ser_mod.FRAME_COUNT_OFFSET:ser_mod.FRAME_COUNT_OFFSET + 4] =                 np.int32(self.frame_count).tobytes()
+
     def close(self):
-        """Patch the marker's frame count (finalize semantics, like SerWriter) and drop our handle;
-        the section lives on exactly as long as some reader still holds it."""
-        try:
-            with open(self.path, 'r+b') as f:
-                f.seek(ser_mod.FRAME_COUNT_OFFSET)
-                f.write(np.int32(self.frame_count).tobytes())
-        except OSError:
-            pass                                          # marker already cleaned up -> nothing to patch
+        """Finalize and drop our handle; the section lives on exactly as long as some reader
+        still holds it. (framestream retains the previous segment's writer for one extra roll so
+        a reader that hasn't attached yet doesn't lose the race.)"""
+        if self._shm is None:
+            return
+        self.finalize()
         self._v = None                                    # release our buffer exports before close()
         self._shm.close()
+        self._shm = None
 
 
 class ShmSerReader:
-    """Reader side, constructed by SerReader when it opens a marker file. Same contract:
-    frames_total() and read_frame(index) -> read-only array, IndexError when not yet committed.
-    Committed frames are immutable, so there are no torn reads and no locks."""
+    """Reader side (see framestream.open_reader): attach the section by the segment's virtual
+    .ser name and parse the SER header straight from the region. Same contract as SerReader:
+    frames_on_disk() and read_frame(index) -> read-only array, IndexError when not yet
+    committed. Committed frames are immutable, so there are no torn reads and no locks."""
 
-    def __init__(self, path, header):
-        self.header = header
-        self.cap = _frame_cap(header)
+    def __init__(self, path):
+        self.path = str(path)
         try:
             self._shm = shared_memory.SharedMemory(name=_section_name(path), create=False)
         except (FileNotFoundError, OSError) as e:
             raise ValueError(f"{path}: shm segment is gone (writer and all readers exited)") from e
-        self._v = _Views(self._shm.buf, header, self.cap)
+        self.header = ser_mod.unpack_header(bytes(self._shm.buf[:ser_mod.HEADER_SIZE]))
+        if not is_shm_header(self.header):
+            self._shm.close()
+            raise ValueError(f"{path}: section exists but is not a SHMSER region")
+        self.cap = _frame_cap(self.header)
+        self._v = _Views(self._shm.buf, self.header, self.cap)
 
     def frames_total(self):
         return int(self._v.total[0])
+
+    def frames_on_disk(self):                             # SerReader-compatible name
+        return self.frames_total()
+
+    def finalized(self):
+        """True once the writer has closed this segment (header count patched from sentinel)."""
+        hdr = ser_mod.unpack_header(bytes(self._shm.buf[:ser_mod.HEADER_SIZE]))
+        return hdr.frame_count != ser_mod.SENTINEL_FRAME_COUNT
 
     def read_frame(self, index, to_float=False):
         total = self.frames_total()
