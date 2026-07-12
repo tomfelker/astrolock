@@ -16,7 +16,9 @@ FrameRef = collections.namedtuple('FrameRef', ['ser_path', 'index'])
 
 
 def _seg_id(seg):
-    return seg.frames_path[:-len('.frames.jsonl')] + '.ser'
+    # Historical '<stem>.ser' shape, from the segment's ident (shm GUID / .dat basename):
+    # consumers use it as an identity and to derive sibling names (detections).
+    return seg.ident + '.ser'
 
 
 class SerFollower:
@@ -69,11 +71,20 @@ class SerFollower:
         seg = self._newest()
         return _seg_id(seg) if seg is not None else None
 
+    def frame_time_ns(self, index):
+        """t_mono_ns of frame ``index`` in the CURRENT segment (None if not committed)."""
+        seg = self._newest()
+        if seg is None:
+            return None
+        try:
+            return seg.record(index)['t_mono_ns']
+        except IndexError:
+            return None
+
     @property
-    def frames_path(self):
-        """The newest segment's sidecar (the on-disk artifact that grows per frame)."""
-        self._fo.poll()
-        return self._fo.frames_path
+    def segs(self):
+        """The held SegmentReaders (for in-memory wake probes)."""
+        return self._fo.segs
 
     def close(self):
         self._fo.close()

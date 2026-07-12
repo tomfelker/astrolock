@@ -39,13 +39,12 @@ def test_control_file_drives_cam():
     t.join(timeout=5.0)
     assert not t.is_alive(), "cam should have stopped"
 
-    sides = sorted(glob.glob(os.path.join(out, '*_guide.frames.jsonl')))
-    assert len(sides) >= 2, f"frame-limit 10 should have rolled to several segments (got {len(sides)})"
-
-    starts = [sidecar.read_complete_lines(fp)[0] for fp in sides]
-    assert all(r['type'] == 'start' and r['store'] == 'file' for r in starts)
-    # No 'important' concept anymore: recording is the recorder process's job; the cam just
-    # streams (a .dat heap here, shm on the rig).
+    head = sidecar.read_complete_lines(os.path.join(out, 'guide.stream.jsonl'))
+    segs = [e for e in head if e.get('event') == 'segment']
+    assert len(segs) >= 2, f"frame-limit 10 should have rolled to several segments (got {len(segs)})"
+    assert all('data' in e for e in segs)           # file store here (shm on the rig)
+    assert head[-1] == {'event': 'ended'}
+    # No 'important' concept anymore: recording is the recorder process's job.
 
 
 if __name__ == '__main__':

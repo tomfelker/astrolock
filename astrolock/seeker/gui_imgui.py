@@ -137,21 +137,31 @@ def _rate_to_u(r):
 
 
 def _waker(glfw_mod, wake, stop):
-    """Watch the sidecars the GUI renders from and poke the (blocked-in-wait_events) GUI thread awake
-    ONLY when something it actually draws has changed. Two signals, both self-gating -- a parked,
-    not-tracking, not-capturing rig emits neither:
-      * frame/detection files -- a path that grew, OR one we've not seen yet (a cam just connected /
-        a segment rolled over), means new pixels to draw;
-      * state file -- only a *meaningful* field change wakes us. The backend rewrites state at ~20 Hz
-        even when parked, so we diff with the volatile fields stripped, else the GUI would never idle.
-    glfw.post_empty_event() is documented thread-safe, and portable -- this replaces the retired
-    dpg front end's Windows-only PostThreadMessageW hack."""
+    """Poke the (blocked-in-wait_events) GUI thread awake ONLY when something it draws changed.
+    Three signals, all self-gating -- a parked, not-tracking, not-capturing rig emits none:
+      * shm PROBES -- frame counts read straight out of the followed segments' headers (pure
+        memory reads, no syscalls: v3 frames commit in RAM);
+      * files -- head files (segment/ended events) + detection sidecars that grew or appeared;
+      * state file -- only a *meaningful* field change wakes us. The backend rewrites state at
+        ~20 Hz even when parked, so we diff with the volatile fields stripped.
+    glfw.post_empty_event() is documented thread-safe, and portable."""
     sizes = {}
+    last_counts = None
     cur_sp = None
     state_pos = 0
     last_state = None
     while not stop.is_set():
         dirty = False
+        counts = []
+        for seg in (wake.get('probes') or ()):
+            try:
+                counts.append(seg.committed())
+            except (AttributeError, ValueError):   # render thread closed it mid-probe: benign race
+                counts.append(-1)
+        counts = tuple(counts)
+        if counts != last_counts:
+            last_counts = counts
+            dirty = True
         paths = wake.get('paths') or ()
         for pth in paths:                         # unseen path (sizes.get -> None) or a grown one = new data
             try:
@@ -412,7 +422,7 @@ def main(argv=None):
     track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True,   # Tracking panel state; backend defaults
                 'delay': 0.0}                                            # post-lock mount-hold (s)
     sim_ui = {'r0': 0.0, 'bortle': 4}                     # Simulation panel: seeing r0 (m) + Bortle sky class
-    focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'path': None, 'tailer': None,
+    focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'fo': None,
                 't0': None, 'com_mult': 10.0,             # collimation-trail exaggeration on the star view
                 'screw_phase': 0.0,                       # deg: rotation of the 3 collimation screws in the image
                 'rad_per_turn': 100e-6,                   # empirical: CoM-offset radians removed per screw turn
@@ -531,7 +541,7 @@ def main(argv=None):
             fh0, fw0 = frame.shape[0], frame.shape[1]
             nb = 2 if bayer.is_bayer(f.header.color_id) else 1
             w, h = fw0 // nb, fh0 // nb
-            det_path = seg[:-len('.ser')] + '.detections.jsonl'
+            det_path = os.path.join(args.session, seg[:-len('.ser')] + '.detections.jsonl')
             cam = cams[stream] = dict(gl=_StreamGL(ctx, prog, vao), w=w, h=h, fw=fw0, fh=fh0,
                                       ox=w / fw0, oy=h / fh0, color_id=f.header.color_id,
                                       blobs=[], ext=None, status=None, det_idx=-1, last_idx=-1,
@@ -540,7 +550,8 @@ def main(argv=None):
         # into cam['ser_path'], so reset them: index N in the old segment is a different frame than in the new.
         if seg != cam['ser_path']:
             cam['det_tailer'].close()
-            cam['det_tailer'] = JsonlTailer(seg[:-len('.ser')] + '.detections.jsonl')
+            cam['det_tailer'] = JsonlTailer(os.path.join(args.session,
+                                                         seg[:-len('.ser')] + '.detections.jsonl'))
             cam['ser_path'] = seg
             cam['last_idx'] = cam['det_idx'] = -1
         for rec in cam['det_tailer'].poll():
@@ -1227,9 +1238,9 @@ def main(argv=None):
         for k in focus_ui['series']:
             focus_ui['series'][k] = []
         focus_ui['t0'] = None
-        if focus_ui['tailer'] is not None:
-            focus_ui['tailer'].close()
-        focus_ui['tailer'], focus_ui['path'] = None, None
+        if focus_ui['fo'] is not None:
+            focus_ui['fo'].close()
+        focus_ui['fo'] = None
 
     def _focus_start(role):
         """Point the big pane at this cam's star stream and (re)launch the focus process on it."""
@@ -1254,35 +1265,39 @@ def main(argv=None):
             focus_ui['role'] = role                       # just remember the selection until Start
 
     def _poll_focus_metrics():
-        """Tail <role>_focus.frames.jsonl (the focus process's metric spine) into the rolling series that
-        feed the on-pane focus graph (peak) + collimation trail (dx/dy). Rolls to a newer segment's file."""
+        """Read the star stream's binary record extras (peak/strehl/com...) into the rolling
+        series feeding the on-pane focus graph + collimation trail. Sequential across the
+        segment chain; NaN extras decode back to None/absent (unknown aperture/plate scale)."""
         if not focus_ui['want']:
             return
-        p_ = _newest(args.session, f"_{focus_ui['role']}_focus.frames.jsonl")
-        if p_ and p_ != focus_ui['path']:                 # first file, or a new segment
-            if focus_ui['tailer'] is not None:
-                focus_ui['tailer'].close()
-            focus_ui['tailer'] = JsonlTailer(p_)
-            focus_ui['path'] = p_
-        if focus_ui['tailer'] is None:
-            return
+        if focus_ui['fo'] is None:
+            focus_ui['fo'] = framestream.StreamFollower(args.session, f"{focus_ui['role']}_focus",
+                                                        keep_all=True)
+        fo_ = focus_ui['fo']
+        fo_.poll()
         s = focus_ui['series']
-        for rec in focus_ui['tailer'].poll():
-            t = rec.get('t_mono_ns')
-            if t is None:
+        while fo_.segs:
+            seg = fo_.segs[0]
+            i = getattr(seg, '_gui_used', 0)
+            while i < seg.committed():
+                rec = seg.record(i)
+                i += 1
+                t = rec['t_mono_ns']
+                if focus_ui['t0'] is None:
+                    focus_ui['t0'] = t * 1e-9
+                s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
+                s['peak'].append(rec['peak'])
+                s['strehl'].append(None if math.isnan(rec['strehl']) else rec['strehl'])
+                s['dx'].append(rec['dx'])
+                s['dy'].append(rec['dy'])
+                if not math.isnan(rec['com_rad_x']):       # pixel-scale-free CoM -> screw dial (latest)
+                    focus_ui['com_rad'] = (rec['com_rad_x'], rec['com_rad_y'])
+                perf['focus'].hit()                        # one record = one focus frame produced
+            seg._gui_used = i
+            if seg.finalized() and i >= seg.committed() and len(fo_.segs) > 1:
+                fo_.release(seg)                           # fully consumed -> let the section go
                 continue
-            if focus_ui['t0'] is None:
-                focus_ui['t0'] = t * 1e-9
-            s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
-            s['peak'].append(rec.get('peak', 0.0))
-            s['strehl'].append(rec.get('strehl'))         # None when the aperture is unknown (no Strehl)
-            com = rec.get('com') or [0.0, 0.0]
-            s['dx'].append(com[0])
-            s['dy'].append(com[1])
-            cr = rec.get('com_rad')                         # pixel-scale-free CoM offset -> screw dial (latest)
-            if cr:
-                focus_ui['com_rad'] = (cr[0], cr[1])
-            perf['focus'].hit()                            # one metric record = one focus frame produced
+            break
         for k in s:                                       # keep only the last FOCUS_MAX points
             if len(s[k]) > FOCUS_MAX:
                 del s[k][:len(s[k]) - FOCUS_MAX]
@@ -1899,11 +1914,12 @@ def main(argv=None):
         # Tell the watcher which files to watch (the currently-followed .ser + detection sidecars +
         # the backend state file), then block until it (or an OS input event) wakes us. The 0.25s
         # timeout is the idle heartbeat: blink text, meter sampling, tooltip delays.
-        # Watch the frames SIDECARS (the on-disk artifact that grows per frame -- a shm
-        # segment stores pixels off-disk) + the stream HEAD files (segment/ended events) + the
-        # detection sidecars.
-        paths = [fo.frames_path for fo in followers.values() if fo.frames_path]
-        paths += [framestream.head_path(args.session, name) for name in followers]
+        # v3: frames commit in RAM, so the waker PROBES shm headers directly (pure memory
+        # reads, no syscalls) and stat-watches only the head files (segment/ended events),
+        # detection sidecars, and the state file.
+        wake['probes'] = [seg for fo_ in followers.values() for seg in fo_.segs
+                          if seg._buf is not None]
+        paths = [framestream.head_path(args.session, name) for name in followers]
         paths += [c['det_tailer'].path for c in cams.values()]
         wake['paths'] = paths
         wake['state_path'] = ctrl['tailer'].path if ctrl['tailer'] is not None else None

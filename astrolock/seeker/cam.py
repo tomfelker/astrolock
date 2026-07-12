@@ -692,7 +692,9 @@ def main(argv=None):
                 seg_limit = args.shm_frames
             stream.open_segment(session_mod.segment_stamp(), width, height, color_id=color_id,
                                 pixel_depth=pixel_depth,
-                                shm=use_shm, cap=max(1, seg_limit) if use_shm else 64)
+                                shm=use_shm, cap=max(1, seg_limit) if use_shm else 64,
+                                meta={**frame_meta,            # bin + roi (sensor->frame mapping)
+                                      **({'settings': applied} if applied else {})})
             frames_in_file = 0
             rolled = False
             try:
@@ -742,12 +744,10 @@ def main(argv=None):
                         wait = (avail_ns - time.perf_counter_ns()) * 1e-9
                         if wait > 0:
                             time.sleep(wait)
-                    stream.commit(                             # then commit-point line
+                    stream.commit(                             # the commit: one shm store
                         t_mono_ns=cap_t_ns if cap_t_ns is not None else time.perf_counter_ns(),
-                        t_utc=session_mod.utc_now_iso(),
-                        **frame_meta,                          # bin + roi (sensor->frame mapping)
-                        **({'settings': applied} if applied else {}),   # exposure/gain in effect this segment
-                    )
+                        t_utc_ns=time.time_ns(),
+                        src_index=frames_in_file)
                     frames_in_file += 1
                     total += 1
 

@@ -1,47 +1,61 @@
 """
-Named frame streams, v2: chained sidecars, head files, and pure frame-heap stores.
+Named frame streams, v3: binary in-section records -- the OS can't stall a frame commit.
 
-A STREAM ('guide', 'main_debug', ...) is a chain of SEGMENTS. Discovery involves no globbing
-and no stat-polling of sentinel files:
+A STREAM ('guide', 'main_debug', ...) is a chain of SEGMENTS announced by a HEAD file
+(<name>.stream.jsonl, fixed name, single writer, appended only at ROLL cadence -- the sole
+disk artifact in the live path, and the discovery bootstrap):
 
-  <name>.stream.jsonl            the HEAD file (fixed name, single writer = the producer):
-                                   {"event":"segment","sidecar":"<ts>_<name>.frames.jsonl"}
-                                   {"event":"ended"}
-  <ts>_<name>.frames.jsonl       a segment's sidecar -- the commit spine and the ONLY protocol:
-                                   {"type":"start", store/geometry metadata}          (line 0)
-                                   {"off":..,"len":.., ...}    one per frame, in order
-                                   {"type":"next","sidecar":"..."}  on roll, OR
-                                   {"type":"ended"}                 on clean stream end
+    {"event":"segment", "shm":"<guid>"}            (or "data":"<file>.dat" for the file store)
+    {"event":"ended"}
 
-The pixel store is a pure frame HEAP -- a shared-memory section (named by a random GUID carried
-in the start record; nothing lands on disk) or a plain .dat file -- with frames written at
-4K-aligned offsets and addressed ONLY by the sidecar's off/len records. There is no format
-inside the store, no counters, no locks: the writer fills the pixels, THEN write()s the sidecar
-line, and that syscall is the commit point and the memory barrier. Committed frames are
-immutable. Variable-size frames (mjpeg, compressed archives) need nothing new.
+A segment is ONE section (or file) that carries everything -- v2's sidecar records moved
+inside, as fixed-size binary structs (we own both ends; JSON was only convenience, and the
+filesystem's write-throttle gates were stalling per-frame commits during drive breathers):
 
-Consumers are fire-and-forget: open the head, follow the chain, stop at 'ended' (a clean
-shutdown is an event in the data, not a sentinel file); a chain that never ends but goes stale
-means the producer died. Sections die with their last handle (Windows named sections are
-kernel-refcounted, session-local, same-user), so a reader holding a segment IS the write-behind
-buffer, and cleanup is garbage collection of small sidecar files only.
+    [ header struct | JSON blob (cold metadata: geometry, settings, extras schema) ]
+    [ FrameInfo[cap]: fixed binary records -- t_mono_ns, t_utc_ns, off, len, flags, src_index,
+                      plus optional per-stream EXTRAS (schema declared in the header JSON) ]
+    [ frame heap, 4K-aligned offsets ]
 
-Why every file has exactly ONE writer (head = producer, sidecar = producer, heap = producer):
-multi-process appends to a shared index would be the one racy spot in an otherwise race-free
-design. See docs/notes.md 2026-07-10/11 for the SSD saga that motivated all of this.
+Commit = memcpy frame, fill FrameInfo[n], store header.frame_count = n+1. That single aligned
+u64 store is the system's entire synchronization story (x86/ARM64 store order; a fenced build
+can come later). frame_count and flags live at fixed offsets so readers poll them with pure
+memory reads -- no syscalls, so even the GUI's waker probes for new frames without touching
+the filesystem. Segment finalize/stream-end are header FLAG bits (+ the head's ended event).
+Sections are committed lazily by the OS (untouched pages cost no RAM), sized for cap frames of
+worst case -- which stays well-defined even for future variable-size frames (mjpeg bounds at
+~raw+slack); the file store writes the same bytes to disk (tests/offline), patching
+frame_count per commit like SerWriter used to.
+
+Consumers are fire-and-forget: follow the head, attach segments eagerly (holding a section IS
+the write-behind buffer), read records straight out of the region, finish at ended. Every file
+and every section has exactly one writer.
 """
 
 import json
 import os
+import struct
 import uuid
 from multiprocessing import shared_memory
 
 import numpy as np
 
-from astrolock.seeker import ser as ser_mod          # ColorId + container/dtype conventions only
+from astrolock.seeker import ser as ser_mod          # ColorId convention only
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
-_ALIGN = 4096                                        # frame offsets are 4K-aligned (for luck)
+_ALIGN = 4096
+MAGIC = b'ALFSSEG3'
+# magic 8s | version I | rec_off I | rec_size I | cap I | json_len I | pad I | count Q | flags Q
+_HDR = struct.Struct('<8sIIIIIIQQ')                  # pad I keeps count/flags 8-byte ALIGNED
+assert (_HDR.size - 16) % 8 == 0                     # the publish store must be a single aligned write
+_COUNT_OFF = _HDR.size - 16                          # byte offset of the frame_count publish word
+_FLAGS_OFF = _HDR.size - 8
+FLAG_FINALIZED = 1                                   # no more frames in THIS segment
+FLAG_STREAM_ENDED = 2                                # ...and the whole stream ended cleanly here
+
+# The base per-frame record; streams may append EXTRAS (schema in the header JSON).
+_REC_BASE = struct.Struct('<qqQIIq')                 # t_mono_ns, t_utc_ns, off, len, flags, src_index
+_REC_FIELDS = ('t_mono_ns', 't_utc_ns', 'off', 'len', 'flags', 'src_index')
 
 
 def _align(n):
@@ -56,119 +70,144 @@ def _dtype_for(pixel_depth):
     return np.dtype('u1') if pixel_depth <= 8 else np.dtype('<u2')
 
 
+def _layout(width, height, pixel_depth, cap, extras_fmt, json_len):
+    frame_bytes = int(width) * int(height) * _dtype_for(pixel_depth).itemsize
+    rec_size = _REC_BASE.size + (struct.calcsize(extras_fmt) if extras_fmt else 0)
+    rec_off = _align(_HDR.size + json_len)
+    heap_off = _align(rec_off + rec_size * cap)
+    total = heap_off + _align(frame_bytes) * cap
+    return frame_bytes, rec_size, rec_off, heap_off, total
+
+
 # --------------------------------- write side ---------------------------------------------
 
 class FrameStream:
-    """Producer side of a named stream: head file + one open segment at a time, rolled by the
-    caller (or when full). Two-phase commit preserves the cam's contract: write_pixels(), any
-    between-work (exposure wait), then commit(**record) -- the sidecar line IS the commit."""
+    """Producer side: head file + one open segment at a time, rolled by the caller (or when
+    full). Two-phase commit preserves the cam's contract: write_pixels(), any between-work
+    (exposure wait), then commit(...) -- one shm store, untouchable by the filesystem."""
 
-    def __init__(self, out_dir, name):
+    def __init__(self, out_dir, name, extras=None):
+        """``extras``: optional (fmt, names) -- e.g. ('<6f', ['peak','strehl',...]) -- appended
+        to every frame record; schema is published in each segment's header JSON."""
         self.out_dir, self.name = str(out_dir), str(name)
         self._head = JsonlWriter(head_path(out_dir, name))
-        self._sidecar = None
-        self._store = None                    # dict: kind/shm/file handles for the open segment
-        self._retired_shm = None              # previous segment's section, bridged one roll
-        self._staged = None                   # (off, len) from write_pixels awaiting commit
-        self._off = 0
-        self.frame_count = 0                  # frames committed in the CURRENT segment
-        self.frames_path = None
-        self._meta = None
+        self.extras_fmt, self.extras_names = (extras or ('', []))
+        self._x = struct.Struct(self.extras_fmt) if self.extras_fmt else None
+        self._seg = None                      # dict for the open segment
+        self._retired_shm = None              # previous section, bridged one roll
+        self._staged = None                   # (off, len) awaiting commit
+        self.frame_count = 0
 
     def open_segment(self, seg_ts, width, height, color_id=ser_mod.ColorId.MONO,
-                     pixel_depth=16, shm=True, cap=64):
-        """Roll to a fresh segment '<seg_ts>_<name>': create the new store + sidecar first, then
-        chain the old sidecar to it ('next') -- a reader only ever sees a link to something that
-        already exists."""
-        stem = os.path.join(self.out_dir, f'{seg_ts}_{self.name}')
-        new_frames = stem + '.frames.jsonl'
-        frame_bytes = int(width) * int(height) * _dtype_for(pixel_depth).itemsize
-        cap_bytes = _align(frame_bytes) * int(cap)
-        meta = {'type': 'start', 'width': int(width), 'height': int(height),
-                'pixel_depth': int(pixel_depth), 'color_id': int(color_id)}
+                     pixel_depth=16, shm=True, cap=64, meta=None):
+        """Roll to a fresh segment. ``meta``: cold per-segment metadata (bin/roi/settings/...)
+        published in the header JSON alongside geometry and the extras schema."""
+        blob = json.dumps({'name': self.name, 'seg_ts': str(seg_ts), 'width': int(width),
+                           'height': int(height), 'pixel_depth': int(pixel_depth),
+                           'color_id': int(color_id), 'extras_fmt': self.extras_fmt,
+                           'extras': list(self.extras_names), **(meta or {})},
+                          separators=(',', ':')).encode('utf-8')
+        fb, rec_size, rec_off, heap_off, total = _layout(width, height, pixel_depth, cap,
+                                                         self.extras_fmt, len(blob))
+        hdr = _HDR.pack(MAGIC, 3, rec_off, rec_size, cap, len(blob), 0, 0, 0) + blob
+        self._roll_out()
+        seg = {'width': width, 'height': height, 'pixel_depth': pixel_depth, 'cap': cap,
+               'rec_size': rec_size, 'rec_off': rec_off, 'heap_off': heap_off,
+               'frame_bytes': fb, 'off': heap_off}
         if shm:
-            section = shared_memory.SharedMemory(create=True, size=cap_bytes,
-                                                 name=uuid.uuid4().hex)
-            store = {'kind': 'shm', 'shm': section, 'buf': section.buf, 'cap': cap_bytes}
-            meta.update(store='shm', shm=section.name)
+            section = shared_memory.SharedMemory(create=True, size=total, name=uuid.uuid4().hex)
+            seg.update(kind='shm', shm=section, buf=section.buf)
+            seg['buf'][:len(hdr)] = hdr
+            self._head.append({'event': 'segment', 'shm': section.name})
         else:
-            f = open(stem + '.dat', 'wb')
-            store = {'kind': 'file', 'file': f, 'cap': None}
-            meta.update(store='file', data=os.path.basename(stem) + '.dat')
-        sc = JsonlWriter(new_frames)
-        sc.append(meta)
-        self._chain_out(next_sidecar=os.path.basename(new_frames))
-        self._sidecar, self._store, self._meta = sc, store, meta
-        self._off = 0
+            path = os.path.join(self.out_dir, f'{seg_ts}_{self.name}.dat')
+            f = open(path, 'wb')
+            f.write(hdr)
+            f.flush()
+            seg.update(kind='file', file=f, path=path)
+            self._head.append({'event': 'segment', 'data': os.path.basename(path)})
+        self._seg = seg
         self.frame_count = 0
         self._staged = None
-        self.frames_path = new_frames
-        self._head.append({'event': 'segment', 'sidecar': os.path.basename(new_frames)})
 
     @property
     def full(self):
-        """True when the next fixed-size frame wouldn't fit (shm segments are committed RAM)."""
-        st = self._store
-        if st is None or st['cap'] is None or self._meta is None:
-            return False
-        fb = _align(self._meta['width'] * self._meta['height']
-                    * _dtype_for(self._meta['pixel_depth']).itemsize)
-        return self._off + fb > st['cap']
+        s = self._seg
+        return s is not None and self.frame_count >= s['cap']
 
     def write_pixels(self, frame):
         """Phase 1: place the pixels in the heap at the next aligned offset."""
-        arr = np.ascontiguousarray(frame, dtype=_dtype_for(self._meta['pixel_depth']))
-        off, n = self._off, arr.nbytes
-        st = self._store
-        if st['kind'] == 'shm':
-            if off + n > st['cap']:
-                raise ValueError(f"segment full ({st['cap']} bytes); roll first")
-            st['buf'][off:off + n] = arr.tobytes()
+        s = self._seg
+        arr = np.ascontiguousarray(frame, dtype=_dtype_for(s['pixel_depth']))
+        if self.frame_count >= s['cap']:
+            raise ValueError(f"segment full ({s['cap']} frames); roll first")
+        off, n = s['off'], arr.nbytes
+        if s['kind'] == 'shm':
+            s['buf'][off:off + n] = arr.tobytes()
         else:
-            f = st['file']
-            f.seek(off)
-            f.write(arr.tobytes())
-            f.flush()
+            s['file'].seek(off)
+            s['file'].write(arr.tobytes())
         self._staged = (off, n)
-        self._off = _align(off + n)
+        s['off'] = _align(off + n)
 
-    def commit(self, **record):
-        """Phase 2: the sidecar line -- THE commit point (and, cross-process, the memory barrier:
-        readers only trust pixels a complete line points at)."""
+    def commit(self, t_mono_ns=0, t_utc_ns=0, src_index=-1, flags=0, extras=()):
+        """Phase 2: the frame record + the frame_count publish -- pure memory stores (shm)."""
+        s = self._seg
         off, n = self._staged
         self._staged = None
-        self._sidecar.append({'off': off, 'len': n, **record})
+        rec = _REC_BASE.pack(int(t_mono_ns), int(t_utc_ns), off, n, int(flags), int(src_index))
+        if self._x is not None:
+            rec += self._x.pack(*extras)
+        pos = s['rec_off'] + self.frame_count * s['rec_size']
+        new_count = struct.pack('<Q', self.frame_count + 1)
+        if s['kind'] == 'shm':
+            s['buf'][pos:pos + len(rec)] = rec
+            s['buf'][_COUNT_OFF:_COUNT_OFF + 8] = new_count   # THE commit: a single u64 store
+        else:
+            f = s['file']
+            f.seek(pos)
+            f.write(rec)
+            f.seek(_COUNT_OFF)
+            f.write(new_count)
+            f.flush()
         self.frame_count += 1
 
-    def write(self, frame, **record):
+    def write(self, frame, **kw):
         self.write_pixels(frame)
-        self.commit(**record)
+        self.commit(**kw)
 
-    def _chain_out(self, next_sidecar=None):
-        """Close the open segment, ending its sidecar with 'next' (roll) or 'ended' (stream end).
-        A rolled shm section is retained until the roll after next, so a reader that hasn't
-        attached yet can't lose the race."""
-        if self._sidecar is not None:
-            self._sidecar.append({'type': 'next', 'sidecar': next_sidecar} if next_sidecar
-                                 else {'type': 'ended'})
-            self._sidecar.close()
-            self._sidecar = None
+    def _set_flags(self, flags):
+        s = self._seg
+        raw = struct.pack('<Q', flags)
+        if s['kind'] == 'shm':
+            s['buf'][_FLAGS_OFF:_FLAGS_OFF + 8] = raw
+        else:
+            s['file'].seek(_FLAGS_OFF)
+            s['file'].write(raw)
+            s['file'].flush()
+
+    def _roll_out(self, stream_ended=False):
+        """Finalize the open segment (header flag). A rolled shm section is retained until the
+        roll after next, bridging the reader-attach race."""
         if self._retired_shm is not None:
             self._retired_shm.close()
             self._retired_shm = None
-        st, self._store = self._store, None
-        if st is not None:
-            if st['kind'] == 'shm':
-                st['buf'] = None
-                self._retired_shm = st['shm']
+        s, self._seg = self._seg, None
+        if s is not None:
+            self._seg = s                                    # _set_flags needs it briefly
+            self._set_flags(FLAG_FINALIZED | (FLAG_STREAM_ENDED if stream_ended else 0))
+            self._seg = None
+            if s['kind'] == 'shm':
+                s['buf'] = None
+                self._retired_shm = s['shm']
             else:
-                st['file'].close()
+                s['file'].close()
 
     def close(self):
-        """End the stream cleanly: 'ended' in the sidecar AND the head; consumers self-finish."""
+        """End the stream cleanly: STREAM_ENDED flag in the segment + ended event in the head."""
         if self._head is None:
             return
-        self._chain_out(next_sidecar=None)
+        self._roll_out(stream_ended=True)
         if self._retired_shm is not None:
             self._retired_shm.close()
             self._retired_shm = None
@@ -180,101 +219,108 @@ class FrameStream:
 # --------------------------------- read side ----------------------------------------------
 
 class SegmentReader:
-    """One segment: its tailed sidecar + attached heap. read(i) returns frame i (immutable,
-    read-only). committed() grows as the producer commits; next_sidecar()/stream_ended() report
-    the chain link once present."""
+    """One segment: attached section (or opened .dat). committed()/finalized()/stream_ended()
+    are pure memory reads of the header (thread-safe to probe -- the GUI waker does). read(i)
+    returns the frame, record(i) the decoded record dict (base fields + declared extras)."""
 
-    def __init__(self, session_dir, frames_path):
+    def __init__(self, session_dir, ref):
         self.session_dir = str(session_dir)
-        self.frames_path = str(frames_path)
-        self._tail = JsonlTailer(self.frames_path)
-        first = self._tail.poll()
-        if not first or first[0].get('type') != 'start':
-            self._tail.close()
-            raise ValueError(f"{frames_path}: no committed start record yet")
-        self.meta = first[0]
-        self.recs = [r for r in first[1:] if 'off' in r]
-        self._link = next((r for r in first[1:] if r.get('type') in ('next', 'ended')), None)
-        self._dtype = _dtype_for(self.meta['pixel_depth'])
-        self._shape = (self.meta['height'], self.meta['width'])
+        self.ref = dict(ref)                 # {'shm': name} or {'data': basename}
         self._shm = None
         self._buf = None
-        if self.meta['store'] == 'shm':
+        self._file = None
+        if 'shm' in ref:
             try:
-                self._shm = shared_memory.SharedMemory(name=self.meta['shm'], create=False)
+                self._shm = shared_memory.SharedMemory(name=ref['shm'], create=False)
             except (FileNotFoundError, OSError) as e:
-                self._tail.close()
-                raise ValueError(f"{frames_path}: shm segment gone (writer+readers exited)") from e
+                raise ValueError(f"shm segment {ref['shm']} gone (writer+readers exited)") from e
             self._buf = self._shm.buf
+            self.ident = ref['shm']
         else:
-            self._data_path = os.path.join(self.session_dir, self.meta['data'])
+            # File store: plain seek/read (a growing file outruns any fixed-size mapping).
+            path = os.path.join(self.session_dir, ref['data'])
+            self._file = open(path, 'rb')
+            self.ident = ref['data']
+        raw = self._get(0, _HDR.size)
+        if len(raw) < _HDR.size or raw[:8] != MAGIC:
+            self.close()
+            raise ValueError(f"{self.ident}: bad/short segment header")
+        (_, _, self._rec_off, self._rec_size, self.cap,
+         json_len, _, _, _) = _HDR.unpack(raw)
+        self.meta = json.loads(self._get(_HDR.size, json_len).decode('utf-8'))
+        self._dtype = _dtype_for(self.meta['pixel_depth'])
+        self._shape = (self.meta['height'], self.meta['width'])
+        self._x = struct.Struct(self.meta['extras_fmt']) if self.meta.get('extras_fmt') else None
+        self._xnames = self.meta.get('extras') or []
+
+    def _get(self, off, n):
+        if self._buf is not None:
+            return bytes(self._buf[off:off + n])
+        self._file.seek(off)
+        return self._file.read(n)
 
     @property
     def header(self):
-        """SerHeader-shaped view of the metadata (image_width/height/color_id/pixel_depth...)."""
+        """SerHeader-shaped view of the metadata."""
         import types
         m = self.meta
         return types.SimpleNamespace(image_width=m['width'], image_height=m['height'],
                                      color_id=m['color_id'],
                                      pixel_depth_per_plane=m['pixel_depth'])
 
-    def poll(self):
-        """Ingest newly committed records; call before reading counts/links."""
-        for r in self._tail.poll():
-            if 'off' in r:
-                self.recs.append(r)
-            elif r.get('type') in ('next', 'ended'):
-                self._link = r
-
     def committed(self):
-        return len(self.recs)
+        return struct.unpack('<Q', self._get(_COUNT_OFF, 8))[0]
+
+    def _flags(self):
+        return struct.unpack('<Q', self._get(_FLAGS_OFF, 8))[0]
 
     def finalized(self):
-        return self._link is not None
-
-    def next_sidecar(self):
-        return self._link['sidecar'] if self._link and self._link.get('type') == 'next' else None
+        return bool(self._flags() & FLAG_FINALIZED)
 
     def stream_ended(self):
-        return bool(self._link and self._link.get('type') == 'ended')
+        return bool(self._flags() & FLAG_STREAM_ENDED)
+
+    def record(self, i):
+        if i < 0 or i >= self.committed():
+            raise IndexError(f"record {i} not committed (have {self.committed()})")
+        pos = self._rec_off + i * self._rec_size
+        raw = self._get(pos, self._rec_size)
+        rec = dict(zip(_REC_FIELDS, _REC_BASE.unpack(raw[:_REC_BASE.size])))
+        if self._x is not None:
+            rec.update(zip(self._xnames, self._x.unpack(raw[_REC_BASE.size:
+                                                            _REC_BASE.size + self._x.size])))
+        return rec
 
     def read(self, i):
-        if i < 0 or i >= len(self.recs):
-            raise IndexError(f"frame {i} not committed (have {len(self.recs)})")
-        rec = self.recs[i]
-        if self._buf is not None:
-            arr = np.frombuffer(self._buf, dtype=self._dtype,
-                                count=rec['len'] // self._dtype.itemsize, offset=rec['off'])
-            arr = np.array(arr).reshape(self._shape)       # copy out of the shared region
-        else:
-            arr = np.fromfile(self._data_path, dtype=self._dtype,
-                              count=rec['len'] // self._dtype.itemsize, offset=rec['off'])
-            arr = arr.reshape(self._shape)
+        rec = self.record(i)
+        arr = np.frombuffer(self._get(rec['off'], rec['len']), dtype=self._dtype)
+        arr = arr.reshape(self._shape).copy()                # our own buffer, not the shared region
         arr.setflags(write=False)
         return arr
 
     def close(self):
-        self._tail.close()
+        self._buf = None
         if self._shm is not None:
-            self._buf = None
             self._shm.close()
             self._shm = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 class StreamFollower:
-    """Consumer of a whole stream: tails the head file, opens segments as they appear, follows
-    the chain. Two consumption styles:
-      * skip-to-newest (GUI/backend): poll(); latest() -> (segment, index) of the newest frame.
-      * sequential (detect offline, recorder): poll(); segments() in order; each SegmentReader
-        is drained by the caller at its own pace -- holding it holds the shm section alive.
-    ended() goes True when the producer wrote its 'ended' event (clean stop)."""
+    """Consumer of a whole stream: tails the head, attaches segments eagerly (holding a section
+    IS the write-behind buffer), reads records straight from the regions. Skip-to-newest
+    consumers (GUI/backend) let old segments drop; sequential consumers (recorder, offline
+    detect) pass keep_all=True and release() segments themselves. ended() goes True at the
+    producer's clean stop."""
 
     def __init__(self, session_dir, name, keep_all=False):
         self.session_dir, self.name = str(session_dir), str(name)
-        self.keep_all = keep_all              # sequential consumers keep every segment until released
+        self.keep_all = keep_all
         self._head = None
-        self._pending = []                    # sidecar basenames announced but not yet openable
-        self.segs = []                        # opened SegmentReaders, oldest first
+        self._pending = []
+        self.segs = []
         self.lost = 0                         # frames in segments that vanished before we attached
         self._ended = False
 
@@ -286,36 +332,33 @@ class StreamFollower:
             self._head = JsonlTailer(hp)
         for ev in self._head.poll():
             if ev.get('event') == 'segment':
-                self._pending.append(ev['sidecar'])
+                self._pending.append(ev)
             elif ev.get('event') == 'ended':
                 self._ended = True
         still = []
-        for base in self._pending:            # attach EAGERLY: holding the reader holds the section
-            full = os.path.join(self.session_dir, base)
+        for ev in self._pending:
             try:
-                self.segs.append(SegmentReader(self.session_dir, full))
+                self.segs.append(SegmentReader(self.session_dir, ev))
             except ValueError as e:
-                if 'gone' in str(e):          # vanished before we attached: count and move on
-                    from astrolock.seeker import sidecar as _sc
-                    self.lost += max(0, _sc.count_complete_lines(full) - 2)
-                elif not os.path.exists(full):
-                    pass                      # sidecar already garbage-collected -- old history, skip
+                if 'gone' in str(e):
+                    self.lost += 1            # section died before we attached (count unknown)
+                elif 'data' in ev and not os.path.exists(os.path.join(self.session_dir, ev['data'])):
+                    pass                      # file already garbage-collected -- old history
                 else:
-                    still.append(base)        # start record not committed yet -- retry next poll
+                    still.append(ev)          # header not written yet -- retry next poll
         self._pending = still
-        for s in self.segs:
-            s.poll()
         if not self.keep_all:                 # newest-frame consumers don't buffer history
-            while len(self.segs) > 2:
-                self.segs.pop(0).close()
             while len(self.segs) > 1 and self.segs[-1].committed() > 0:
+                self.segs.pop(0).close()
+            while len(self.segs) > 2:
                 self.segs.pop(0).close()
 
     def latest(self):
         """(SegmentReader, index) of the newest committed frame, or None."""
         for s in reversed(self.segs):
-            if s.committed() > 0:
-                return s, s.committed() - 1
+            n = s.committed()
+            if n > 0:
+                return s, n - 1
         return None
 
     def ended(self):
@@ -323,11 +366,10 @@ class StreamFollower:
 
     @property
     def frames_path(self):
-        """The newest segment's sidecar (the on-disk file that grows per frame -- watch this)."""
-        return self.segs[-1].frames_path if self.segs else None
+        """v3: frames commit in RAM; the head file is the stream's only on-disk artifact."""
+        return None
 
     def release(self, seg):
-        """Sequential consumers: done with a fully-drained segment."""
         seg.close()
         self.segs.remove(seg)
 

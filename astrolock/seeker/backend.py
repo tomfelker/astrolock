@@ -693,13 +693,10 @@ def main(argv=None):
         """Capture time (seconds) of frame `index` for a role, from the cam's frame sidecar.
         The whole control loop is clocked off these so PID dt is the true inter-frame interval
         (the cam's monotonic clock), not the backend's polling jitter."""
-        sp = followers[role].ser_path
-        if not sp or index < 0:
+        if index < 0:
             return None
-        lines = sidecar.read_complete_lines(sp[:-len('.ser')] + '.frames.jsonl')
-        if index < len(lines) and 't_mono_ns' in lines[index]:
-            return lines[index]['t_mono_ns'] * 1e-9
-        return None
+        t_ns = followers[role].frame_time_ns(index)
+        return t_ns * 1e-9 if t_ns is not None else None
 
     def _detector_for(role):
         return getattr(args, f'{role}_detector', None) or args.detector
@@ -801,22 +798,27 @@ def main(argv=None):
             launch_detect(role)                    # safety: detect normally rolls on its own
 
     def delete_old_segments():
-        """Rolling cleanup: drop non-important segments older than the two newest per STREAM --
-        each role's cam stream plus its derived debug/focus streams (which used to leak: their
-        names never matched the '*_<role>.ser' glob). Discovery is by sidecar; a shm segment has
-        no .ser file at all (missing files just skip)."""
+        """Rolling GC of live-session leftovers. v3 shm segments leave NOTHING per segment; the
+        only per-segment disk artifacts are .dat heaps (file-store sessions) and the detections
+        sidecars (keyed by segment GUID, so age-based). Head files are tiny and append-only.
+        Recordings live in --recordings-dir and are never touched."""
         if args.keep:
             return
         streams = [n for role in roles for n in (role, f'{role}_debug', f'{role}_focus')]
         for name in streams:
-            sides = sorted(glob.glob(os.path.join(session_dir, f'*_{name}.frames.jsonl')))
-            for fp in sides[:-2]:
-                stem = fp[:-len('.frames.jsonl')]
-                for ext in ('.dat', '.frames.jsonl', '.detections.jsonl'):
-                    try:                                  # all live-session artifacts are ephemeral
-                        os.remove(stem + ext)             # (recordings live in --recordings-dir)
-                    except OSError:
-                        pass
+            dats = sorted(glob.glob(os.path.join(session_dir, f'*_{name}.dat')))
+            for sp in dats[:-2]:
+                try:
+                    os.remove(sp)
+                except OSError:
+                    pass
+        cutoff = time.time() - 120.0
+        for fp in glob.glob(os.path.join(session_dir, '*.detections.jsonl')):
+            try:
+                if os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)                 # open handles (GUI tailers) block this -> retried
+            except OSError:
+                pass
 
     def connect_mount(url):
         """Replace the current mount driver with a fresh one for `url` ('sim' or a celestron URL),

@@ -176,7 +176,11 @@ def main(argv=None):
     # Follow the cam stream chain; the star OUTPUT is one stream for the whole run, rolling
     # its own segments (fresh on every input-segment switch, and when a shm segment fills).
     fo = framestream.StreamFollower(args.session, args.role)
-    out = framestream.FrameStream(args.session, f'{args.role}_focus')
+    # Star stream: per-frame focus metrics ride as binary record extras (strehl None -> NaN;
+    # 'present' is record flags bit 0). The GUI reads them straight from the section.
+    out = framestream.FrameStream(args.session, f'{args.role}_focus',
+                                  extras=('<6f', ['peak', 'strehl', 'dx', 'dy',
+                                                  'com_rad_x', 'com_rad_y']))
     cur = None                                              # current input SegmentReader
     det = None
     ema = None
@@ -246,15 +250,15 @@ def main(argv=None):
             pk = int(torch.argmax(work))
             target = (pk % work.shape[1], pk // work.shape[1])
         star_ema, metrics, sat = ema.update(work, target)
-        if strehl_ref:                                 # measured normalized peak vs the ideal (0..~1)
-            metrics['strehl'] = round(_normalized_peak(star_ema) / strehl_ref, 4)
-        if rad_per_px is not None:                     # CoM offset in radians (pixel-scale-free) -> screw guide
-            metrics['com_rad'] = [round(metrics['com'][0] * rad_per_px, 9),
-                                  round(metrics['com'][1] * rad_per_px, 9)]
-        t = time.perf_counter_ns()
+        # Extras schema ('<6f'): strehl NaN when the aperture is unknown; com_rad NaN when the
+        # plate scale is (consumers turn NaN back into None/absent).
+        strehl = (_normalized_peak(star_ema) / strehl_ref) if strehl_ref else float('nan')
+        crx = metrics['com'][0] * rad_per_px if rad_per_px is not None else float('nan')
+        cry = metrics['com'][1] * rad_per_px if rad_per_px is not None else float('nan')
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
         out.write(_ema_frame_u16(star_ema, scale, sat if even else None),
-                  index=i, t_mono_ns=t, present=present, **metrics)
+                  t_mono_ns=time.perf_counter_ns(), src_index=i, flags=1 if present else 0,
+                  extras=(metrics['peak'], strehl, metrics['com'][0], metrics['com'][1], crx, cry))
         total += 1
 
     try:

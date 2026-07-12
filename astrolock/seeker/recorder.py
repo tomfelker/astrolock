@@ -34,11 +34,9 @@ import time
 from astrolock.seeker import framestream, ser as ser_mod
 
 
-def _parse_utc(s):
-    try:
-        return dt.datetime.fromisoformat(s.replace('Z', '+00:00')) if s else None
-    except ValueError:
-        return None
+def _utc_of(rec):
+    ns = rec.get('t_utc_ns') or 0
+    return dt.datetime.fromtimestamp(ns / 1e9, dt.timezone.utc) if ns else None
 
 
 def main(argv=None):
@@ -92,8 +90,7 @@ def main(argv=None):
                 drained = getattr(seg, '_rec_drained', 0)
                 while drained < seg.committed():
                     frame = seg.read(drained)
-                    rec = seg.recs[drained]
-                    t_utc = _parse_utc(rec.get('t_utc'))
+                    t_utc = _utc_of(seg.record(drained))
                     if out is None or out_geom != frame.shape:
                         if out is not None:
                             out.close()

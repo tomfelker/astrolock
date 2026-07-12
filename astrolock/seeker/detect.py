@@ -817,7 +817,7 @@ def main(argv=None):
         if writer is not None:
             writer.close()
         cur = seg
-        writer = JsonlWriter(seg.frames_path[:-len('.frames.jsonl')] + '.detections.jsonl')
+        writer = JsonlWriter(os.path.join(args.session, seg.ident + '.detections.jsonl'))
         prev = None
         surprise = new_surprise()                      # fresh temporal state for the new segment
         scale = None
@@ -943,13 +943,13 @@ def main(argv=None):
             if st is None:
                 st = dbg['stream'] = framestream.FrameStream(args.session, f'{args.role}_debug')
             dh, dw = debug_surface.shape
-            if st.frames_path is None or st.frame_count >= args.shm_frames:
+            if st._seg is None or st.frame_count >= args.shm_frames:
                 st.open_segment(session_mod.segment_stamp(), dw, dh, color_id=ser_mod.ColorId.MONO,
                                 pixel_depth=16, shm=args.shm_ser, cap=args.shm_frames)
             # A surprisal surface is in true sigma units -> FIXED scale (debug_hi, white = 10 sigma)
             # so standout is judgeable across frames; other surfaces autoscale per frame (hi=None).
             st.write(debug_frame_u16(debug_surface, hi=debug_hi),
-                     t_mono_ns=time.perf_counter_ns(), index=i)
+                     t_mono_ns=time.perf_counter_ns(), src_index=i)
         total += 1
 
     try:
@@ -978,10 +978,9 @@ def main(argv=None):
                     if seg is not cur:
                         switch_to(seg)
                     while next_index < seg.committed():   # offline: every frame, in order
-                        process(next_index)
+                        process(next_index)                # (committed() is live -- a header read)
                         next_index += 1
                         worked = True
-                        seg.poll()
                     if seg.finalized() and next_index >= seg.committed():
                         stream_done = seg.stream_ended()
                         if writer is not None:
