@@ -77,6 +77,43 @@ def _com_offset(img):
     return dx, dy
 
 
+def _find_blur(img, sigma):
+    """Gaussian low-pass for FINDING the star (matched filter for the best-focus PSF): a single
+    hot pixel averages down by ~the kernel norm while a real star keeps most of its amplitude,
+    so a dim star always beats a hot pixel at the argmax. Stacking and the peak metric use the
+    RAW pixels -- only localization looks through this."""
+    from astrolock.seeker.detect import gaussian_deriv_kernels, _conv1d_axis
+    if sigma <= 0:
+        return img
+    r = min(max(1, int(3.0 * sigma + 0.5)), (min(img.shape) - 1) // 2)
+    if r < 1:
+        return img
+    g, _, _ = gaussian_deriv_kernels(sigma, r, device=img.device)
+    return _conv1d_axis(_conv1d_axis(img, g, 1), g, 0)
+
+
+def _hfd(crop):
+    """Half-flux diameter (px) of a star crop: the flux-weighted mean radius x2 about the CoM,
+    after subtracting the border-pixel sky pedestal. THE autofocus metric: it measures spread,
+    so it keeps working when the core saturates (where 'peak' pins at 1.0 and goes blind), and
+    a focuser sweep of it is a clean V-curve whose minimum is best focus."""
+    edge = torch.cat([crop[0], crop[-1], crop[:, 0], crop[:, -1]])
+    # Subtract sky at edge mean + 2 sigma: with a plain mean, clamped noise residue spread over
+    # the whole crop swamps the star and HFD reads ~crop-size regardless of focus.
+    net = (crop - (edge.mean() + 2.0 * edge.std())).clamp(min=0)
+    tot = float(net.sum())
+    if tot <= 0:
+        return 0.0
+    H, W = crop.shape
+    dev = crop.device
+    ys = torch.arange(H, dtype=torch.float32, device=dev)
+    xs = torch.arange(W, dtype=torch.float32, device=dev)
+    cy = float((net.sum(dim=1) * ys).sum()) / tot
+    cx = float((net.sum(dim=0) * xs).sum()) / tot
+    r = torch.sqrt((xs[None, :] - cx) ** 2 + (ys[:, None] - cy) ** 2)
+    return 2.0 * float((net * r).sum()) / tot
+
+
 def _normalized_peak(crop):
     """Subtract the sky pedestal (mean of the crop's border pixels), scale so the crop sums to 1, and
     return the peak -- i.e. the fraction of the star's energy in its brightest pixel. Strehl = this for
@@ -94,17 +131,19 @@ class FocusEma:
     (ema_crop, metrics). ``scale`` (full_scale) normalizes brightness to 0..1 so metrics are
     comparable across cameras / bit depths."""
 
-    def __init__(self, crop, search, alpha, scale, peak_decay=0.9):
+    def __init__(self, crop, search, alpha, scale, peak_decay=0.9, find_sigma=2.0):
         self.crop, self.search, self.alpha, self.scale = crop, search, alpha, scale
         self.peak_decay = peak_decay
+        self.find_sigma = find_sigma   # PSF-matched blur for LOCALIZATION only (hot-pixel immunity)
         self.ema = None
         self.peak_meter = None      # per-pixel decaying peak-hold of the RAW star crop, for saturation
 
     def update(self, work, target):
-        # 1) search ROI around the target; 2) its brightest pixel; 3) star crop centred there.
+        # 1) search ROI around the target; 2) the MATCHED-FILTERED region's brightest pixel (a
+        # hot pixel can't win); 3) star crop centred there, from the RAW pixels.
         tx, ty = target
         region, rx0, ry0 = _crop(work, tx, ty, self.search)
-        pk = int(torch.argmax(region))
+        pk = int(torch.argmax(_find_blur(region, self.find_sigma)))
         py, px = pk // region.shape[1], pk % region.shape[1]
         star, _, _ = _crop(work, rx0 + px, ry0 + py, self.crop)
         if self.ema is None or self.ema.shape != star.shape:
@@ -122,6 +161,8 @@ class FocusEma:
         # wants the full second-moment matrix Mxx/Myy/Mxy, not marginals; not worth it unless collimating.)
         metrics = {
             'peak': round(float(ema.max()) / self.scale, 6),
+            'peak_frame': round(float(star.max()) / self.scale, 6),   # per-frame; blinds when saturated
+            'hfd': round(_hfd(star), 3),                              # per-frame; saturation-immune
             'com': [round(dx, 3), round(dy, 3)],
         }
         sat = self.peak_meter > (0.9 * self.scale)                    # near full well -> peak unreliable
@@ -141,7 +182,7 @@ def _ema_frame_u16(ema, scale, blank=None):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker focus / collimation filter")
-    p.add_argument('--session', required=True, help="session directory to follow")
+    p.add_argument('--session', default=None, help="session directory to follow")
     p.add_argument('--role', default='main', help="camera role to focus on (tails its .ser + detections)")
     p.add_argument('--follow', action='store_true',
                    help="live mode: track the newest segment and never exit (default: offline, process "
@@ -165,23 +206,41 @@ def main(argv=None):
     p.add_argument('--stop-file', default=None, help="stop cleanly when this file appears")
     p.add_argument('--shm-ser', action='store_true',
                    help="write the star stream to shared-memory segments instead of disk (matches the cams)")
+    p.add_argument('--find-blur-px', type=float, default=0.0,
+                   help="star-FINDING low-pass sigma (px): the matched filter that stops a hot "
+                        "pixel from stealing the lock at dim exposures. 0 = auto (from the "
+                        "optics' diffraction size when known, else 2.0). Stacking uses raw pixels")
     p.add_argument('--shm-frames', type=int, default=256,
                    help="shm star segments: frames per segment (the star crop is tiny)")
     p.add_argument('--device', default='auto',
                    help="torch device: 'auto' (default) = cuda if present else cpu, or force 'cpu'/'cuda'")
+    p.add_argument('--ser', default=None,
+                   help="OFFLINE: analyze a recorded .ser directly (no session/backend) -- run the "
+                        "same find/EMA/Strehl pipeline over its frames and emit per-frame metrics. "
+                        "For tuning against saved focus sweeps, and later the autofocus fit")
+    p.add_argument('--stride', type=int, default=1, help="offline: analyze every Nth frame")
+    p.add_argument('--limit', type=int, default=0, help="offline: stop after N analyzed frames (0 = all)")
+    p.add_argument('--metrics-out', default=None, help="offline: write per-frame metrics JSONL here")
     args = p.parse_args(argv)
     device = resolve_device(args.device)
     print(f"[focus:{args.role}] compute device: {device}", flush=True)
+    if args.ser:
+        return analyze_ser(args, device)
 
     # Follow the cam stream chain; the star OUTPUT is one stream for the whole run, rolling
     # its own segments (fresh on every input-segment switch, and when a shm segment fills).
-    fo = framestream.StreamFollower(args.session, args.role)
+    fo = framestream.StreamFollower(args.session, args.role, keep_all=True)
+
+    def find_sigma0():
+        """Star-finding blur sigma: explicit --find-blur-px, else 2.0 until the optics-derived
+        value takes over (set in process() once the plate scale is known)."""
+        return args.find_blur_px if args.find_blur_px > 0 else 2.0
     det_fo = framestream.StreamFollower(args.session, f'{args.role}_det')   # latest target blobs
     # Star stream: per-frame focus metrics ride as binary record extras (strehl None -> NaN;
     # 'present' is record flags bit 0). The GUI reads them straight from the section.
     out = framestream.FrameStream(args.session, f'{args.role}_focus',
-                                  extras=('<6f', ['peak', 'strehl', 'dx', 'dy',
-                                                  'com_rad_x', 'com_rad_y']))
+                                  extras=('<8f', ['peak', 'peak_frame', 'hfd', 'strehl',
+                                                  'dx', 'dy', 'com_rad_x', 'com_rad_y']))
     cur = None                                              # current input SegmentReader
     ema = None
 
@@ -192,7 +251,7 @@ def main(argv=None):
         out.open_segment(session_mod.segment_stamp(), crop, crop,
                          color_id=ser_mod.ColorId.MONO, pixel_depth=16,
                          shm=args.shm_ser, cap=args.shm_frames)
-        ema = FocusEma(crop, args.search, args.alpha, scale=None)
+        ema = FocusEma(crop, args.search, args.alpha, scale=None, find_sigma=find_sigma0())
         scale = None
 
     latest_blobs = []
@@ -229,6 +288,8 @@ def main(argv=None):
             if args.aperture_mm > 0 and args.focal_mm > 0 and args.pixel_um > 0:
                 r_null = skysim.airy_r_null_px(args.focal_mm, args.aperture_mm, args.wavelength_nm,
                                                args.pixel_um * coord_scale)
+                if args.find_blur_px <= 0:             # auto: match the finder to the Airy core
+                    ema.find_sigma = max(1.0, 0.35 * r_null)   # gaussian sigma ~ the Airy core width
                 ideal = skysim.aperture_psf(ema.crop, r_null, obstruction=args.obstruction,
                                             vanes=args.vanes, vane_width_frac=args.vane_width, device=device)
             else:
@@ -242,7 +303,7 @@ def main(argv=None):
             fx, fy = latest_blobs[0]['px']
             target = (fx / coord_scale, fy / coord_scale)
         else:
-            pk = int(torch.argmax(work))
+            pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))   # hot pixels can't win
             target = (pk % work.shape[1], pk // work.shape[1])
         star_ema, metrics, sat = ema.update(work, target)
         # Extras schema ('<6f'): strehl NaN when the aperture is unknown; com_rad NaN when the
@@ -253,7 +314,8 @@ def main(argv=None):
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
         out.write(_ema_frame_u16(star_ema, scale, sat if even else None),
                   t_mono_ns=time.perf_counter_ns(), src_index=i, flags=1 if present else 0,
-                  extras=(metrics['peak'], strehl, metrics['com'][0], metrics['com'][1], crx, cry))
+                  extras=(metrics['peak'], metrics['peak_frame'], metrics['hfd'], strehl,
+                          metrics['com'][0], metrics['com'][1], crx, cry))
         total += 1
 
     try:
@@ -270,20 +332,27 @@ def main(argv=None):
                     latest_blobs = _json.loads(bytes(dseg.read(di)).decode('utf-8')).get('blobs', [])
             fo.poll()
             worked = False
-            got = fo.latest()
-            if got:
-                seg, i = got
+            seg = fo.segs[0] if fo.segs else None      # SEQUENTIAL: exactly one EMA sample per
+            if seg is not None:                        # frame, in order, stalls notwithstanding
                 if seg is not cur:
                     switch_to(seg)
                     latest_blobs = []
                     next_index = 0
-                if i >= next_index:                    # live: skip to the most recent frame
-                    next_index = i
+                n = min(seg.committed(), next_index + 8)   # catch up in bounded bites (stay live)
+                while next_index < n:
                     process(next_index)
                     next_index += 1
                     worked = True
+                if (seg.finalized() and next_index >= seg.committed()
+                        and (len(fo.segs) > 1 or seg.stream_ended())):
+                    done = seg.stream_ended()
+                    fo.release(seg)
+                    cur = None
+                    if done:
+                        break
+                    continue
             if not worked:
-                if fo.ended():
+                if fo.ended() and seg is None:
                     break                              # cam stream ended cleanly; we're done
                 time.sleep(args.poll)
     except KeyboardInterrupt:
@@ -291,6 +360,75 @@ def main(argv=None):
     finally:
         close_all()
         print(f"[focus:{args.role}] processed {total} frames", flush=True)
+
+
+def analyze_ser(args, device):
+    """Offline sweep analysis: the live pipeline's exact find/EMA/Strehl math over a recorded
+    .ser. Emits per-frame metrics (peak_frame is what an autofocus sweep fits); the summary
+    reports the best-focus frame and how stable the star lock was (hot-pixel jumps show up as
+    target teleports)."""
+    import json as _json
+    r = ser_mod.SerReader(args.ser)
+    cid = r.header.color_id
+    n = r.frames_on_disk()
+    crop = _effective_crop(r.header, args.crop)
+    scale = full_scale(cid, r.header.pixel_depth_per_plane)
+    ema = FocusEma(crop, args.search, args.alpha, scale=scale,
+                   find_sigma=(args.find_blur_px if args.find_blur_px > 0 else 2.0))
+    strehl_ref = None
+    rows = []
+    outf = open(args.metrics_out, 'w', encoding='utf-8') if args.metrics_out else None
+    last_t = None
+    idxs = range(0, n, max(1, args.stride))
+    if args.limit:
+        idxs = list(idxs)[:args.limit]
+    for k, i in enumerate(idxs):
+        work = work_image(r.read_frame(i), cid, device=device)
+        if strehl_ref is None:
+            coord_scale = r.header.image_width / work.shape[1]
+            if args.aperture_mm > 0 and args.focal_mm > 0 and args.pixel_um > 0:
+                r_null = skysim.airy_r_null_px(args.focal_mm, args.aperture_mm,
+                                               args.wavelength_nm, args.pixel_um * coord_scale)
+                if args.find_blur_px <= 0:
+                    ema.find_sigma = max(1.0, 0.35 * r_null)
+                ideal = skysim.aperture_psf(ema.crop, r_null, obstruction=args.obstruction,
+                                            vanes=args.vanes, vane_width_frac=args.vane_width,
+                                            device=device)
+            else:
+                ideal = torch.zeros((ema.crop, ema.crop), device=device)
+                ideal[ema.crop // 2, ema.crop // 2] = 1.0
+            strehl_ref = _normalized_peak(ideal)
+            print(f"[focus] {n} frames, crop {crop}, find_sigma {ema.find_sigma:.2f}px, "
+                  f"stride {args.stride}", flush=True)
+        pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))
+        target = (pk % work.shape[1], pk // work.shape[1])
+        star_ema, metrics, sat = ema.update(work, target)
+        row = {'i': i, 'tx': target[0], 'ty': target[1],
+               'peak': metrics['peak'], 'peak_frame': metrics['peak_frame'],
+               'hfd': metrics['hfd'],
+               'strehl': round(_normalized_peak(star_ema) / strehl_ref, 4) if strehl_ref else None,
+               'sat_px': int(sat.sum())}
+        rows.append(row)
+        if outf:
+            outf.write(_json.dumps(row) + chr(10))
+        if k % 200 == 0:
+            print(f"  frame {i}/{n}  peak_frame {row['peak_frame']:.4f}", flush=True)
+    if outf:
+        outf.close()
+    r.close()
+    # Summary: best focus + lock stability (a teleporting target = the finder changed its mind).
+    import math as _math
+    best = max(rows, key=lambda x: x['peak_frame'])
+    besth = min((x for x in rows if x['hfd'] > 0), key=lambda x: x['hfd'], default=None)
+    if besth:
+        print(f"[focus] min HFD {besth['hfd']:.2f}px at frame {besth['i']} "
+              f"(saturation-immune best focus)", flush=True)
+    jumps = sum(1 for a, b in zip(rows, rows[1:])
+                if _math.hypot(b['tx'] - a['tx'], b['ty'] - a['ty']) > args.search / 2)
+    satn = sum(1 for x in rows if x['sat_px'])
+    print(f"[focus] best peak_frame {best['peak_frame']:.4f} at frame {best['i']} "
+          f"(strehl there {best['strehl']}); target jumps >{args.search // 2}px: {jumps}; "
+          f"frames with saturated px: {satn}/{len(rows)}", flush=True)
 
 
 if __name__ == '__main__':

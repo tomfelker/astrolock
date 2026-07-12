@@ -39,6 +39,7 @@ from astrolock.seeker import bayer, control, ser
 from astrolock.seeker import optics as optics_db
 from astrolock.seeker import settings as settings_store
 from astrolock.seeker import framestream
+from astrolock.seeker import session as session_mod
 from astrolock.seeker.follower import FrameRef, SerFollower
 from astrolock.seeker.sidecar import JsonlTailer
 
@@ -414,7 +415,10 @@ def main(argv=None):
                 'invert_x': False, 'invert_y': False,     # flip screw-turn direction per axis (image parity)
                 'alpha': 0.05,                            # star-crop EMA smoothing (relaunch-tier)
                 'com_rad': (0.0, 0.0),                    # latest CoM offset (radians) for the screw dial
-                'series': {k: [] for k in ('t', 'peak', 'strehl', 'dx', 'dy')}}
+                'series': {k: [] for k in ('t', 'peak', 'peakf', 'hfd', 'strehl', 'dx', 'dy')}}
+    sweep_ui = {'start': 0.0, 'end': 10.0, 'steps': 9, 'frames': 40,  # focus sweep (human actuator)
+                'role': None, 'fo': None, 'state': None,              # prompt/result stream tail
+                'writer': None, 'writer_role': None}                  # our position-report stream
     FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
     # Immediate-mode UI state: text-input buffers + selections the panel reads/writes each frame.
@@ -677,6 +681,37 @@ def main(argv=None):
             _draw_turn_arc(dl, A, sx, sy, S(15), t)
             _text(dl, A(sx - S(11), sy + S(13)), f"{t:+.2f}", S(12), _SCREW_COL)
 
+    def _draw_sweep_curve(stt):
+        """Little V-curve in the Focus panel: every collected (position, HFD) frame as a dot,
+        with the fitted best-focus position as a vertical line. Instantly shows a bad sweep
+        (saturated plateau, wind gust, range that didn't bracket focus)."""
+        pts = stt.get('points') or []
+        if len(pts) < 3:
+            return
+        dl = imgui.get_window_draw_list()
+        x0, y0 = imgui.get_cursor_screen_pos()
+        W, H = S(248), S(96)
+        xs = [p_ for p_, _h in pts]
+        ys = [h_ for _p, h_ in pts]
+        pl, ph = min(xs), max(xs)
+        hh = (max(ys) * 1.05) or 1.0
+        if ph <= pl:
+            return
+
+        def PX(p_):
+            return x0 + S(4) + (W - S(8)) * (p_ - pl) / (ph - pl)
+
+        def PY(h_):
+            return y0 + H - S(4) - (H - S(8)) * h_ / hh
+        dl.add_rect_filled((x0, y0), (x0 + W, y0 + H), C((0, 0, 0, 120)))
+        dl.add_rect((x0, y0), (x0 + W, y0 + H), C((150, 155, 172, 170)), 0.0, 1.0)
+        for p_, h_ in pts:
+            dl.add_circle_filled((PX(p_), PY(h_)), S(1.5), C((120, 220, 255, 160)))
+        p0 = stt.get('p0')
+        if p0 is not None and pl <= p0 <= ph:
+            dl.add_line((PX(p0), y0 + S(2)), (PX(p0), y0 + H - S(2)), C((255, 190, 90, 220)), 1.2)
+        imgui.dummy((W, H + S(4)))
+
     def _draw_placeholder(dl, A, SW, SH, lines):
         """Centred multi-line placeholder text (a str is treated as one line)."""
         if isinstance(lines, str):
@@ -860,6 +895,14 @@ def main(argv=None):
                 n = len(series)
                 pts = [A(gx0 + GW * i / (n - 1), gy1 - GH * min(1.0, v / hi)) for i, v in enumerate(series)]
                 dl.add_polyline(pts, C((120, 220, 255, 235)), 1.4, 0)
+                hfds = [v for v in sc['hfd'] if v is not None]
+                if len(hfds) >= 2 and hfds[-1] > 0:        # per-frame HFD: THE focus series (smaller = better)
+                    hh = max(hfds) or 1.0
+                    hn = len(sc['hfd'])
+                    hp = [A(gx0 + GW * i / (hn - 1), gy1 - GH * min(1.0, (v or 0.0) / hh))
+                          for i, v in enumerate(sc['hfd'])]
+                    dl.add_polyline(hp, C((255, 190, 90, 235)), 1.4, 0)
+                    label += f"  HFD {hfds[-1]:.1f}px"
                 dl.add_rect(A(gx0, gy0), A(gx1, gy1), C((150, 155, 172, 170)), 0.0, 1.0)
                 _text(dl, A(gx0, gy0 - S(16)), label, S(12), (180, 205, 235, 235))
             Rd = S(38)
@@ -1270,6 +1313,60 @@ def main(argv=None):
         else:
             focus_ui['role'] = role                       # just remember the selection until Start
 
+    # ---- Focus sweep: the GUI plays actuator (see astrolock.seeker.focus_sweep) ------------------
+    # The sweep process publishes position REQUESTS on {role}_sweep; we render the prompt and the
+    # human's OK publishes a position REPORT on {role}_focuser. A hardware focuser process would
+    # answer the same requests -- the sweep can't tell the difference.
+    def _sweep_start():
+        role = focus_ui['role']
+        sweep_ui['role'], sweep_ui['state'] = role, None
+        if sweep_ui['fo'] is not None:
+            sweep_ui['fo'].close()
+        sweep_ui['fo'] = framestream.StreamFollower(args.session, f'{role}_sweep', keep_all=True)
+        if not focus_ui['want']:
+            _focus_start(role)                            # the sweep feeds on the focus stream
+        _send({'type': 'sweep', 'on': True, 'role': role, 'start': sweep_ui['start'],
+               'end': sweep_ui['end'], 'steps': sweep_ui['steps'], 'frames': sweep_ui['frames']})
+
+    def _sweep_abort():
+        _send({'type': 'sweep', 'on': False})
+
+    def _sweep_ok(pos):
+        """Human actuator: 'the focuser is at pos now'."""
+        role = sweep_ui['role'] or focus_ui['role']
+        w = sweep_ui['writer']
+        if w is None or sweep_ui['writer_role'] != role:
+            if w is not None:
+                w.close()
+            w = sweep_ui['writer'] = framestream.FrameStream(args.session, f'{role}_focuser')
+            sweep_ui['writer_role'] = role
+        if w._seg is None or w.full:
+            w.open_segment(session_mod.segment_stamp(), 1 << 12, 1, pixel_depth=8,
+                           cap=256, raw=True)
+        payload = json.dumps({'pos': pos}, separators=(',', ':')).encode('utf-8')
+        w.write(np.frombuffer(payload, np.uint8), t_mono_ns=time.monotonic_ns())
+
+    def _poll_sweep():
+        """Tail the sweep's state blobs (latest wins) into sweep_ui['state']."""
+        fo_ = sweep_ui['fo']
+        if fo_ is None:
+            return
+        fo_.poll()
+        blob = None
+        while fo_.segs:
+            seg = fo_.segs[0]
+            i = getattr(seg, '_used', 0)
+            while i < seg.committed():
+                blob = bytes(seg.read(i))
+                i += 1
+            seg._used = i
+            if seg.finalized() and i >= seg.committed() and len(fo_.segs) > 1:
+                fo_.release(seg)
+                continue
+            break
+        if blob is not None:
+            sweep_ui['state'] = json.loads(blob.decode('utf-8'))
+
     def _poll_focus_metrics():
         """Read the star stream's binary record extras (peak/strehl/com...) into the rolling
         series feeding the on-pane focus graph + collimation trail. Sequential across the
@@ -1293,6 +1390,9 @@ def main(argv=None):
                     focus_ui['t0'] = t * 1e-9
                 s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
                 s['peak'].append(rec['peak'])
+                s['peakf'].append(rec.get('peak_frame', rec['peak']))
+                h = rec.get('hfd')
+                s['hfd'].append(None if h is None or math.isnan(h) else h)
                 s['strehl'].append(None if math.isnan(rec['strehl']) else rec['strehl'])
                 s['dx'].append(rec['dx'])
                 s['dy'].append(rec['dy'])
@@ -1379,6 +1479,7 @@ def main(argv=None):
                 ctrl['state'] = got[1]
         st = ctrl['state']
         _poll_focus_metrics()                           # tail focus metrics into the graphs
+        _poll_sweep()                                   # tail sweep prompts/result (if one ran)
         # Auto-switch the main pane to follow the active tracking source (as if its ^ button were pressed):
         # only when the *previously* active cam is the one currently in the big pane, so manual choices hold.
         tr = (st or {}).get('track_role')
@@ -1823,7 +1924,61 @@ def main(argv=None):
             if ch:
                 focus_ui['invert_y'] = v
             _grey("The focus graph, collimation trail, and screw dial draw on the star (main pane).")
-            _grey("planned: graph vs focuser position (electronic focuser)")
+            imgui.separator()
+            # --- Focus sweep: walk a focuser range, fit the HFD V-curve, report best focus.
+            imgui.text("Sweep:")
+            _tip("Focus sweep with YOU as the actuator: give it a focuser range (any units -- knob "
+                 "marks, mm, motor steps) and it prompts for each position; press OK once the "
+                 "focuser is there. Every frame's HFD (star half-flux diameter, px -- immune to a "
+                 "saturated core) is least-squares fit to a V-curve; its minimum is best focus. "
+                 "An electronic focuser will later answer the same prompts unattended.")
+            imgui.same_line()
+            imgui.set_next_item_width(S(56))
+            ch, v = imgui.input_float("##sweep_start", sweep_ui['start'], 0.0, 0.0, "%g", ENTER)
+            if ch:
+                sweep_ui['start'] = float(v)
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "to")
+            imgui.same_line()
+            imgui.set_next_item_width(S(56))
+            ch, v = imgui.input_float("##sweep_end", sweep_ui['end'], 0.0, 0.0, "%g", ENTER)
+            if ch:
+                sweep_ui['end'] = float(v)
+            imgui.same_line()
+            imgui.set_next_item_width(S(64))
+            ch, v = imgui.input_int("##sweep_steps", sweep_ui['steps'], 0)
+            if ch:
+                sweep_ui['steps'] = max(3, int(v))
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "steps")
+            sw_running = bool((st.get('sweep') or {}).get('running'))
+            if imgui.button('Abort Sweep' if sw_running else 'Start Sweep', (S(200), 0)):
+                _sweep_abort() if sw_running else _sweep_start()
+            stt = sweep_ui['state'] or {}
+            if sw_running and stt and not stt.get('done'):
+                step = f"step {stt.get('step', '?')}/{stt.get('of', '?')}"
+                if stt.get('awaiting') == 'position':
+                    imgui.text(f"{step}: set focuser to {stt.get('want_pos', 0):g}")
+                    if imgui.button("OK -- it's there", (S(200), 0)):
+                        _sweep_ok(stt.get('want_pos', 0.0))
+                else:
+                    imgui.text(f"{step}: hold still -- collecting "
+                               f"{stt.get('collected', 0)}/{stt.get('need', 0)} frames")
+            elif stt.get('done'):
+                if stt.get('aborted'):
+                    _grey("Sweep aborted.")
+                elif 'p0' in stt:
+                    imgui.text(f"Best focus: {stt['p0']:g}  (HFD {stt['h0']:g} px)")
+                    if not stt.get('bracketed', True):
+                        imgui.text_colored(C4(235, 180, 90),
+                                           "minimum is OUTSIDE the swept range -- re-sweep around it")
+                    if stt.get('sat_frac', 0) > 0.2:
+                        imgui.text_colored(C4(235, 180, 90),
+                                           f"{stt['sat_frac']:.0%} of frames saturated -- "
+                                           "reduce exposure and re-sweep")
+                elif stt.get('error'):
+                    imgui.text_colored(C4(235, 120, 120), stt['error'])
+                _draw_sweep_curve(stt)
             imgui.tree_pop()
         if imgui.tree_node_ex("Tracking"):
             cap = st.get('capturing') or {}

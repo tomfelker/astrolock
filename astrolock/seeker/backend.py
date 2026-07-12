@@ -630,6 +630,40 @@ def main(argv=None):
         focus_role = role
         print(f"[backend] focus started on {role}", flush=True)
 
+    # Focus sweep: an optional actuator-agnostic sweep process (focus_sweep.py). It watches the
+    # focus stream's per-frame HFD, publishes position requests on {role}_sweep, and whoever can
+    # move the focuser (GUI human, or a future electronic-focuser process) answers on
+    # {role}_focuser. We hold its stdin: closing the pipe = abort (recorder pattern).
+    sweep_proc = None
+    sweep_role = None
+
+    def stop_sweep():
+        nonlocal sweep_proc, sweep_role
+        if sweep_proc is not None and sweep_proc.poll() is None:
+            try:
+                sweep_proc.stdin.close()           # abort: publish final state, end stream, exit
+            except OSError:
+                pass
+            _reap([sweep_proc])
+        sweep_proc, sweep_role = None, None
+
+    def launch_sweep(role, cmd):
+        nonlocal sweep_proc, sweep_role
+        stop_sweep()
+        if focus_role != role or focus_proc is None or focus_proc.poll() is not None:
+            launch_focus(role)                     # the sweep feeds on the focus stream's HFD
+        sweep_proc = subprocess.Popen(
+            [sys.executable, '-m', 'astrolock.seeker.focus_sweep',
+             '--session', session_dir, '--role', role,
+             '--start', str(float(cmd['start'])), '--end', str(float(cmd['end'])),
+             '--steps', str(int(cmd.get('steps', 9))),
+             '--frames-per-step', str(int(cmd.get('frames', 40))),
+             '--settle-s', str(float(cmd.get('settle', 1.0)))],
+            stdin=subprocess.PIPE)
+        sweep_role = role
+        print(f"[backend] focus sweep started on {role}: "
+              f"{cmd['start']} .. {cmd['end']} x{cmd.get('steps', 9)}", flush=True)
+
     # Pre-warm the skyfield ephemeris/star cache once, serially. Two sky cams starting together
     # otherwise race to download de421.bsp / hipparcos into the shared cache and one loses the
     # rename (WinError 5) -- which is what crashed both sim cams in a fresh worktree. Best-effort:
@@ -999,6 +1033,16 @@ def main(argv=None):
             else:
                 stop_focus()
                 print("[backend] focus stopped", flush=True)
+        elif t == 'sweep':                            # GUI Focus tab: start/abort a focus sweep
+            role = cmd.get('role')
+            if cmd.get('on', True):
+                if role in roles:
+                    launch_sweep(role, cmd)
+                else:
+                    print(f"[backend] ignoring sweep on {role!r} (unknown role)", flush=True)
+            else:
+                stop_sweep()
+                print("[backend] focus sweep aborted", flush=True)
         elif t == 'record':
             # Recording is a separate PROCESS per role (astrolock.seeker.recorder): it tails the
             # role's shm stream and archives every frame to recordings/ at drive pace -- the cam
@@ -1280,6 +1324,9 @@ def main(argv=None):
                 # Focus process: which role it's running on (the GUI follows <role>_focus + its metrics).
                 'focus': {'running': focus_proc is not None and focus_proc.poll() is None,
                           'role': focus_role},
+                # Focus sweep process (the GUI follows <role>_sweep for its prompts/result).
+                'sweep': {'running': sweep_proc is not None and sweep_proc.poll() is None,
+                          'role': sweep_role},
                 # ROI (cx, cy, size px) around the predicted target, for detect to clamp its work to.
                 'track_roi': track_rois or None,        # {role: [cx, cy, size]} -- active source + guide fallback
                 'sources': dict(sources),
@@ -1333,6 +1380,11 @@ def main(argv=None):
             control_writers[role].close()
         open(stop_file, 'w').close()               # tell detectors to exit
         open(focus_stop, 'w').close()              # and the focus process, if one is running
+        if sweep_proc is not None and sweep_proc.poll() is None:
+            try:
+                sweep_proc.stdin.close()           # abort a running sweep (it exits promptly)
+            except OSError:
+                pass
         # Recorders need no signal: the cams' 'ended' records end their streams and they drain
         # + finalize + exit on their own (reaped below, patiently -- drain time is legitimate).
         if gui_proc is not None and gui_proc.poll() is None:
@@ -1349,7 +1401,7 @@ def main(argv=None):
         # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow
         # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
         _reap(list(cam_procs.values()) + list(detect_procs.values())
-              + [focus_proc, gui_proc, sky_sim_proc])
+              + [focus_proc, sweep_proc, gui_proc, sky_sim_proc])
         _reap(list(rec_procs.values()), graceful_s=300.0)   # a draining recorder is NOT hung
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
