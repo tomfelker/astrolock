@@ -409,20 +409,23 @@ def _open_sky(args, state_path=None, mount_path=None):
         # the mount-pose extrapolation, and the frame stamp -- so both cameras place a fast satellite
         # at the same world instant (no per-process epoch drift).
         now_ns = time.perf_counter_ns()
-        recs = ()
-        if slot is not None:                     # state slot: latest-wins, pure memory read
-            got = slot.read()
-            recs = (got[1],) if got else ()
-        elif tailer is not None:
-            recs = tailer.poll()
-        for rec in recs:                         # latest mount trajectory anchor wins
-            pose['az'] = _math.radians(rec.get(ka, _math.degrees(pose['az'])))
-            pose['alt'] = _math.radians(rec.get(kl, _math.degrees(pose['alt'])))
-            pose['raz'] = _math.radians(rec.get('rate_az_deg_s', 0.0))
-            pose['ralt'] = _math.radians(rec.get('rate_alt_deg_s', 0.0))
-            pose['enc_t'] = rec.get(kt)
+        if slot is not None or tailer is not None:
+            if slot is not None:                 # state slot: latest-wins, pure memory read
+                got = slot.read()
+                recs = (got[1],) if got else ()
+            else:
+                recs = tailer.poll()
+            for rec in recs:                     # latest mount trajectory anchor wins
+                pose['az'] = _math.radians(rec.get(ka, _math.degrees(pose['az'])))
+                pose['alt'] = _math.radians(rec.get(kl, _math.degrees(pose['alt'])))
+                pose['raz'] = _math.radians(rec.get('rate_az_deg_s', 0.0))
+                pose['ralt'] = _math.radians(rec.get('rate_alt_deg_s', 0.0))
+                pose['enc_t'] = rec.get(kt)
+            # Extrapolate the HELD pose every frame (not just on anchor ticks): between anchors
+            # the mount keeps moving at the anchor rate, and a fresh-record-only pose froze the
+            # rendered sky under a slewing mount (tracker chased its own motion to the rate cap).
             ahead = 0.0
-            if pose['enc_t']:                    # extrapolate the anchor pose to now (mount->cam latency)
+            if pose['enc_t']:                    # anchor pose -> now (mount->cam latency)
                 ahead = min(ahead_cap, max(0.0, now_ns * 1e-9 - pose['enc_t'] * 1e-9))
             az = pose['az'] + pose['raz'] * ahead
             alt = pose['alt'] + pose['ralt'] * ahead
