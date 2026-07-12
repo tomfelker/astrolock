@@ -8,12 +8,14 @@ the knob plays actuator: an electronic-focuser process reporting real positions,
 showing the human "Set focuser to x" with an OK button that echoes the request back. Same sweep
 either way.
 
-Focus quality comes from the running focus process's per-frame HFD records ('{role}_focus'
+Focus quality comes from the running focus process's per-frame records ('{role}_focus'
 extras, capture-timestamped). After a position is reported we skip a settle window (hands just
 shook the tube / motor still ringing), then collect the next N frames at that position. Every
-collected frame goes into ONE least-squares fit at the end: HFD vs position is the hyperbola
-hfd^2 = h0^2 + s^2 (p - p0)^2, which is exactly quadratic in p -- fit hfd^2 = a p^2 + b p + c
-linearly, then best focus p0 = -b/2a with expected hfd h0 = sqrt(c - b^2/4a). No iteration.
+collected frame goes into ONE least-squares fit at the end. KISS (for now): the metric is
+peak_frame -- peak scales ~1/HFD^2, so 1/peak is quadratic in position just like hfd^2 was --
+fit 1/peak = a p^2 + b p + c linearly, then best focus p0 = -b/2a with expected peak
+1/(c - b^2/4a). No iteration. Saturated frames (peak pinned at full scale) carry no focus
+information and are EXCLUDED from the fit; a high excluded fraction = reduce exposure.
 
 The backend holds our stdin: a line or EOF = abort (publish the aborted state, end the stream,
 exit). We also exit if the focus stream ends under us.
@@ -34,22 +36,22 @@ import numpy as np
 from astrolock.seeker import framestream
 from astrolock.seeker import session as session_mod
 
-SAT_PEAK = 0.98          # peak_frame at/above this = clipped core: HFD biased, warn about it
+SAT_PEAK = 0.98          # peak_frame at/above this = clipped core: blind, excluded from the fit
 
 
 def fit_vcurve(points):
-    """Least squares over ALL (pos, hfd) frames: hfd^2 = a p^2 + b p + c. Returns
-    (p0, h0, coeffs) or None when the data has no interior minimum (a <= 0: focus
-    wasn't bracketed, or everything was noise)."""
+    """Least squares over ALL (pos, peak_frame) frames: 1/peak = a p^2 + b p + c (peak scales
+    ~1/spread^2, so its reciprocal is the same quadratic hfd^2 was). Returns (p0, peak0, coeffs)
+    or None when the data has no interior best (a <= 0: focus wasn't bracketed, or noise)."""
     p = np.array([q[0] for q in points], dtype=np.float64)
-    y = np.array([q[1] for q in points], dtype=np.float64) ** 2
+    y = 1.0 / np.array([q[1] for q in points], dtype=np.float64)
     A = np.stack([p * p, p, np.ones_like(p)], axis=1)
     (a, b, c), *_ = np.linalg.lstsq(A, y, rcond=None)
     if a <= 0:
         return None
     p0 = -b / (2 * a)
-    h0 = math.sqrt(max(0.0, c - b * b / (4 * a)))
-    return p0, h0, (a, b, c)
+    ymin = c - b * b / (4 * a)
+    return p0, (1.0 / ymin if ymin > 0 else 0.0), (a, b, c)
 
 
 def main(argv=None):
@@ -60,7 +62,7 @@ def main(argv=None):
     p.add_argument('--end', type=float, required=True, help="last focuser position")
     p.add_argument('--steps', type=int, default=9, help="number of positions (>= 3 to fit)")
     p.add_argument('--frames-per-step', type=int, default=40,
-                   help="HFD frames collected at each position")
+                   help="frames collected at each position")
     p.add_argument('--settle-s', type=float, default=1.0,
                    help="dead time after a position report before frames count (vibration)")
     p.add_argument('--pos-tol', type=float, default=0.0,
@@ -117,8 +119,8 @@ def main(argv=None):
             fo_pos.release(fo_pos.segs[0])
         return hit
 
-    def drain_hfd(since_ns, sink, limit):
-        """Feed (pos-agnostic) HFD records captured after since_ns into sink, up to limit."""
+    def drain_metrics(since_ns, sink, limit):
+        """Feed per-frame peak_frame records captured after since_ns into sink, up to limit."""
         fo_hfd.poll()
         while fo_hfd.segs and len(sink) < limit:
             seg = fo_hfd.segs[0]
@@ -126,17 +128,17 @@ def main(argv=None):
             while i < seg.committed() and len(sink) < limit:
                 rec = seg.record(i)
                 i += 1
-                h = rec.get('hfd')
-                if rec['t_mono_ns'] < since_ns or h is None or math.isnan(h) or h <= 0:
+                pf = rec.get('peak_frame')
+                if rec['t_mono_ns'] < since_ns or pf is None or math.isnan(pf) or pf <= 0:
                     continue
-                sink.append((h, rec.get('peak_frame', 0.0)))
+                sink.append(pf)
             seg._used = i
             if seg.finalized() and i >= seg.committed() and len(fo_hfd.segs) > 1:
                 fo_hfd.release(seg)
                 continue
             break
 
-    points = []                                # (pos, hfd) for EVERY collected frame
+    points = []                                # (pos, peak_frame) for every unsaturated frame
     sat = total = 0
     aborted = False
     try:
@@ -157,7 +159,7 @@ def main(argv=None):
             since = t_ok + int(args.settle_s * 1e9)
             while len(window) < args.frames_per_step and not stop.is_set():
                 n0 = len(window)
-                drain_hfd(since, window, args.frames_per_step)
+                drain_metrics(since, window, args.frames_per_step)
                 if fo_hfd.ended() and not fo_hfd.segs:
                     break
                 if len(window) != n0:
@@ -166,19 +168,20 @@ def main(argv=None):
                     time.sleep(args.poll)
             if stop.is_set():
                 break
-            points.extend((want, h) for h, _pf in window)
-            sat += sum(1 for _h, pf in window if pf >= SAT_PEAK)
+            points.extend((want, pf) for pf in window if pf < SAT_PEAK)  # saturated = no info
+            sat += sum(1 for pf in window if pf >= SAT_PEAK)
             total += len(window)
         aborted = stop.is_set() or total == 0
     finally:
-        result = {'done': True, 'aborted': aborted, 'points': [[p_, round(h, 3)] for p_, h in points],
+        result = {'done': True, 'aborted': aborted,
+                  'points': [[p_, round(v, 4)] for p_, v in points],
                   'sat_frac': round(sat / total, 3) if total else 0.0}
         fit = fit_vcurve(points) if len(points) >= 3 and not aborted else None
         if fit is not None:
-            p0, h0, _ = fit
-            result.update(p0=round(p0, 4), h0=round(h0, 3),
+            p0, peak0, _ = fit
+            result.update(p0=round(p0, 4), peak0=round(peak0, 4),
                           bracketed=bool(min(positions) <= p0 <= max(positions)))
-            print(f"[sweep:{args.role}] best focus p0={p0:.4g} (HFD {h0:.2f}px, "
+            print(f"[sweep:{args.role}] best focus p0={p0:.4g} (peak {peak0:.2f}, "
                   f"{total} frames, sat {result['sat_frac']:.0%})", flush=True)
         elif not aborted:
             result['error'] = 'no minimum found (focus not bracketed, or data too noisy)'

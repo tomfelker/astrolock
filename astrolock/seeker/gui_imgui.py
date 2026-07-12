@@ -682,9 +682,9 @@ def main(argv=None):
             _text(dl, A(sx - S(11), sy + S(13)), f"{t:+.2f}", S(12), _SCREW_COL)
 
     def _draw_sweep_curve(stt):
-        """Little V-curve in the Focus panel: every collected (position, HFD) frame as a dot,
-        with the fitted best-focus position as a vertical line. Instantly shows a bad sweep
-        (saturated plateau, wind gust, range that didn't bracket focus)."""
+        """Little focus curve in the Focus panel: every collected (position, peak_frame)
+        frame as a dot, the fitted best-focus position as a vertical line. Instantly shows a
+        bad sweep (saturated plateau, wind gust, range that didn't bracket focus)."""
         pts = stt.get('points') or []
         if len(pts) < 3:
             return
@@ -1929,8 +1929,9 @@ def main(argv=None):
             imgui.text("Sweep:")
             _tip("Focus sweep with YOU as the actuator: give it a focuser range (any units -- knob "
                  "marks, mm, motor steps) and it prompts for each position; press OK once the "
-                 "focuser is there. Every frame's HFD (star half-flux diameter, px -- immune to a "
-                 "saturated core) is least-squares fit to a V-curve; its minimum is best focus. "
+                 "focuser is there. Every unsaturated frame's peak brightness is least-squares "
+                 "fit (1/peak is quadratic in focuser position); the vertex is best focus. Keep "
+                 "the star UNSATURATED (50-80% full well) -- clipped frames are excluded. "
                  "An electronic focuser will later answer the same prompts unattended.")
             imgui.same_line()
             imgui.set_next_item_width(S(56))
@@ -1968,7 +1969,7 @@ def main(argv=None):
                 if stt.get('aborted'):
                     _grey("Sweep aborted.")
                 elif 'p0' in stt:
-                    imgui.text(f"Best focus: {stt['p0']:g}  (HFD {stt['h0']:g} px)")
+                    imgui.text(f"Best focus: {stt['p0']:g}  (peak {stt.get('peak0', 0):.2f})")
                     if not stt.get('bracketed', True):
                         imgui.text_colored(C4(235, 180, 90),
                                            "minimum is OUTSIDE the swept range -- re-sweep around it")

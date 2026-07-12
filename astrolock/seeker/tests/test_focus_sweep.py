@@ -18,15 +18,18 @@ from astrolock.seeker import focus_sweep, framestream
 from astrolock.seeker import session as session_mod
 from astrolock.seeker.tests._util import fresh_dir
 
-P0, H0, SLOPE = 3.7, 2.0, 1.5
+P0, PK0, SLOPE = 3.7, 0.8, 0.9
+
+def _peak_of(pos):                                       # 1/peak exactly quadratic in position
+    return PK0 / (1.0 + (SLOPE * (pos - P0)) ** 2)
 
 
 def test_fit_vcurve():
-    pts = [(p, math.sqrt(H0 ** 2 + (SLOPE * (p - P0)) ** 2)) for p in np.linspace(0, 8, 40)]
-    p0, h0, _ = focus_sweep.fit_vcurve(pts)
-    assert abs(p0 - P0) < 1e-6 and abs(h0 - H0) < 1e-6
-    peak = [(0.0, 1.0), (1.0, 3.0), (2.0, 1.0)]         # a MAXIMUM in range: concave, no vertex
-    assert focus_sweep.fit_vcurve(peak) is None
+    pts = [(p, _peak_of(p)) for p in np.linspace(0, 8, 40)]
+    p0, pk0, _ = focus_sweep.fit_vcurve(pts)
+    assert abs(p0 - P0) < 1e-6 and abs(pk0 - PK0) < 1e-6
+    dip = [(0.0, 0.8), (1.0, 0.2), (2.0, 0.8)]           # peak MINIMUM in range: no vertex
+    assert focus_sweep.fit_vcurve(dip) is None
 
 
 def test_focus_sweep():
@@ -64,12 +67,11 @@ def test_focus_sweep():
                                      cap=256, raw=True)
             focuser.write(np.frombuffer(json.dumps({'pos': pos}).encode('utf-8'), np.uint8),
                           t_mono_ns=time.monotonic_ns())
-        if pos is not None:                              # the "focus process": HFD of the hyperbola
-            hfd = math.sqrt(H0 ** 2 + (SLOPE * (pos - P0)) ** 2)
+        if pos is not None:                              # the "focus process": known peak curve
             if focus._seg is None or focus.full:
                 focus.open_segment(session_mod.segment_stamp(), 8, 8, cap=64)
             focus.write(frame, t_mono_ns=time.monotonic_ns(),
-                        extras=(0.5, 0.5, hfd, 0.5, 0.0, 0.0, math.nan, math.nan))
+                        extras=(0.5, _peak_of(pos), 20.0, 0.5, 0.0, 0.0, math.nan, math.nan))
         time.sleep(0.005)
     th.join(10)
     assert not th.is_alive(), "sweep never finished"
@@ -82,7 +84,7 @@ def test_focus_sweep():
         seg._used = i
     assert state.get('done') and not state.get('aborted'), state
     assert abs(state['p0'] - P0) < 0.05, state
-    assert abs(state['h0'] - H0) < 0.1, state
+    assert abs(state['peak0'] - PK0) < 0.05, state
     assert len(state['points']) == 5 * 6 and state['bracketed'], state
     assert state['sat_frac'] == 0.0
     focus.close()
