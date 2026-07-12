@@ -515,24 +515,6 @@ def detect_blobs(bp, work, prev_bp, *, threshold_rel, max_candidates, suppress_r
     } for i in range(final.numel())]
 
 
-def _segments(session, role):
-    """Segment identities for a role, discovered BY SIDECAR (a shm segment has no .ser file)."""
-    return framestream.segment_paths(session, role)
-
-
-def _committed(reader, ser_path):
-    """Frames safe to read in a segment: min(committed sidecar lines, frames on disk)."""
-    lines = sidecar.count_complete_lines(ser_path[:-len('.ser')] + '.frames.jsonl')
-    return min(lines, reader.frames_on_disk())
-
-
-def _segment_ready(ser_path):
-    """A just-created segment's .ser exists a beat before the cam has flushed its header + first
-    frame. Gate on the commit point -- the sidecar's first complete line, which the cam appends only
-    after those bytes are on disk -- so we never open a header-less .ser."""
-    return sidecar.count_complete_lines(ser_path[:-len('.ser')] + '.frames.jsonl') >= 1
-
-
 def detect_roi_peak(work, roi, coord_scale, *, detector, bg_radius, psf_px, doh_sigma, snr):
     """Track-mode detection: find the single locked target in a small ROI around the predicted
     position -- far cheaper than a full-frame multi-blob pass, and no merging/gating needed.
@@ -811,24 +793,6 @@ def main(argv=None):
     device = resolve_device(args.device)
     print(f"[detect:{args.role}] compute device: {device}", flush=True)
 
-    # Wait for the first *ready* segment (header + first frame committed via the sidecar), not merely
-    # for the .ser to exist -- the cam creates the file a beat before it writes the header.
-    while True:
-        if args.stop_file and os.path.exists(args.stop_file):
-            return
-        ready = [s for s in _segments(args.session, args.role) if _segment_ready(s)]
-        if ready:
-            break
-        time.sleep(args.poll)
-
-    # Live tracks the newest segment; offline starts at the oldest and processes in order.
-    cur = ready[-1] if args.follow else ready[0]
-
-    def open_segment(ser_path):
-        reader = framestream.open_reader(ser_path)     # disk .ser or shm section, transparently
-        writer = JsonlWriter(ser_path[:-len('.ser')] + '.detections.jsonl')
-        return reader, writer
-
     def new_surprise():                                # per-pixel temporal detector (stateful), or None
         if args.detector != 'surprise':
             return None
@@ -836,13 +800,28 @@ def main(argv=None):
                              args.surprise_decay, args.surprise_var_floor_frac,
                              blur_px=args.surprise_blur_px)
 
-    reader, writer = open_segment(cur)
+    # Follow the stream chain (head file -> segments); live skips to the newest frame, offline
+    # drains every frame in order. Temporal state (surprise) resets per segment, like before.
+    fo = framestream.StreamFollower(args.session, args.role, keep_all=not args.follow)
+    cur = None                                         # current SegmentReader
+    writer = None                                      # detections sidecar for the current segment
     prev = None
     surprise = new_surprise()
-    dbg = {'stream': None}                             # debug detection-surface stream (lazy, per segment)
+    dbg = {'stream': None}                             # debug detection-surface stream (rolls on its own)
     next_index = 0
     scale = None
     total = 0
+
+    def switch_to(seg):
+        nonlocal cur, writer, prev, surprise, scale, next_index
+        if writer is not None:
+            writer.close()
+        cur = seg
+        writer = JsonlWriter(seg.frames_path[:-len('.frames.jsonl')] + '.detections.jsonl')
+        prev = None
+        surprise = new_surprise()                      # fresh temporal state for the new segment
+        scale = None
+        next_index = 0
 
     def close_debug():
         if dbg['stream'] is not None:
@@ -866,12 +845,12 @@ def main(argv=None):
     def process(i):
         nonlocal prev, scale, total
         t_start = time.perf_counter()                              # whole-frame cost -> proc_ms in the record
-        frame = reader.read_frame(i)
-        cid = reader.header.color_id
+        frame = cur.read(i)
+        cid = cur.header.color_id
         if scale is None:
-            scale = full_scale(cid, reader.header.pixel_depth_per_plane)
+            scale = full_scale(cid, cur.header.pixel_depth_per_plane)
         work = work_image(frame, cid, device=device)
-        coord_scale = reader.header.image_width / work.shape[1]    # frame px per (maybe half-res) work px
+        coord_scale = cur.header.image_width / work.shape[1]       # frame px per (maybe half-res) work px
         # Keep the temporal model current every frame (even in track mode) so its state never goes stale.
         trail = surprise.update(work) if surprise is not None else None
         extra, status = {}, ''                                     # extra record fields + a freeform status line
@@ -964,9 +943,9 @@ def main(argv=None):
             if st is None:
                 st = dbg['stream'] = framestream.FrameStream(args.session, f'{args.role}_debug')
             dh, dw = debug_surface.shape
-            if st.ser_path is None or (args.shm_ser and st.frame_count >= args.shm_frames):
+            if st.frames_path is None or st.frame_count >= args.shm_frames:
                 st.open_segment(session_mod.segment_stamp(), dw, dh, color_id=ser_mod.ColorId.MONO,
-                                pixel_depth_per_plane=16, shm=args.shm_ser, cap=args.shm_frames)
+                                pixel_depth=16, shm=args.shm_ser, cap=args.shm_frames)
             # A surprisal surface is in true sigma units -> FIXED scale (debug_hi, white = 10 sigma)
             # so standout is judgeable across frames; other surfaces autoscale per frame (hi=None).
             st.write(debug_frame_u16(debug_surface, hi=debug_hi),
@@ -977,46 +956,52 @@ def main(argv=None):
         while True:
             if args.stop_file and os.path.exists(args.stop_file):
                 break
-
             poll_state()                         # refresh the predicted track ROI (if any)
-            avail = _committed(reader, cur)
+            fo.poll()
+            worked = False
             if args.follow:
-                # Live: never build a backlog -- skip straight to the most recent frame.
-                if avail - 1 >= next_index:
-                    next_index = avail - 1
-                    process(next_index)
-                    next_index += 1
+                got = fo.latest()                # live: never build a backlog -- newest frame only
+                if got:
+                    seg, i = got
+                    if seg is not cur:
+                        switch_to(seg)
+                    if i >= next_index:
+                        next_index = i
+                        process(next_index)
+                        next_index += 1
+                        worked = True
+                if not worked and fo.ended():
+                    break                        # stream ended cleanly and we're caught up
             else:
-                while next_index < avail:        # offline: process every frame in order
-                    process(next_index)
-                    next_index += 1
-                    avail = _committed(reader, cur)
-
-            # Caught up on the current segment. Roll to a newer one -- but only once it's *ready*
-            # (header + first frame committed), else we'd race the cam and open a header-less .ser.
-            newer = [s for s in _segments(args.session, args.role) if s > cur and _segment_ready(s)]
-            if newer:
-                reader.close()
-                writer.close()
-                cur = newer[-1] if args.follow else newer[0]   # live: jump to newest
-                close_debug()                          # finalize this segment's debug .ser
-                reader, writer = open_segment(cur)
-                prev = None
-                surprise = new_surprise()              # fresh temporal state for the new segment
-                next_index = 0
-                scale = None
-                continue
-
-            # No newer segment: live waits; offline exits once this one is finalized.
-            if reader.finalized() and next_index >= _committed(reader, cur):
-                if not args.follow:
+                seg = fo.segs[0] if fo.segs else None
+                if seg is not None:
+                    if seg is not cur:
+                        switch_to(seg)
+                    while next_index < seg.committed():   # offline: every frame, in order
+                        process(next_index)
+                        next_index += 1
+                        worked = True
+                        seg.poll()
+                    if seg.finalized() and next_index >= seg.committed():
+                        stream_done = seg.stream_ended()
+                        if writer is not None:
+                            writer.close()
+                            writer = None
+                        fo.release(seg)
+                        cur = None
+                        if stream_done:
+                            break
+                        continue
+                elif fo.ended():
                     break
-            time.sleep(args.poll)
+            if not worked:
+                time.sleep(args.poll)
     except KeyboardInterrupt:
         pass
     finally:
-        reader.close()
-        writer.close()
+        if writer is not None:
+            writer.close()
+        fo.close()
         close_debug()
         print(f"[detect:{args.role}] processed {total} frames", flush=True)
 

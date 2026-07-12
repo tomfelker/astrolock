@@ -38,6 +38,7 @@ import numpy as np
 from astrolock.seeker import bayer, control, ser
 from astrolock.seeker import optics as optics_db
 from astrolock.seeker import settings as settings_store
+from astrolock.seeker import framestream
 from astrolock.seeker.follower import FrameRef, SerFollower
 from astrolock.seeker.sidecar import JsonlTailer
 
@@ -1899,8 +1900,10 @@ def main(argv=None):
         # the backend state file), then block until it (or an OS input event) wakes us. The 0.25s
         # timeout is the idle heartbeat: blink text, meter sampling, tooltip delays.
         # Watch the frames SIDECARS (the on-disk artifact that grows per frame -- a shm
-        # segment's .ser doesn't exist at all) + the detection sidecars.
+        # segment stores pixels off-disk) + the stream HEAD files (segment/ended events) + the
+        # detection sidecars.
         paths = [fo.frames_path for fo in followers.values() if fo.frames_path]
+        paths += [framestream.head_path(args.session, name) for name in followers]
         paths += [c['det_tailer'].path for c in cams.values()]
         wake['paths'] = paths
         wake['state_path'] = ctrl['tailer'].path if ctrl['tailer'] is not None else None

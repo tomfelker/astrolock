@@ -33,13 +33,16 @@ def test_cam_to_follower():
 
     frames_path = glob.glob(os.path.join(out, '*_guide.frames.jsonl'))[0]
     recs = sidecar.read_complete_lines(frames_path)
-    assert len(recs) == 20
-    assert 't_mono_ns' in recs[0] and 't_utc' in recs[0] and 'store' in recs[0]
+    start, frames = recs[0], [r for r in recs[1:] if 'off' in r]   # line 0 = stream-start metadata;
+    assert start['type'] == 'start' and start['store'] == 'file' and start['width'] == 320
+    assert recs[-1].get('type') == 'ended'             # ...last line = the clean end-of-stream record
+    assert len(frames) == 20
+    assert 't_mono_ns' in frames[0] and 't_utc' in frames[0] and 'off' in frames[0]
 
-    # Cross-file guard: an extra sidecar line with no matching .ser frame must not count.
+    # Only frame records (off/len) count as frames -- other line types never do.
     with open(frames_path, 'a', encoding='utf-8') as fp:
         fp.write('{"t_mono_ns":1,"t_utc":"x"}\n')
-    assert f.committed_count() == 20, "committed count must clamp to frames on disk"
+    assert f.committed_count() == 20, "non-frame lines must not count"
     f.close()
 
 

@@ -691,7 +691,7 @@ def main(argv=None):
             if use_shm and (seg_limit == -1 or seg_limit > args.shm_frames):
                 seg_limit = args.shm_frames
             stream.open_segment(session_mod.segment_stamp(), width, height, color_id=color_id,
-                                pixel_depth_per_plane=pixel_depth,
+                                pixel_depth=pixel_depth,
                                 shm=use_shm, cap=max(1, seg_limit) if use_shm else 64)
             frames_in_file = 0
             rolled = False

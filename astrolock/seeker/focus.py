@@ -35,8 +35,9 @@ import torch
 
 from astrolock.seeker import bayer, ser as ser_mod, skysim
 from astrolock.seeker.detect import (resolve_device, work_image, full_scale,
-                                     _segments, _committed, _segment_ready)
+                                     )
 from astrolock.seeker import framestream
+from astrolock.seeker import session as session_mod
 from astrolock.seeker.sidecar import JsonlTailer
 
 
@@ -172,32 +173,28 @@ def main(argv=None):
     device = resolve_device(args.device)
     print(f"[focus:{args.role}] compute device: {device}", flush=True)
 
-    # Wait for the first ready segment (header + first frame committed), like detect.
-    while True:
-        if args.stop_file and os.path.exists(args.stop_file):
-            return
-        ready = [s for s in _segments(args.session, args.role) if _segment_ready(s)]
-        if ready:
-            break
-        time.sleep(args.poll)
+    # Follow the cam stream chain; the star OUTPUT is one stream for the whole run, rolling
+    # its own segments (fresh on every input-segment switch, and when a shm segment fills).
+    fo = framestream.StreamFollower(args.session, args.role)
+    out = framestream.FrameStream(args.session, f'{args.role}_focus')
+    cur = None                                              # current input SegmentReader
+    det = None
+    ema = None
 
-    cur = ready[-1] if args.follow else ready[0]
-
-    def open_segment(ser_path):
-        reader = framestream.open_reader(ser_path)          # disk .ser or shm section, transparently
-        stem = ser_path[:-len('.ser')]
-        crop = _effective_crop(reader.header, args.crop)    # fits the analysis image; writer + EMA agree
-        # Output stream: <seg>_<role>_focus segments (star image + the metrics spine), via the
-        # shared FrameStream interface -- shm-backed when --shm-ser, like the cams.
-        out = framestream.FrameStream(args.session, f'{args.role}_focus')
-        out.open_segment(os.path.basename(stem)[:-(len(args.role) + 1)], crop, crop,
-                         color_id=ser_mod.ColorId.MONO, pixel_depth_per_plane=16,
+    def switch_to(seg):
+        nonlocal cur, det, ema, scale
+        if det is not None:
+            det.close()
+        cur = seg
+        crop = _effective_crop(seg.header, args.crop)       # fits the analysis image; writer + EMA agree
+        out.open_segment(session_mod.segment_stamp(), crop, crop,
+                         color_id=ser_mod.ColorId.MONO, pixel_depth=16,
                          shm=args.shm_ser, cap=args.shm_frames)
+        stem = seg.frames_path[:-len('.frames.jsonl')]
         det = JsonlTailer(stem + '.detections.jsonl')       # where the target is (this role's detector)
         ema = FocusEma(crop, args.search, args.alpha, scale=None)
-        return reader, out, det, ema
+        scale = None
 
-    reader, out, det, ema = open_segment(cur)
     latest_blobs = []
     next_index = 0
     scale = None
@@ -206,18 +203,21 @@ def main(argv=None):
     strehl_done = False          # False until we've decided whether Strehl is available (needs the plate scale)
     rad_per_px = None            # radians per work px (for the pixel-scale-free CoM offset); None if unknown
 
-    def close_segment():
-        reader.close(); out.close(); det.close()
+    def close_all():
+        fo.close()
+        out.close()
+        if det is not None:
+            det.close()
 
     def process(i):
         nonlocal scale, total, strehl_ref, strehl_done, rad_per_px
-        frame = reader.read_frame(i)
-        cid = reader.header.color_id
+        frame = cur.read(i)
+        cid = cur.header.color_id
         if scale is None:
-            scale = full_scale(cid, reader.header.pixel_depth_per_plane)
+            scale = full_scale(cid, cur.header.pixel_depth_per_plane)
             ema.scale = scale
         work = work_image(frame, cid, device=device)
-        coord_scale = reader.header.image_width / work.shape[1]     # frame px per (maybe half-res) work px
+        coord_scale = cur.header.image_width / work.shape[1]        # frame px per (maybe half-res) work px
         # Strehl reference: the ideal PSF's normalized peak. With a known aperture it's the diffraction
         # Airy at the WORK-image plate scale (work px are coarser than sensor px -- e.g. 2x for a Bayer
         # mono-sum -- hence pixel_um * coord_scale). With the aperture UNKNOWN we assume the best a lens
@@ -261,39 +261,31 @@ def main(argv=None):
         while True:
             if args.stop_file and os.path.exists(args.stop_file):
                 break
-            for rec in det.poll():                    # refresh the target location
-                latest_blobs = rec.get('blobs', [])
-
-            avail = _committed(reader, cur)
-            if args.follow:
-                if avail - 1 >= next_index:            # live: skip to the most recent frame
-                    next_index = avail - 1
+            if det is not None:
+                for rec in det.poll():                # refresh the target location
+                    latest_blobs = rec.get('blobs', [])
+            fo.poll()
+            worked = False
+            got = fo.latest()
+            if got:
+                seg, i = got
+                if seg is not cur:
+                    switch_to(seg)
+                    latest_blobs = []
+                    next_index = 0
+                if i >= next_index:                    # live: skip to the most recent frame
+                    next_index = i
                     process(next_index)
                     next_index += 1
-            else:
-                while next_index < avail:              # offline: every frame in order
-                    process(next_index)
-                    next_index += 1
-                    avail = _committed(reader, cur)
-
-            newer = [s for s in _segments(args.session, args.role) if s > cur and _segment_ready(s)]
-            if newer:
-                close_segment()
-                cur = newer[-1] if args.follow else newer[0]
-                reader, out, det, ema = open_segment(cur)
-                latest_blobs = []
-                next_index = 0
-                scale = None
-                continue
-
-            if reader.finalized() and next_index >= _committed(reader, cur):
-                if not args.follow:
-                    break
-            time.sleep(args.poll)
+                    worked = True
+            if not worked:
+                if fo.ended():
+                    break                              # cam stream ended cleanly; we're done
+                time.sleep(args.poll)
     except KeyboardInterrupt:
         pass
     finally:
-        close_segment()
+        close_all()
         print(f"[focus:{args.role}] processed {total} frames", flush=True)
 
 

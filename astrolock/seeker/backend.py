@@ -812,7 +812,7 @@ def main(argv=None):
             sides = sorted(glob.glob(os.path.join(session_dir, f'*_{name}.frames.jsonl')))
             for fp in sides[:-2]:
                 stem = fp[:-len('.frames.jsonl')]
-                for ext in ('.ser', '.frames.jsonl', '.detections.jsonl'):
+                for ext in ('.dat', '.frames.jsonl', '.detections.jsonl'):
                     try:                                  # all live-session artifacts are ephemeral
                         os.remove(stem + ext)             # (recordings live in --recordings-dir)
                     except OSError:
@@ -998,14 +998,19 @@ def main(argv=None):
             targets = [r] if r in roles else roles    # a named role, else all (back-compat)
             for role in targets:
                 if on and not _recorder_alive(role):
-                    rs = os.path.join(session_dir, f'stop_rec_{role}')
-                    if os.path.exists(rs):
-                        os.remove(rs)
-                    rec_procs[role] = _spawn('astrolock.seeker.recorder',
-                                             ['--session', session_dir, '--role', role,
-                                              '--out-dir', args.recordings_dir, '--stop-file', rs])
+                    # We hold the recorder's stdin: 'stop' is a line on it, and if WE die the
+                    # pipe closes and the recorder freezes+flushes+exits on its own. Nobody is
+                    # ever killed; it also self-exits at the stream's 'ended' record.
+                    rec_procs[role] = subprocess.Popen(
+                        [sys.executable, '-m', 'astrolock.seeker.recorder',
+                         '--session', session_dir, '--role', role,
+                         '--out-dir', args.recordings_dir],
+                        stdin=subprocess.PIPE)
                 elif not on and _recorder_alive(role):
-                    open(os.path.join(session_dir, f'stop_rec_{role}'), 'w').close()
+                    try:
+                        rec_procs[role].stdin.close()     # freeze + flush + exit
+                    except OSError:
+                        pass
                 recording[role] = on
             print(f"[backend] recording {'ON' if on else 'off'} for {', '.join(targets)}", flush=True)
         elif t == 'capture':
@@ -1317,8 +1322,8 @@ def main(argv=None):
             control_writers[role].close()
         open(stop_file, 'w').close()               # tell detectors to exit
         open(focus_stop, 'w').close()              # and the focus process, if one is running
-        for role in rec_procs:                     # recorders: drain what's committed, finalize, exit
-            open(os.path.join(session_dir, f'stop_rec_{role}'), 'w').close()
+        # Recorders need no signal: the cams' 'ended' records end their streams and they drain
+        # + finalize + exit on their own (reaped below, patiently -- drain time is legitimate).
         if gui_proc is not None and gui_proc.poll() is None:
             gui_proc.terminate()
         cmd_server.close()
@@ -1334,7 +1339,8 @@ def main(argv=None):
         # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow
         # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
         _reap(list(cam_procs.values()) + list(detect_procs.values())
-              + list(rec_procs.values()) + [focus_proc, gui_proc, sky_sim_proc])
+              + [focus_proc, gui_proc, sky_sim_proc])
+        _reap(list(rec_procs.values()), graceful_s=300.0)   # a draining recorder is NOT hung
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
         print("[backend] done", flush=True)
