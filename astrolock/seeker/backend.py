@@ -33,6 +33,7 @@ import time
 
 from astrolock.seeker import cam as cam_mod
 from astrolock.seeker import control
+from astrolock.seeker import framestream
 from astrolock.seeker import mount as mount_mod
 from astrolock.seeker import session as session_mod
 from astrolock.seeker import sidecar
@@ -291,9 +292,13 @@ def main(argv=None):
     stop_file = os.path.join(session_dir, 'stop')          # for detect (cams use control files)
 
     cmd_server = control.CommandServer()
+    # State is a latest-wins shm slot, not a file: the ~20 Hz append used to ride the control
+    # loop, and a volume-wide write throttle (drive breather) could stall the loop that has to
+    # keep processing estop. backend.json advertises the slot; cams/detect get it by argument.
+    state_slot = framestream.LatestSlot(create=True)
     with open(os.path.join(session_dir, f"{ts}_backend.json"), 'w') as f:
-        json.dump({'command_host': cmd_server.host, 'command_port': cmd_server.port}, f)
-    state_writer = JsonlWriter(os.path.join(session_dir, session_mod.state_name(ts)))
+        json.dump({'command_host': cmd_server.host, 'command_port': cmd_server.port,
+                   'state_shm': state_slot.name}, f)
     print(f"[backend] session {session_dir} roles={roles} source={args.source} "
           f"cmd_port={cmd_server.port}", flush=True)
 
@@ -545,6 +550,7 @@ def main(argv=None):
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
             '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
+            '--state-shm', state_slot.name,        # sky follow-state pose (file-free)
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
@@ -564,6 +570,7 @@ def main(argv=None):
                                     ['--session', session_dir, '--role', role, '--follow',
                                      '--stop-file', stop_file,
                                      '--detector', det, '--track-detector', tdet,
+                                     '--state-shm', state_slot.name,
                                      *(['--shm-ser', '--shm-frames', str(min(64, args.shm_frames))]
                                        if args.shm_ser else []),
                                      '--track-blur-px', str(args.track_blur_px),
@@ -656,28 +663,30 @@ def main(argv=None):
 
     followers = {role: SerFollower(session_dir, role) for role in roles}
 
-    det_tailers = {role: None for role in roles}     # follow each role's detections across rollover
-    det_ser = {role: None for role in roles}
+    det_fos = {role: framestream.StreamFollower(session_dir, f'{role}_det', keep_all=True)
+               for role in roles}                    # detections stream (raw JSON payloads)
     latest_blobs = {role: [] for role in roles}
     latest_det_index = {role: -1 for role in roles}
     latest_ext = {role: None for role in roles}          # role -> extended-detector metrics (present/...)
 
     def update_detections():
         for role in roles:
-            f = followers[role]
-            f.committed_count()                      # refresh which segment is newest
-            sp = f.ser_path
-            if not sp:
-                continue
-            if det_ser[role] != sp:                  # rolled to a new segment -> re-point tailer
-                if det_tailers[role] is not None:
-                    det_tailers[role].close()
-                det_tailers[role] = JsonlTailer(sp[:-len('.ser')] + '.detections.jsonl')
-                det_ser[role] = sp
-            for rec in det_tailers[role].poll():
-                latest_blobs[role] = rec.get('blobs', [])
-                latest_det_index[role] = rec.get('index', latest_det_index[role])
-                latest_ext[role] = rec.get('ext')        # extended detector: {'present', 'com', ...} or None
+            fo_ = det_fos[role]
+            fo_.poll()
+            while fo_.segs:                          # drain every new detection record, in order
+                seg = fo_.segs[0]
+                i = getattr(seg, '_used', 0)
+                while i < seg.committed():
+                    rec = json.loads(bytes(seg.read(i)).decode('utf-8'))
+                    i += 1
+                    latest_blobs[role] = rec.get('blobs', [])
+                    latest_det_index[role] = rec.get('index', latest_det_index[role])
+                    latest_ext[role] = rec.get('ext')    # extended: {'present', 'com', ...} or None
+                seg._used = i
+                if seg.finalized() and i >= seg.committed() and len(fo_.segs) > 1:
+                    fo_.release(seg)
+                    continue
+                break
 
     def frame_binning(role):
         """Sensor pixels per frame pixel for a role (from the cam's frame sidecar; default 1)."""
@@ -1242,7 +1251,7 @@ def main(argv=None):
             else:
                 backend_status = {'lost': 'target lost', 'slew': 'slewing'}.get(mode, 'idle')
 
-            state_writer.append({
+            state_slot.write({
                 't_mono_ns': time.perf_counter_ns(),
                 't_utc': session_mod.utc_now_iso(),
                 'mode': mode,
@@ -1329,13 +1338,12 @@ def main(argv=None):
         if gui_proc is not None and gui_proc.poll() is None:
             gui_proc.terminate()
         cmd_server.close()
-        state_writer.close()
+        state_slot.close()
         mount.close()
         for fo in followers.values():
             fo.close()
-        for dt_ in det_tailers.values():
-            if dt_ is not None:
-                dt_.close()
+        for fo_ in det_fos.values():
+            fo_.close()
 
         # Make sure every child is fully dead before cleanup: a still-terminating cam/detect holds
         # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow

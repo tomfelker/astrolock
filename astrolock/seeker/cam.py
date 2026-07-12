@@ -387,8 +387,14 @@ def _open_sky(args, state_path=None, mount_path=None):
     # extrapolate with no upper cap (a constant-rate segment can be long with no new anchor); the
     # estimate path keeps the old 0.2 s cap as a guard against a stalled backend.
     follow_mount = getattr(args, 'sky_follow_mount', False) and mount_path is not None
-    follow_state = args.sky_follow_state and state_path is not None
-    tailer = JsonlTailer(mount_path if follow_mount else state_path) if (follow_mount or follow_state) else None
+    follow_state = args.sky_follow_state and getattr(args, 'state_shm', None)
+    tailer = JsonlTailer(mount_path) if follow_mount else None
+    slot = None
+    if follow_state and not follow_mount:                    # backend pose via the shm state slot
+        try:
+            slot = framestream.LatestSlot(name=args.state_shm)
+        except ValueError:
+            slot = None                                      # standalone run: scripted pose below
     ka, kl = ('az_deg', 'alt_deg') if follow_mount else ('enc_az_deg', 'enc_alt_deg')
     kt = 't_mono_ns' if follow_mount else 'enc_t_mono_ns'
     ahead_cap = 5.0 if follow_mount else 0.2
@@ -403,13 +409,18 @@ def _open_sky(args, state_path=None, mount_path=None):
         # the mount-pose extrapolation, and the frame stamp -- so both cameras place a fast satellite
         # at the same world instant (no per-process epoch drift).
         now_ns = time.perf_counter_ns()
-        if tailer is not None:
-            for rec in tailer.poll():            # latest mount trajectory anchor wins
-                pose['az'] = _math.radians(rec.get(ka, _math.degrees(pose['az'])))
-                pose['alt'] = _math.radians(rec.get(kl, _math.degrees(pose['alt'])))
-                pose['raz'] = _math.radians(rec.get('rate_az_deg_s', 0.0))
-                pose['ralt'] = _math.radians(rec.get('rate_alt_deg_s', 0.0))
-                pose['enc_t'] = rec.get(kt)
+        recs = ()
+        if slot is not None:                     # state slot: latest-wins, pure memory read
+            got = slot.read()
+            recs = (got[1],) if got else ()
+        elif tailer is not None:
+            recs = tailer.poll()
+        for rec in recs:                         # latest mount trajectory anchor wins
+            pose['az'] = _math.radians(rec.get(ka, _math.degrees(pose['az'])))
+            pose['alt'] = _math.radians(rec.get(kl, _math.degrees(pose['alt'])))
+            pose['raz'] = _math.radians(rec.get('rate_az_deg_s', 0.0))
+            pose['ralt'] = _math.radians(rec.get('rate_alt_deg_s', 0.0))
+            pose['enc_t'] = rec.get(kt)
             ahead = 0.0
             if pose['enc_t']:                    # extrapolate the anchor pose to now (mount->cam latency)
                 ahead = min(ahead_cap, max(0.0, now_ns * 1e-9 - pose['enc_t'] * 1e-9))
@@ -602,6 +613,8 @@ def main(argv=None):
                         "~24 fps like the real hardware. 0 = unlimited")
     p.add_argument('--sky-almanac', default=None,
                    help="sky: shared source-direction almanac (JSONL) published by sky_sim")
+    p.add_argument('--state-shm', default=None,
+                   help="backend state slot (shm name) for --sky-follow-state pose")
     p.add_argument('--sky-follow-state', action='store_true',
                    help="sky: render from the backend's encoder estimate in <ts>_state.jsonl")
     p.add_argument('--sky-follow-mount', action='store_true',

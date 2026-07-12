@@ -28,7 +28,14 @@ def test_detect_tracks_moving_blob():
     # Offline: detect runs to completion (the .ser header is finalized) and exits.
     detect.main(['--session', out, '--role', 'guide', '--moving-frac', '0.1'])
 
-    recs = sidecar.read_complete_lines(glob.glob(os.path.join(out, '*.detections.jsonl'))[0])
+    # Detections are a raw-payload stream now (shm live, .dat here): read every record back.
+    import json
+    from astrolock.seeker import framestream
+    dfo = framestream.StreamFollower(out, 'guide_det', keep_all=True)
+    dfo.poll()
+    recs = [json.loads(bytes(seg.read(i)).decode('utf-8'))
+            for seg in dfo.segs for i in range(seg.committed())]
+    dfo.close()
     assert len(recs) == 30, len(recs)
     assert all(r['blobs'] for r in recs), "every frame should find at least one blob"
 

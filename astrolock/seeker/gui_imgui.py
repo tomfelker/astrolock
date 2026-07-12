@@ -147,8 +147,6 @@ def _waker(glfw_mod, wake, stop):
     glfw.post_empty_event() is documented thread-safe, and portable."""
     sizes = {}
     last_counts = None
-    cur_sp = None
-    state_pos = 0
     last_state = None
     while not stop.is_set():
         dirty = False
@@ -173,31 +171,18 @@ def _waker(glfw_mod, wake, stop):
                 dirty = True
         for stale in [k for k in sizes if k not in paths]:
             del sizes[stale]                      # forget rolled-over segments so the dict stays bounded
-        sp = wake.get('state_path')
-        if sp != cur_sp:                          # new backend session -> re-point, skip existing history
-            cur_sp = sp
-            last_state = None
+        slot = wake.get('state_slot')             # backend state: latest-wins shm slot (memory read)
+        if slot is not None:
             try:
-                state_pos = os.path.getsize(sp) if sp else 0
-            except OSError:
-                state_pos = 0
-        if cur_sp:
-            try:
-                with open(cur_sp, 'rb') as f:
-                    f.seek(state_pos)
-                    data = f.read()
-                    state_pos = f.tell()
-            except OSError:
-                data = b''
-            for line in data.splitlines():
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
+                got = slot.read()
+            except (AttributeError, ValueError):  # closed mid-probe: benign race
+                got = None
+            if got:
+                rec = dict(got[1])
                 for k in ('t_mono_ns', 't_utc', 'enc_t_mono_ns', 'cameras'):
-                    rec.pop(k, None)              # volatile fields the GUI doesn't draw (frame counts
-                if rec != last_state:             # arrive via .ser growth) -- exclude from the wake test
-                    last_state = rec
+                    rec.pop(k, None)              # volatile fields the GUI doesn't draw
+                if rec != last_state:             # only a MEANINGFUL change wakes us (else the
+                    last_state = rec              # ~20 Hz heartbeat would never let the GUI idle)
                     dirty = True
         if dirty:
             glfw_mod.post_empty_event()
@@ -521,6 +506,29 @@ def main(argv=None):
         s['zoom'] = ZOOM_MULTS[max(0, min(len(ZOOM_MULTS) - 1, i + delta))]
 
     # ---- per-stream camera data (GL textures + frames + detections) --------------------------
+    det_fos = {}                                     # role -> detections stream follower
+
+    def _det_records(role):
+        """Drain new detection records (raw JSON payloads) for a role, in order."""
+        fo_ = det_fos.get(role)
+        if fo_ is None:
+            fo_ = det_fos[role] = framestream.StreamFollower(args.session, f'{role}_det',
+                                                             keep_all=True)
+        fo_.poll()
+        out_ = []
+        while fo_.segs:
+            seg_ = fo_.segs[0]
+            i = getattr(seg_, '_used', 0)
+            while i < seg_.committed():
+                out_.append(json.loads(bytes(seg_.read(i)).decode('utf-8')))
+                i += 1
+            seg_._used = i
+            if seg_.finalized() and i >= seg_.committed() and len(fo_.segs) > 1:
+                fo_.release(seg_)
+                continue
+            break
+        return out_
+
     def update_cam(stream):
         """Advance a stream's follower: upload a new frame to the GPU (debayer/tonemap pass), poll
         detections, refresh the histogram. When a detector is producing records for this stream we
@@ -541,24 +549,22 @@ def main(argv=None):
             fh0, fw0 = frame.shape[0], frame.shape[1]
             nb = 2 if bayer.is_bayer(f.header.color_id) else 1
             w, h = fw0 // nb, fh0 // nb
-            det_path = os.path.join(args.session, seg[:-len('.ser')] + '.detections.jsonl')
             cam = cams[stream] = dict(gl=_StreamGL(ctx, prog, vao), w=w, h=h, fw=fw0, fh=fh0,
                                       ox=w / fw0, oy=h / fh0, color_id=f.header.color_id,
                                       blobs=[], ext=None, status=None, det_idx=-1, last_idx=-1,
-                                      hist=None, det_tailer=JsonlTailer(det_path), ser_path=seg)
-        # segment rollover / source switch -> re-point the detections tailer. det_idx/last_idx are indices
-        # into cam['ser_path'], so reset them: index N in the old segment is a different frame than in the new.
+                                      hist=None, ser_path=seg)
+        # segment rollover / source switch: det_idx/last_idx are indices into cam['ser_path'],
+        # so reset them -- index N in the old segment is a different frame than in the new.
         if seg != cam['ser_path']:
-            cam['det_tailer'].close()
-            cam['det_tailer'] = JsonlTailer(os.path.join(args.session,
-                                                         seg[:-len('.ser')] + '.detections.jsonl'))
             cam['ser_path'] = seg
             cam['last_idx'] = cam['det_idx'] = -1
-        for rec in cam['det_tailer'].poll():
+        for rec in (_det_records(stream) if stream in roles else ()):
             cam['blobs'] = rec.get('blobs', [])
             cam['ext'] = rec.get('ext')                         # extended-detector metrics (or None)
             cam['status'] = rec.get('status')                   # detector's freeform status line (or None)
-            new_idx = rec.get('index', cam['det_idx'])          # an index into cam['ser_path'] (== seg)
+            # Detection indices only apply against the SAME cam segment the record was made on.
+            same_seg = (rec.get('seg', '') + '.ser') == cam['ser_path']
+            new_idx = rec.get('index', cam['det_idx']) if same_seg else cam['det_idx']
             if stream in perf['det']:                    # a detection record = one frame the detector ran;
                 perf['det'][stream].hit()                # an index gap = frames it skipped to keep up
                 if 0 <= cam['det_idx'] < new_idx:
@@ -1356,16 +1362,21 @@ def main(argv=None):
                 try:
                     info = json.load(open(bj))
                     ctrl['client'] = control.CommandClient(info['command_host'], info['command_port'])
+                    ctrl['state_shm'] = info.get('state_shm')
                 except (OSError, ValueError, KeyError):
                     ctrl['client'] = None
-        if ctrl['tailer'] is None:
-            sp = _newest(args.session, '_state.jsonl')
-            if sp:
-                ctrl['tailer'] = JsonlTailer(sp)
-        if ctrl['tailer'] is not None:
-            for rec in ctrl['tailer'].poll():
-                ctrl['state'] = rec
-                perf['mount'].hit()                       # each state record = one mount/backend update
+        if ctrl.get('slot') is None and ctrl.get('state_shm'):
+            try:
+                ctrl['slot'] = framestream.LatestSlot(name=ctrl['state_shm'])
+            except ValueError:
+                ctrl['slot'] = None                       # backend gone; retry after reconnect
+                ctrl['state_shm'] = None
+        if ctrl.get('slot') is not None:
+            got = ctrl['slot'].read()                     # latest-wins, pure memory read
+            if got and got[0] != ctrl.get('state_v'):
+                perf['mount'].hit(got[0] - (ctrl.get('state_v') or 0))   # meter true update count
+                ctrl['state_v'] = got[0]
+                ctrl['state'] = got[1]
         st = ctrl['state']
         _poll_focus_metrics()                           # tail focus metrics into the graphs
         # Auto-switch the main pane to follow the active tracking source (as if its ^ button were pressed):
@@ -1906,7 +1917,7 @@ def main(argv=None):
             imgui.tree_pop()
 
     # ---- main loop -----------------------------------------------------------------------------
-    wake = {'paths': (), 'state_path': None}
+    wake = {'paths': (), 'probes': (), 'state_slot': None}
     waker_stop = threading.Event()
     threading.Thread(target=_waker, args=(glfw, wake, waker_stop), daemon=True).start()
 
@@ -1917,12 +1928,14 @@ def main(argv=None):
         # v3: frames commit in RAM, so the waker PROBES shm headers directly (pure memory
         # reads, no syscalls) and stat-watches only the head files (segment/ended events),
         # detection sidecars, and the state file.
-        wake['probes'] = [seg for fo_ in followers.values() for seg in fo_.segs
-                          if seg._buf is not None]
+        wake['probes'] = ([seg for fo_ in followers.values() for seg in fo_.segs
+                           if seg._buf is not None]
+                          + [seg for fo_ in det_fos.values() for seg in fo_.segs
+                             if seg._buf is not None])
         paths = [framestream.head_path(args.session, name) for name in followers]
-        paths += [c['det_tailer'].path for c in cams.values()]
+        paths += [framestream.head_path(args.session, f'{r}_det') for r in det_fos]
         wake['paths'] = paths
-        wake['state_path'] = ctrl['tailer'].path if ctrl['tailer'] is not None else None
+        wake['state_slot'] = ctrl.get('slot')
         glfw.wait_events_timeout(0.25)
 
         update_control()

@@ -99,13 +99,16 @@ class FrameStream:
         self.frame_count = 0
 
     def open_segment(self, seg_ts, width, height, color_id=ser_mod.ColorId.MONO,
-                     pixel_depth=16, shm=True, cap=64, meta=None):
+                     pixel_depth=16, shm=True, cap=64, meta=None, raw=False):
         """Roll to a fresh segment. ``meta``: cold per-segment metadata (bin/roi/settings/...)
-        published in the header JSON alongside geometry and the extras schema."""
+        published in the header JSON alongside geometry and the extras schema. ``raw``: payloads
+        are variable-size byte blobs (JSON records, mjpeg, ...) -- width x height x depth only
+        sizes the worst-case heap slot; readers get 1-D bytes, not a reshaped image."""
         blob = json.dumps({'name': self.name, 'seg_ts': str(seg_ts), 'width': int(width),
                            'height': int(height), 'pixel_depth': int(pixel_depth),
                            'color_id': int(color_id), 'extras_fmt': self.extras_fmt,
-                           'extras': list(self.extras_names), **(meta or {})},
+                           'extras': list(self.extras_names), **({'raw': True} if raw else {}),
+                           **(meta or {})},
                           separators=(',', ':')).encode('utf-8')
         fb, rec_size, rec_off, heap_off, total = _layout(width, height, pixel_depth, cap,
                                                          self.extras_fmt, len(blob))
@@ -293,7 +296,10 @@ class SegmentReader:
 
     def read(self, i):
         rec = self.record(i)
-        arr = np.frombuffer(self._get(rec['off'], rec['len']), dtype=self._dtype)
+        raww = self._get(rec['off'], rec['len'])
+        if self.meta.get('raw'):
+            return raww                                      # variable-size byte payload, as-is
+        arr = np.frombuffer(raww, dtype=self._dtype)
         arr = arr.reshape(self._shape).copy()                # our own buffer, not the shared region
         arr.setflags(write=False)
         return arr
@@ -380,3 +386,63 @@ class StreamFollower:
         if self._head is not None:
             self._head.close()
             self._head = None
+
+
+# --------------------------------- latest-wins slot ----------------------------------------
+
+class LatestSlot:
+    """A latest-wins record slot in shared memory (the backend's state channel: written ~20 Hz,
+    where a per-frame LOG would be waste and a blocked file append stalls the CONTROL LOOP --
+    the loop that has to keep processing estop). Layout: [seq u64 | len u32 | pad | payload].
+    Single writer, seqlock: seq goes odd during a write, even after; readers retry on odd or
+    changed. version() = seq//2 = how many writes ever (consumers meter on deltas). Payload is
+    JSON -- one smallish record, parse cost irrelevant; what matters is that write() is pure
+    memory stores."""
+
+    _HDR = struct.Struct('<QII')
+
+    def __init__(self, name=None, cap=1 << 16, create=False):
+        if create:
+            self._shm = shared_memory.SharedMemory(create=True, size=self._HDR.size + cap,
+                                                   name=name or uuid.uuid4().hex)
+            self._shm.buf[:self._HDR.size] = self._HDR.pack(0, 0, 0)
+        else:
+            try:
+                self._shm = shared_memory.SharedMemory(name=name, create=False)
+            except (FileNotFoundError, OSError) as e:
+                raise ValueError(f"state slot {name} gone") from e
+        self.name = self._shm.name
+        self._cap = self._shm.size - self._HDR.size
+
+    def write(self, obj):
+        buf = self._shm.buf
+        payload = json.dumps(obj, separators=(',', ':')).encode('utf-8')
+        if len(payload) > self._cap:
+            raise ValueError(f"state record {len(payload)}B exceeds slot cap {self._cap}B")
+        seq = struct.unpack_from('<Q', buf, 0)[0]
+        struct.pack_into('<Q', buf, 0, seq + 1)              # odd: mid-write
+        buf[self._HDR.size:self._HDR.size + len(payload)] = payload
+        struct.pack_into('<I', buf, 8, len(payload))
+        struct.pack_into('<Q', buf, 0, seq + 2)              # even: committed
+
+    def read(self):
+        """(version, record) of the latest committed write, or None if none/torn (retry next
+        poll -- the writer is mid-store for microseconds at most)."""
+        buf = self._shm.buf
+        for _ in range(4):
+            seq = struct.unpack_from('<Q', buf, 0)[0]
+            if seq == 0 or seq & 1:
+                if seq == 0:
+                    return None
+                continue
+            n = struct.unpack_from('<I', buf, 8)[0]
+            raw = bytes(buf[self._HDR.size:self._HDR.size + n])
+            if struct.unpack_from('<Q', buf, 0)[0] == seq:
+                try:
+                    return seq // 2, json.loads(raw.decode('utf-8'))
+                except ValueError:
+                    return None                              # torn beyond repair this tick
+        return None
+
+    def close(self):
+        self._shm.close()

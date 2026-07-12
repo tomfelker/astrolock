@@ -18,6 +18,7 @@ image-op functions accept numpy or torch and return torch.
 
 import argparse
 import glob
+import json
 import math
 import os
 import time
@@ -786,6 +787,8 @@ def main(argv=None):
                    help="frame-diff at the peak must exceed this fraction of the peak to be 'moving'")
     p.add_argument('--poll', type=float, default=0.02, help="seconds between polls when caught up (live)")
     p.add_argument('--stop-file', default=None, help="stop when this file appears")
+    p.add_argument('--state-shm', default=None,
+                   help="backend state slot (shm name) for the predicted track ROI")
     p.add_argument('--device', default='auto',
                    help="torch device for detection: 'auto' (default) = cuda if present else cpu, "
                         "or force 'cpu' / 'cuda'")
@@ -804,7 +807,6 @@ def main(argv=None):
     # drains every frame in order. Temporal state (surprise) resets per segment, like before.
     fo = framestream.StreamFollower(args.session, args.role, keep_all=not args.follow)
     cur = None                                         # current SegmentReader
-    writer = None                                      # detections sidecar for the current segment
     prev = None
     surprise = new_surprise()
     dbg = {'stream': None}                             # debug detection-surface stream (rolls on its own)
@@ -812,12 +814,24 @@ def main(argv=None):
     scale = None
     total = 0
 
+    # Detections are a raw-payload framestream ({role}_det): each record is the JSON detection
+    # dict as a variable-size heap blob (+ 'seg' = the cam segment it indexes into). Committing
+    # one is a pure shm store, so a drive breather can't stall detection->tracking.
+    det_out = framestream.FrameStream(args.session, f'{args.role}_det')
+
+    def _emit(rec, i):
+        if det_out.frame_count == 0 and det_out._seg is None or det_out.full:
+            det_out.open_segment(session_mod.segment_stamp(), 1 << 17, 1, pixel_depth=8,
+                                 shm=args.shm_ser, cap=256, raw=True)
+        import numpy as _np
+        payload = (json.dumps({**rec, 'seg': cur.ident}, separators=(',', ':'))
+                   .encode('utf-8'))
+        det_out.write(_np.frombuffer(payload, _np.uint8),
+                      t_mono_ns=rec.get('t_mono_ns', 0), src_index=i)
+
     def switch_to(seg):
-        nonlocal cur, writer, prev, surprise, scale, next_index
-        if writer is not None:
-            writer.close()
+        nonlocal cur, prev, surprise, scale, next_index
         cur = seg
-        writer = JsonlWriter(os.path.join(args.session, seg.ident + '.detections.jsonl'))
         prev = None
         surprise = new_surprise()                      # fresh temporal state for the new segment
         scale = None
@@ -831,16 +845,20 @@ def main(argv=None):
     # Track-mode: tail the backend state for a predicted ROI around the target. When present (this
     # role is being tracked), detect just that small window with a single-peak/centroid pass instead
     # of the whole frame -- far higher framerate, which is when we most need it (the catch-up slew).
-    state = {'tailer': None, 'roi': None}
+    state = {'slot': None, 'roi': None, 'v': -1}
 
     def poll_state():
-        if state['tailer'] is None:
-            sf = sorted(glob.glob(os.path.join(args.session, '*_state.jsonl')))
-            if sf:
-                state['tailer'] = sidecar.JsonlTailer(sf[-1])
-        if state['tailer'] is not None:
-            for rec in state['tailer'].poll():
-                state['roi'] = (rec.get('track_roi') or {}).get(args.role)   # per-role: {role: [cx,cy,size]}
+        if state['slot'] is None and args.state_shm:
+            try:
+                state['slot'] = framestream.LatestSlot(name=args.state_shm)
+            except ValueError:
+                return                                   # backend slot not up (standalone run)
+        if state['slot'] is None:
+            return
+        got = state['slot'].read()                       # latest-wins, pure memory read
+        if got and got[0] != state['v']:
+            state['v'] = got[0]
+            state['roi'] = (got[1].get('track_roi') or {}).get(args.role)   # per-role [cx,cy,size]
 
     def process(i):
         nonlocal prev, scale, total
@@ -932,9 +950,9 @@ def main(argv=None):
                     b['px'] = [b['px'][0] * coord_scale, b['px'][1] * coord_scale]
                     if 'size_px' in b:
                         b['size_px'] = b['size_px'] * coord_scale
-        writer.append({'index': i, 't_mono_ns': time.perf_counter_ns(),
-                       'proc_ms': round((time.perf_counter() - t_start) * 1e3, 1),
-                       'blobs': blobs, 'status': status, **extra})
+        _emit({'index': i, 't_mono_ns': time.perf_counter_ns(),
+               'proc_ms': round((time.perf_counter() - t_start) * 1e3, 1),
+               'blobs': blobs, 'status': status, **extra}, i)
         # Debug movie of the detection surface: a parallel stream the GUI follows by name
         # ('<role>_debug'); shm-backed like the cams when --shm-ser (it's the same sustained-write
         # hazard), rolling on its own stamps when a shm segment fills.
@@ -983,9 +1001,6 @@ def main(argv=None):
                         worked = True
                     if seg.finalized() and next_index >= seg.committed():
                         stream_done = seg.stream_ended()
-                        if writer is not None:
-                            writer.close()
-                            writer = None
                         fo.release(seg)
                         cur = None
                         if stream_done:
@@ -998,8 +1013,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if writer is not None:
-            writer.close()
+        det_out.close()
         fo.close()
         close_debug()
         print(f"[detect:{args.role}] processed {total} frames", flush=True)

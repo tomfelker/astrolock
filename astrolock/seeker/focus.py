@@ -176,26 +176,22 @@ def main(argv=None):
     # Follow the cam stream chain; the star OUTPUT is one stream for the whole run, rolling
     # its own segments (fresh on every input-segment switch, and when a shm segment fills).
     fo = framestream.StreamFollower(args.session, args.role)
+    det_fo = framestream.StreamFollower(args.session, f'{args.role}_det')   # latest target blobs
     # Star stream: per-frame focus metrics ride as binary record extras (strehl None -> NaN;
     # 'present' is record flags bit 0). The GUI reads them straight from the section.
     out = framestream.FrameStream(args.session, f'{args.role}_focus',
                                   extras=('<6f', ['peak', 'strehl', 'dx', 'dy',
                                                   'com_rad_x', 'com_rad_y']))
     cur = None                                              # current input SegmentReader
-    det = None
     ema = None
 
     def switch_to(seg):
-        nonlocal cur, det, ema, scale
-        if det is not None:
-            det.close()
+        nonlocal cur, ema, scale
         cur = seg
         crop = _effective_crop(seg.header, args.crop)       # fits the analysis image; writer + EMA agree
         out.open_segment(session_mod.segment_stamp(), crop, crop,
                          color_id=ser_mod.ColorId.MONO, pixel_depth=16,
                          shm=args.shm_ser, cap=args.shm_frames)
-        stem = seg.frames_path[:-len('.frames.jsonl')]
-        det = JsonlTailer(stem + '.detections.jsonl')       # where the target is (this role's detector)
         ema = FocusEma(crop, args.search, args.alpha, scale=None)
         scale = None
 
@@ -209,9 +205,8 @@ def main(argv=None):
 
     def close_all():
         fo.close()
+        det_fo.close()
         out.close()
-        if det is not None:
-            det.close()
 
     def process(i):
         nonlocal scale, total, strehl_ref, strehl_done, rad_per_px
@@ -265,9 +260,14 @@ def main(argv=None):
         while True:
             if args.stop_file and os.path.exists(args.stop_file):
                 break
-            if det is not None:
-                for rec in det.poll():                # refresh the target location
-                    latest_blobs = rec.get('blobs', [])
+            det_fo.poll()                             # refresh the target location (latest record)
+            got_det = det_fo.latest()
+            if got_det is not None:
+                dseg, di = got_det
+                if getattr(dseg, '_used', -1) != di:
+                    dseg._used = di
+                    import json as _json
+                    latest_blobs = _json.loads(bytes(dseg.read(di)).decode('utf-8')).get('blobs', [])
             fo.poll()
             worked = False
             got = fo.latest()
