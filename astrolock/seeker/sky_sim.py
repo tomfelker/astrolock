@@ -29,6 +29,7 @@ import numpy as np
 from astrolock.seeker import bodies
 from astrolock.seeker.almanac import fix_record
 from astrolock.seeker.sidecar import JsonlWriter
+from astrolock.seeker.session import mono_ns
 
 
 def _enu_from_altaz(az_rad, alt_rad):
@@ -77,7 +78,7 @@ class SkyPublisher:
             self.sat_mag = args.target_mag + 2.5 * math.log10(npts)        # split flux over the points
 
         self.epoch = datetime.datetime.fromisoformat(args.epoch.replace('Z', '+00:00'))
-        self.perf0_ns = time.perf_counter_ns()                             # system time <-> sim epoch anchor
+        self.perf0_ns = mono_ns()                                          # system time <-> sim epoch anchor
 
     def _sf_secs(self, t_ns):
         """Seconds-from-epoch (as skyfield.ts.utc wants them) for system-time anchor(s) t_ns."""
@@ -169,7 +170,7 @@ def run(argv=None):
     while True:
         if args.stop_file and os.path.exists(args.stop_file):
             break
-        now = time.perf_counter_ns()
+        now = mono_ns()
 
         # Satellite: dense but low-volume (~68 points) -- write its whole chunk when due.
         if pub.sat and sat_next <= now + sat_lead_ns:

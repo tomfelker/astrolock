@@ -23,6 +23,7 @@ import math
 import enum
 
 import astrolock.model.telescope_connections.com_port
+from astrolock.seeker.session import mono_ns
 
 class CelestronNexstarDeviceIds(enum.IntEnum):
     DEV_ID_MAIN = 0x01
@@ -205,10 +206,10 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
             data[2] if len(data) > 2 else 0,
             response_len
         ])
-        write_start_time_ns = time.perf_counter_ns()
-        self.serial_stream.write(cmd)
+        write_start_time_ns = mono_ns()        # the canonical stamp clock: these times feed
+        self.serial_stream.write(cmd)          # t_mono_ns in the seeker's mount state
         response = self.serial_stream.read(response_len + 1)
-        read_finish_time_ns = time.perf_counter_ns()
+        read_finish_time_ns = mono_ns()
         if len(response) != response_len + 1 or response[response_len] != CelestronNexstarResponseCodes.HC_OK:  # '#'
             raise ConnectionError(f"Error reading {msg_id.name} from {dest_id.name}.")
         
@@ -220,8 +221,10 @@ class CelestronNexstarHCConnection(astrolock.model.telescope_connections.com_por
             print(f"Hmm, telescope responded too soon by {-thinking_time} s for {dest_id.name} {msg_id.name}")
         if not expect_delay and thinking_time > .1:
             print(f"Hmm, either telescope responded late or someone's hogging the GIL, thinking_time {thinking_time} s for {dest_id.name} {msg_id.name}")
-        self.last_message_thinking_mid_time_ns = write_start_time_ns + int(write_time + thinking_time / 2)
-        self.last_message_thinking_end_time_ns = write_start_time_ns + int(thinking_time)
+        # (write_time/thinking_time are SECONDS -- the 1e9 was missing, so the mid-message
+        # correction used to be a no-op of a few ns.)
+        self.last_message_thinking_mid_time_ns = write_start_time_ns + int((write_time + thinking_time / 2) * 1e9)
+        self.last_message_thinking_end_time_ns = write_start_time_ns + int(thinking_time * 1e9)
 
         return response[:-1]
 

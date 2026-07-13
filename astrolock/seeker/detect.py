@@ -951,7 +951,10 @@ def main(argv=None):
                     b['px'] = [b['px'][0] * coord_scale, b['px'][1] * coord_scale]
                     if 'size_px' in b:
                         b['size_px'] = b['size_px'] * coord_scale
-        _emit({'index': i, 't_mono_ns': time.perf_counter_ns(),
+        # The record's t_mono_ns is the FRAME'S capture time, never "now": the backend pairs the
+        # blobs with the mount pose at this instant, and our processing lag must not skew that.
+        frame_t_ns = cur.record(i)['t_mono_ns'] or session_mod.mono_ns()
+        _emit({'index': i, 't_mono_ns': frame_t_ns,
                'proc_ms': round((time.perf_counter() - t_start) * 1e3, 1),
                'blobs': blobs, 'status': status, **extra}, i)
         # Debug movie of the detection surface: a parallel stream the GUI follows by name
@@ -968,7 +971,7 @@ def main(argv=None):
             # A surprisal surface is in true sigma units -> FIXED scale (debug_hi, white = 10 sigma)
             # so standout is judgeable across frames; other surfaces autoscale per frame (hi=None).
             st.write(debug_frame_u16(debug_surface, hi=debug_hi),
-                     t_mono_ns=time.perf_counter_ns(), src_index=i)
+                     t_mono_ns=frame_t_ns, src_index=i)
         total += 1
 
     try:

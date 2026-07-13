@@ -347,7 +347,7 @@ def _open_sky(args, state_path=None, mount_path=None):
               f"{(1.0 / bw_interval) if bw_interval else float('inf'):.1f} fps)", flush=True)
 
         def capture_noop():
-            now_ns = time.perf_counter_ns()
+            now_ns = session_mod.mono_ns()
             exp = _live['exp']
             _bw_wait()
             return noop_frame, int(now_ns + 0.5 * exp * 1e9), now_ns + int(exp * 1e9)
@@ -402,13 +402,13 @@ def _open_sky(args, state_path=None, mount_path=None):
     sim.gain_mult = 10.0 ** (_live['gain_cb'] / 200.0)         # centibels -> linear signal multiplier
     S = args.sky_substeps
     fr = (torch.arange(S, dtype=torch.float64) + 0.5) / S      # (S,) substep mid-fractions
-    start_ns = time.perf_counter_ns()
+    start_ns = session_mod.mono_ns()
 
     def capture():
         # One shared system clock (perf_counter_ns / QPC) times everything -- the exposure substeps,
         # the mount-pose extrapolation, and the frame stamp -- so both cameras place a fast satellite
         # at the same world instant (no per-process epoch drift).
-        now_ns = time.perf_counter_ns()
+        now_ns = session_mod.mono_ns()
         if slot is not None or tailer is not None:
             if slot is not None:                 # state slot: latest-wins, pure memory read
                 got = slot.read()
@@ -757,11 +757,11 @@ def main(argv=None):
 
                     stream.write_pixels(frame)                # pixels flushed (may precede the commit line)
                     if avail_ns is not None:                   # hold the commit until the exposure really ends
-                        wait = (avail_ns - time.perf_counter_ns()) * 1e-9
+                        wait = (avail_ns - session_mod.mono_ns()) * 1e-9   # avail_ns is on the mono clock
                         if wait > 0:
                             time.sleep(wait)
                     stream.commit(                             # the commit: one shm store
-                        t_mono_ns=cap_t_ns if cap_t_ns is not None else time.perf_counter_ns(),
+                        t_mono_ns=cap_t_ns if cap_t_ns is not None else session_mod.mono_ns(),
                         t_utc_ns=time.time_ns(),
                         src_index=frames_in_file)
                     frames_in_file += 1

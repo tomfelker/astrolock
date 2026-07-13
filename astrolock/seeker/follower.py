@@ -71,16 +71,6 @@ class SerFollower:
         seg = self._newest()
         return _seg_id(seg) if seg is not None else None
 
-    def frame_time_ns(self, index):
-        """t_mono_ns of frame ``index`` in the CURRENT segment (None if not committed)."""
-        seg = self._newest()
-        if seg is None:
-            return None
-        try:
-            return seg.record(index)['t_mono_ns']
-        except IndexError:
-            return None
-
     @property
     def segs(self):
         """The held SegmentReaders (for in-memory wake probes)."""

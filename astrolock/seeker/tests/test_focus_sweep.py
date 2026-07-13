@@ -66,11 +66,11 @@ def test_focus_sweep():
                 focuser.open_segment(session_mod.segment_stamp(), 1 << 12, 1, pixel_depth=8,
                                      cap=256, raw=True)
             focuser.write(np.frombuffer(json.dumps({'pos': pos}).encode('utf-8'), np.uint8),
-                          t_mono_ns=time.monotonic_ns())
+                          t_mono_ns=session_mod.mono_ns())
         if pos is not None:                              # the "focus process": known peak curve
             if focus._seg is None or focus.full:
                 focus.open_segment(session_mod.segment_stamp(), 8, 8, cap=64)
-            focus.write(frame, t_mono_ns=time.monotonic_ns(),
+            focus.write(frame, t_mono_ns=session_mod.mono_ns(),
                         extras=(0.5, _peak_of(pos), 20.0, 0.5, 0.0, 0.0, math.nan, math.nan))
         time.sleep(0.005)
     th.join(10)

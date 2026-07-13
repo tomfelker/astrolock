@@ -10,6 +10,33 @@ File naming: ``<ts>_<role>.<kind>`` where kind is ``ser`` (pixels), ``frames.jso
 
 import datetime
 import os
+import time
+
+
+# Deliberate poison offset on the shared timeline. The epoch of perf_counter is arbitrary
+# (~boot, magnitude ~1e14 ns), so a stamp that BYPASSES mono_ns() would only be subtly wrong.
+# Shifting our timeline by ~95 years makes any mix loudly absurd: a raw perf_counter_ns stamp
+# reads ~95 years in the past, and a UTC time_ns mixup (~1.8e18 until 2065) is off by decades.
+# Still comfortably inside int64 (9.2e18) for the '<q' record fields.
+_EPOCH_OFFSET_NS = 3_000_000_000 * 1_000_000_000
+
+
+def mono_ns():
+    """THE clock for every cross-process stamp: frame capture times, detection records,
+    focuser position reports, state blobs, sim-time anchors, mount angle times.
+    perf_counter_ns (QPC on Windows, CLOCK_MONOTONIC on Linux -- one machine-wide timeline,
+    valid to subtract across processes) plus a deliberate ~95-year offset so a stamp from any
+    OTHER source (bare time.*_ns()) is instantly, unmissably wrong instead of subtly late.
+    Data that leaves a process is stamped with this and nothing else; process-local
+    durations/pacing may use time.perf_counter()."""
+    return time.perf_counter_ns() + _EPOCH_OFFSET_NS
+
+
+def mono_s():
+    """mono_ns() in float seconds -- for control code whose 'now' meets stamped capture times
+    (servo horizons, pose-history interpolation). Same poisoned timeline, so mixing in a raw
+    time.perf_counter() 'now' is ~95 years off and fails immediately, not subtly."""
+    return mono_ns() * 1e-9
 
 
 def utc_stamp(dt=None):

@@ -98,7 +98,7 @@ def main(argv=None):
             out.open_segment(session_mod.segment_stamp(), 1 << 14, 1, pixel_depth=8,
                              cap=256, raw=True)
         payload = json.dumps(state, separators=(',', ':')).encode('utf-8')
-        out.write(np.frombuffer(payload, np.uint8), t_mono_ns=time.monotonic_ns())
+        out.write(np.frombuffer(payload, np.uint8), t_mono_ns=session_mod.mono_ns())
 
     def next_position_report(after_ns, want):
         """Newest position report at ~want stamped after the request, else None."""
@@ -110,7 +110,7 @@ def main(argv=None):
                 rec = seg.record(i)
                 blob = json.loads(bytes(seg.read(i)).decode('utf-8'))
                 i += 1
-                t = rec['t_mono_ns'] or time.monotonic_ns()
+                t = rec['t_mono_ns'] or session_mod.mono_ns()
                 if t >= after_ns and abs(float(blob.get('pos', math.nan)) - want) <= tol:
                     hit = t
             seg._used = i
@@ -156,7 +156,7 @@ def main(argv=None):
             want = round(float(pos), 6)
             publish(step=k + 1, want_pos=want, awaiting='position', collected=0)
             print(f"[sweep:{args.role}] step {k + 1}/{steps}: focus to {want}", flush=True)
-            req_ns = time.monotonic_ns()
+            req_ns = session_mod.mono_ns()
             t_ok = None
             while t_ok is None and not stop.is_set() and not fo_hfd.ended():
                 t_ok = next_position_report(req_ns, want)

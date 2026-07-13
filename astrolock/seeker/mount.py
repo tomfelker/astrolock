@@ -27,6 +27,7 @@ import threading
 import time
 
 from astrolock.seeker.sidecar import JsonlWriter
+from astrolock.seeker.session import mono_ns
 
 
 def _wrap_pi(a):
@@ -74,7 +75,7 @@ class SimMount(Mount):
         self._stop = False
         self._last = time.perf_counter()
         self._wall0 = self._last
-        self._angle_t_ns = time.perf_counter_ns()   # when the reported angles were valid
+        self._angle_t_ns = mono_ns()                # when the reported angles were valid
         # Ground-truth trajectory sidecar for the sim camera: piecewise-linear anchors
         # {t, angle, rate}, one whenever the actual rate changes. This is the mount's *real* plan
         # (continuous by construction), as opposed to the backend's reconstructed estimate -- so the
@@ -109,7 +110,7 @@ class SimMount(Mount):
                 # and keep going, so a near-zenith meridian crossing tips over rather than whipping az.
                 self._az = (self._az + self._rate[0] * dt) % (2 * math.pi)
                 self._alt = (self._alt + self._rate[1] * dt) % (2 * math.pi)
-                self._angle_t_ns = time.perf_counter_ns()
+                self._angle_t_ns = mono_ns()
                 changed = False
                 for ax in (0, 1):
                     dv = _clamp(self._cmd[ax] - self._rate[ax], -self._accel * dt, self._accel * dt)
@@ -166,7 +167,7 @@ class CelestronMount(Mount):
         self._desired = [0.0, 0.0]
         self._angles = [az0_rad, alt0_rad]
         self._rates = [0.0, 0.0]
-        self._angle_t_ns = time.perf_counter_ns()
+        self._angle_t_ns = mono_ns()
         self._stop = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -218,7 +219,7 @@ class NullMount(Mount):
     def __init__(self, az0_rad=0.0, alt0_rad=0.0, site=None):
         self._az, self._alt = az0_rad, alt0_rad
         self._site = dict(site) if site else {}
-        self._t_ns = time.perf_counter_ns()
+        self._t_ns = mono_ns()
 
     def set_rates(self, az_rad_s, alt_rad_s):
         pass

@@ -19,6 +19,7 @@ import time
 import torch
 
 from astrolock.seeker import ser as ser_mod
+from astrolock.seeker.session import mono_ns
 from astrolock.seeker.sidecar import JsonlWriter
 
 
@@ -55,7 +56,7 @@ def main(argv=None):
         cur = load(i)
         diff = ((cur - ref).abs() * args.scale).clamp(0, hi).to(torch.int32)
         writer.write_frame(diff.cpu().numpy().astype('uint16'))
-        sidecar.append({'t_mono_ns': time.perf_counter_ns(), 'important': True})
+        sidecar.append({'t_mono_ns': mono_ns(), 'important': True})
         if args.ema > 0.0:
             ref += args.ema * (cur - ref)                # EMA background (low-noise static scene)
         else:
