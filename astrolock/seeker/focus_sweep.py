@@ -141,6 +141,16 @@ def main(argv=None):
     points = []                                # (pos, peak_frame) for every unsaturated frame
     sat = total = 0
     aborted = False
+
+    def pts_out(window=(), want=None):
+        """Completed-step points + the in-progress window, for the GUI's LIVE curve: the plot is
+        most valuable exactly when a sweep goes wrong, so it can't wait for the final blob.
+        Saturated frames are INCLUDED here (the GUI paints them red -- an all-red wall is the
+        clearest possible 'reduce exposure'); only the fit excludes them."""
+        out_pts = [[p_, round(v, 4)] for p_, v in points]
+        out_pts += [[want, round(pf, 4)] for pf in window]
+        return out_pts
+
     try:
         for k, pos in enumerate(positions):
             want = round(float(pos), 6)
@@ -163,20 +173,20 @@ def main(argv=None):
                 if fo_hfd.ended() and not fo_hfd.segs:
                     break
                 if len(window) != n0:
-                    publish(collected=len(window))
+                    publish(collected=len(window), points=pts_out(window, want))
                 else:
                     time.sleep(args.poll)
             if stop.is_set():
                 break
-            points.extend((want, pf) for pf in window if pf < SAT_PEAK)  # saturated = no info
+            points.extend((want, pf) for pf in window)
             sat += sum(1 for pf in window if pf >= SAT_PEAK)
             total += len(window)
         aborted = stop.is_set() or total == 0
     finally:
-        result = {'done': True, 'aborted': aborted,
-                  'points': [[p_, round(v, 4)] for p_, v in points],
+        result = {'done': True, 'aborted': aborted, 'points': pts_out(),
                   'sat_frac': round(sat / total, 3) if total else 0.0}
-        fit = fit_vcurve(points) if len(points) >= 3 and not aborted else None
+        usable = [q for q in points if q[1] < SAT_PEAK]    # a clipped peak carries no focus info
+        fit = fit_vcurve(usable) if len(usable) >= 3 and not aborted else None
         if fit is not None:
             p0, peak0, _ = fit
             result.update(p0=round(p0, 4), peak0=round(peak0, 4),
@@ -184,7 +194,11 @@ def main(argv=None):
             print(f"[sweep:{args.role}] best focus p0={p0:.4g} (peak {peak0:.2f}, "
                   f"{total} frames, sat {result['sat_frac']:.0%})", flush=True)
         elif not aborted:
-            result['error'] = 'no minimum found (focus not bracketed, or data too noisy)'
+            if total and sat / total >= 0.5:
+                result['error'] = (f"star saturated in {sat}/{total} frames (excluded from the "
+                                   "fit) -- reduce exposure and re-sweep")
+            else:
+                result['error'] = 'no best-focus vertex found (focus not bracketed, or data too noisy)'
             print(f"[sweep:{args.role}] fit failed: {result['error']}", flush=True)
         else:
             print(f"[sweep:{args.role}] aborted", flush=True)

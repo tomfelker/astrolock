@@ -28,6 +28,7 @@ or a recording (where you'd tune it offline).
 
 import argparse
 import glob
+import math
 import os
 import time
 
@@ -146,6 +147,8 @@ class FocusEma:
         pk = int(torch.argmax(_find_blur(region, self.find_sigma)))
         py, px = pk // region.shape[1], pk % region.shape[1]
         star, _, _ = _crop(work, rx0 + px, ry0 + py, self.crop)
+        # NEVER clear a live EMA (user 2026-07-13): a finder hiccup blending through the average
+        # beats restarting it -- the crop is target-locked, so a wrong frame fades in ~1/alpha.
         if self.ema is None or self.ema.shape != star.shape:
             self.ema = star.clone()
             self.peak_meter = star.clone()
@@ -245,16 +248,22 @@ def main(argv=None):
     ema = None
 
     def switch_to(seg):
-        nonlocal cur, ema, scale
+        nonlocal cur, ema, scale, strehl_done
         cur = seg
         crop = _effective_crop(seg.header, args.crop)       # fits the analysis image; writer + EMA agree
         out.open_segment(session_mod.segment_stamp(), crop, crop,
                          color_id=ser_mod.ColorId.MONO, pixel_depth=16,
                          shm=args.shm_ser, cap=args.shm_frames)
-        ema = FocusEma(crop, args.search, args.alpha, scale=None, find_sigma=find_sigma0())
+        # The EMA SURVIVES segment rolls (they're just the stream's paging, ~every few seconds);
+        # it only rebuilds when the geometry actually changes -- never cleared otherwise.
+        if ema is None or ema.crop != crop:
+            fs = ema.find_sigma if ema is not None else find_sigma0()
+            ema = FocusEma(crop, args.search, args.alpha, scale=None, find_sigma=fs)
+            strehl_done = False                             # the ideal PSF is crop-sized: rebuild
         scale = None
 
     latest_blobs = []
+    latest_tracking = False        # blobs are only trusted when they answer a tracker lock
     next_index = 0
     scale = None
     total = 0
@@ -296,11 +305,13 @@ def main(argv=None):
                 ideal = torch.zeros((ema.crop, ema.crop), device=device)   # perfect point source
                 ideal[ema.crop // 2, ema.crop // 2] = 1.0
             strehl_ref = _normalized_peak(ideal)
-        # Target in WORK px: the detector's strongest blob (its px are frame coords), else the frame's
-        # global brightest pixel -- so we lock a star even before/without any detection.
-        present = bool(latest_blobs)
-        if present:
-            fx, fy = latest_blobs[0]['px']
+        # Target in WORK px. A detection steers us ONLY when it answers a tracker lock (the
+        # detector's ROI/tracking phase): acquisition blobs jiggle and the extended detector is
+        # for resolved targets, not stars. Untracked = the frame's matched-filtered brightest
+        # pixel, full frame -- the brightest star is a steadier choice than any detector guess.
+        present = bool(latest_blobs) and latest_tracking
+        if present:                                # strongest blob (detect emits in tile order)
+            fx, fy = max(latest_blobs, key=lambda b: b.get('score', 0.0))['px']
             target = (fx / coord_scale, fy / coord_scale)
         else:
             pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))   # hot pixels can't win
@@ -329,7 +340,9 @@ def main(argv=None):
                 if getattr(dseg, '_used', -1) != di:
                     dseg._used = di
                     import json as _json
-                    latest_blobs = _json.loads(bytes(dseg.read(di)).decode('utf-8')).get('blobs', [])
+                    d = _json.loads(bytes(dseg.read(di)).decode('utf-8'))
+                    latest_blobs = d.get('blobs', [])
+                    latest_tracking = bool(d.get('tracking'))
             fo.poll()
             worked = False
             seg = fo.segs[0] if fo.segs else None      # SEQUENTIAL: exactly one EMA sample per
@@ -337,6 +350,7 @@ def main(argv=None):
                 if seg is not cur:
                     switch_to(seg)
                     latest_blobs = []
+                    latest_tracking = False
                     next_index = 0
                 n = min(seg.committed(), next_index + 8)   # catch up in bounded bites (stay live)
                 while next_index < n:

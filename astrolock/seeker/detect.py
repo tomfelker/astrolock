@@ -915,6 +915,7 @@ def main(argv=None):
             else:
                 debug_surface, debug_hi = work, None
             status = "Locked On" if blobs else "Searching"
+            extra = {'tracking': True}         # these blobs answer a tracker lock, not acquisition
         else:                                                      # acquisition: full-frame multi-blob
             if args.detector == 'surprise':
                 # Tile-extremum pass: fixed targets from the running mean, movers from the signed

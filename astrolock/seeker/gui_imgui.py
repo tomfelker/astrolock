@@ -416,8 +416,9 @@ def main(argv=None):
                 'alpha': 0.05,                            # star-crop EMA smoothing (relaunch-tier)
                 'com_rad': (0.0, 0.0),                    # latest CoM offset (radians) for the screw dial
                 'series': {k: [] for k in ('t', 'peak', 'peakf', 'hfd', 'strehl', 'dx', 'dy')}}
-    sweep_ui = {'start': 0.0, 'end': 10.0, 'steps': 9, 'frames': 40,  # focus sweep (human actuator)
+    sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0, 'frames': 40,  # focus sweep (human actuator)
                 'role': None, 'fo': None, 'state': None,              # prompt/result stream tail
+                'confirmed': None,                                    # last position we OK'd
                 'writer': None, 'writer_role': None}                  # our position-report stream
     FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
@@ -425,6 +426,8 @@ def main(argv=None):
     ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'track_delay': f"{track_ui['delay']:g}",
                   'sim_r0': f"{sim_ui['r0']:g}", 'track_smooth': f"{track_ui['smoothing']:g}",
                   'focus_alpha': f"{focus_ui['alpha']:g}", 'focus_com_mult': f"{focus_ui['com_mult']:g}",
+                  'sweep_start': f"{sweep_ui['start']:g}", 'sweep_end': f"{sweep_ui['end']:g}",
+                  'sweep_step': f"{sweep_ui['step']:g}",
                   'settings_name': ''},
           'src': {},                                      # role -> unified source dropdown value
           'rec': {r: False for r in roles}, 'autorec': {r: False for r in roles},
@@ -681,36 +684,39 @@ def main(argv=None):
             _draw_turn_arc(dl, A, sx, sy, S(15), t)
             _text(dl, A(sx - S(11), sy + S(13)), f"{t:+.2f}", S(12), _SCREW_COL)
 
-    def _draw_sweep_curve(stt):
-        """Little focus curve in the Focus panel: every collected (position, peak_frame)
-        frame as a dot, the fitted best-focus position as a vertical line. Instantly shows a
-        bad sweep (saturated plateau, wind gust, range that didn't bracket focus)."""
+    def _draw_sweep_curve(dl, A, gx0, gy1, W, stt):
+        """Sweep peak-vs-position curve on the STAR PANE, stacked under the focus graph: every
+        collected frame as a dot (red = saturated, excluded from the fit), the fitted best-focus
+        position as a vertical line. Returns the vertical space consumed (0 = nothing drawn)."""
         pts = stt.get('points') or []
         if len(pts) < 3:
-            return
-        dl = imgui.get_window_draw_list()
-        x0, y0 = imgui.get_cursor_screen_pos()
-        W, H = S(248), S(96)
+            return 0
+        H = S(80)
+        gy0 = gy1 - H
         xs = [p_ for p_, _h in pts]
         ys = [h_ for _p, h_ in pts]
         pl, ph = min(xs), max(xs)
+        if ph <= pl:                                       # first step: one position so far
+            pl, ph = pl - 0.5, ph + 0.5
         hh = (max(ys) * 1.05) or 1.0
-        if ph <= pl:
-            return
 
         def PX(p_):
-            return x0 + S(4) + (W - S(8)) * (p_ - pl) / (ph - pl)
+            return gx0 + S(4) + (W - S(8)) * (p_ - pl) / (ph - pl)
 
         def PY(h_):
-            return y0 + H - S(4) - (H - S(8)) * h_ / hh
-        dl.add_rect_filled((x0, y0), (x0 + W, y0 + H), C((0, 0, 0, 120)))
-        dl.add_rect((x0, y0), (x0 + W, y0 + H), C((150, 155, 172, 170)), 0.0, 1.0)
+            return gy1 - S(4) - (H - S(8)) * min(h_, hh) / hh
+        dl.add_rect_filled(A(gx0 - S(4), gy0 - S(4)), A(gx0 + W + S(4), gy1 + S(4)), C((0, 0, 0, 150)))
         for p_, h_ in pts:
-            dl.add_circle_filled((PX(p_), PY(h_)), S(1.5), C((120, 220, 255, 160)))
+            sat_ = h_ >= 0.98                              # clipped: excluded from the fit
+            dl.add_circle_filled(A(PX(p_), PY(h_)), S(1.5),
+                                 C((235, 100, 100, 200) if sat_ else (120, 220, 255, 180)))
         p0 = stt.get('p0')
         if p0 is not None and pl <= p0 <= ph:
-            dl.add_line((PX(p0), y0 + S(2)), (PX(p0), y0 + H - S(2)), C((255, 190, 90, 220)), 1.2)
-        imgui.dummy((W, H + S(4)))
+            dl.add_line(A(PX(p0), gy0 + S(2)), A(PX(p0), gy1 - S(2)), C((255, 190, 90, 220)), 1.2)
+        dl.add_rect(A(gx0, gy0), A(gx0 + W, gy1), C((150, 155, 172, 170)), 0.0, 1.0)
+        lbl = f"sweep p0 {p0:g}" if p0 is not None else "sweep"
+        _text(dl, A(gx0, gy0 - S(16)), lbl, S(12), (255, 190, 90, 235))
+        return H + S(26)
 
     def _draw_placeholder(dl, A, SW, SH, lines):
         """Centred multi-line placeholder text (a str is treated as one line)."""
@@ -884,27 +890,27 @@ def main(argv=None):
             sc = focus_ui['series']
             GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
             gx1, gy1 = SW - mgn, SH - mgn
-            gx0, gy0 = gx1 - GW, gy1 - GH
+            gx0 = gx1 - GW
+            # Sweep curve takes the bottom slot; the focus graph (and the dial above it) stack up.
+            gy1 -= _draw_sweep_curve(dl, A, gx0, gy1, GW, sweep_ui['state'] or {})
+            gy0 = gy1 - GH
             strehls = sc['strehl']
             use_str = bool(strehls) and strehls[-1] is not None
             series = [v if v is not None else 0.0 for v in strehls] if use_str else sc['peak']
             if len(series) >= 2:
-                hi = 1.0 if use_str else (max(sc['peak']) or 1.0)     # Strehl 0..1; raw peak auto-scales
+                # Both series draw min..max autoscaled: a focus graph is about the TREND, and a
+                # fixed 0..1 axis glued a 0.03-Strehl line to the border (read as "no graph").
+                # The label carries the absolute numbers.
+                lo, hi = min(series), max(series)
+                span = (hi - lo) or 1.0
                 label = f"Strehl {strehls[-1]:.2f}" if use_str else f"focus peak {sc['peak'][-1]:.3f}"
                 dl.add_rect_filled(A(gx0 - S(4), gy0 - S(4)), A(gx1 + S(4), gy1 + S(4)), C((0, 0, 0, 150)))
                 n = len(series)
-                pts = [A(gx0 + GW * i / (n - 1), gy1 - GH * min(1.0, v / hi)) for i, v in enumerate(series)]
+                pts = [A(gx0 + GW * i / (n - 1), gy1 - GH * max(0.0, min(1.0, (v - lo) / span)))
+                       for i, v in enumerate(series)]
                 dl.add_polyline(pts, C((120, 220, 255, 235)), 1.4, 0)
-                hfds = [v for v in sc['hfd'] if v is not None]
-                if len(hfds) >= 2 and hfds[-1] > 0:        # per-frame HFD: THE focus series (smaller = better)
-                    hh = max(hfds) or 1.0
-                    hn = len(sc['hfd'])
-                    hp = [A(gx0 + GW * i / (hn - 1), gy1 - GH * min(1.0, (v or 0.0) / hh))
-                          for i, v in enumerate(sc['hfd'])]
-                    dl.add_polyline(hp, C((255, 190, 90, 235)), 1.4, 0)
-                    label += f"  HFD {hfds[-1]:.1f}px"
                 dl.add_rect(A(gx0, gy0), A(gx1, gy1), C((150, 155, 172, 170)), 0.0, 1.0)
-                _text(dl, A(gx0, gy0 - S(16)), label, S(12), (180, 205, 235, 235))
+                _text(dl, A(gx0, gy0 - S(16)), label, S(12), (120, 220, 255, 235))
             Rd = S(38)
             ox_, oy_ = focus_ui['com_rad']
             off = (-ox_ if focus_ui['invert_x'] else ox_, -oy_ if focus_ui['invert_y'] else oy_)
@@ -1319,14 +1325,20 @@ def main(argv=None):
     # answer the same requests -- the sweep can't tell the difference.
     def _sweep_start():
         role = focus_ui['role']
-        sweep_ui['role'], sweep_ui['state'] = role, None
+        sweep_ui['role'], sweep_ui['state'], sweep_ui['confirmed'] = role, None, None
         if sweep_ui['fo'] is not None:
             sweep_ui['fo'].close()
         sweep_ui['fo'] = framestream.StreamFollower(args.session, f'{role}_sweep', keep_all=True)
         if not focus_ui['want']:
             _focus_start(role)                            # the sweep feeds on the focus stream
+        sweep_ui['start'] = _flt(ui['txt']['sweep_start'], sweep_ui['start'])   # parsed only here
+        sweep_ui['end'] = _flt(ui['txt']['sweep_end'], sweep_ui['end'])
+        sweep_ui['step'] = abs(_flt(ui['txt']['sweep_step'], sweep_ui['step']))
+        span = abs(sweep_ui['end'] - sweep_ui['start'])
+        step = sweep_ui['step'] or 1.0                     # UI takes a step SIZE; the process wants a count
+        steps = max(3, min(201, int(round(span / step)) + 1))
         _send({'type': 'sweep', 'on': True, 'role': role, 'start': sweep_ui['start'],
-               'end': sweep_ui['end'], 'steps': sweep_ui['steps'], 'frames': sweep_ui['frames']})
+               'end': sweep_ui['end'], 'steps': steps, 'frames': sweep_ui['frames']})
 
     def _sweep_abort():
         _send({'type': 'sweep', 'on': False})
@@ -1345,6 +1357,7 @@ def main(argv=None):
                            cap=256, raw=True)
         payload = json.dumps({'pos': pos}, separators=(',', ':')).encode('utf-8')
         w.write(np.frombuffer(payload, np.uint8), t_mono_ns=time.monotonic_ns())
+        sweep_ui['confirmed'] = pos
 
     def _poll_sweep():
         """Tail the sweep's state blobs (latest wins) into sweep_ui['state']."""
@@ -1933,38 +1946,39 @@ def main(argv=None):
                  "fit (1/peak is quadratic in focuser position); the vertex is best focus. Keep "
                  "the star UNSATURATED (50-80% full well) -- clipped frames are excluded. "
                  "An electronic focuser will later answer the same prompts unattended.")
+            # Plain text boxes: nothing reads them until Start Sweep, which parses them then.
             imgui.same_line()
             imgui.set_next_item_width(S(56))
-            ch, v = imgui.input_float("##sweep_start", sweep_ui['start'], 0.0, 0.0, "%g", ENTER)
-            if ch:
-                sweep_ui['start'] = float(v)
+            _ch, ui['txt']['sweep_start'] = imgui.input_text('##sweep_start', ui['txt']['sweep_start'])
             imgui.same_line()
             imgui.text_colored(C4(140, 145, 160), "to")
             imgui.same_line()
             imgui.set_next_item_width(S(56))
-            ch, v = imgui.input_float("##sweep_end", sweep_ui['end'], 0.0, 0.0, "%g", ENTER)
-            if ch:
-                sweep_ui['end'] = float(v)
+            _ch, ui['txt']['sweep_end'] = imgui.input_text('##sweep_end', ui['txt']['sweep_end'])
             imgui.same_line()
-            imgui.set_next_item_width(S(64))
-            ch, v = imgui.input_int("##sweep_steps", sweep_ui['steps'], 0)
-            if ch:
-                sweep_ui['steps'] = max(3, int(v))
+            imgui.text_colored(C4(140, 145, 160), "step")
             imgui.same_line()
-            imgui.text_colored(C4(140, 145, 160), "steps")
+            imgui.set_next_item_width(S(56))
+            _ch, ui['txt']['sweep_step'] = imgui.input_text('##sweep_step', ui['txt']['sweep_step'])
             sw_running = bool((st.get('sweep') or {}).get('running'))
             if imgui.button('Abort Sweep' if sw_running else 'Start Sweep', (S(200), 0)):
                 _sweep_abort() if sw_running else _sweep_start()
             stt = sweep_ui['state'] or {}
             if sw_running and stt and not stt.get('done'):
-                step = f"step {stt.get('step', '?')}/{stt.get('of', '?')}"
-                if stt.get('awaiting') == 'position':
-                    imgui.text(f"{step}: set focuser to {stt.get('want_pos', 0):g}")
-                    if imgui.button("OK -- it's there", (S(200), 0)):
-                        _sweep_ok(stt.get('want_pos', 0.0))
-                else:
-                    imgui.text(f"{step}: hold still -- collecting "
-                               f"{stt.get('collected', 0)}/{stt.get('need', 0)} frames")
+                # Fixed three-line layout -- the OK button is ALWAYS present (disabled while
+                # collecting) so nothing reflows as the sweep advances.
+                awaiting = stt.get('awaiting') == 'position'
+                conf = sweep_ui.get('confirmed')
+                imgui.text(f"Current focus: {'--' if conf is None else f'{conf:g}'}")
+                imgui.text(f"Commanded focus: {stt.get('want_pos', 0):g}")
+                imgui.same_line()
+                imgui.begin_disabled(not awaiting)
+                if imgui.button("OK##sweep_ok", (S(64), 0)):
+                    _sweep_ok(stt.get('want_pos', 0.0))
+                imgui.end_disabled()
+                imgui.text(f"Step {stt.get('step', '?')}/{stt.get('of', '?')}"
+                           + ("" if awaiting else
+                              f" -- collecting {stt.get('collected', 0)}/{stt.get('need', 0)}"))
             elif stt.get('done'):
                 if stt.get('aborted'):
                     _grey("Sweep aborted.")
@@ -1972,14 +1986,15 @@ def main(argv=None):
                     imgui.text(f"Best focus: {stt['p0']:g}  (peak {stt.get('peak0', 0):.2f})")
                     if not stt.get('bracketed', True):
                         imgui.text_colored(C4(235, 180, 90),
-                                           "minimum is OUTSIDE the swept range -- re-sweep around it")
+                                           "best focus is OUTSIDE the swept range -- re-sweep around it")
                     if stt.get('sat_frac', 0) > 0.2:
                         imgui.text_colored(C4(235, 180, 90),
                                            f"{stt['sat_frac']:.0%} of frames saturated -- "
                                            "reduce exposure and re-sweep")
                 elif stt.get('error'):
                     imgui.text_colored(C4(235, 120, 120), stt['error'])
-                _draw_sweep_curve(stt)
+            if stt.get('points'):
+                _grey("The sweep curve draws on the star (main pane), under the focus graph.")
             imgui.tree_pop()
         if imgui.tree_node_ex("Tracking"):
             cap = st.get('capturing') or {}
