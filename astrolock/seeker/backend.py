@@ -731,14 +731,16 @@ def main(argv=None):
                 break
 
     def frame_binning(role):
-        """Sensor pixels per frame pixel for a role (from the cam's frame sidecar; default 1)."""
-        sp = followers[role].ser_path
-        if not sp:
+        """Sensor pixels per frame pixel for a role, from the live segment's header meta.
+        (v3 killed the frames.jsonl sidecar this used to read -- the dead lookup silently
+        returned 1.0, halving the reconstruction plate scale for a 2x2-binned cam: pixel
+        motion then cancelled only HALF the mount motion, so a fixed target appeared to flee
+        at half the slew rate and every lock overshot.)"""
+        segs = followers[role].segs
+        if not segs:
             return 1.0
-        for r in sidecar.read_complete_lines(sp[:-len('.ser')] + '.frames.jsonl'):
-            if 'bin' in r:
-                return float(r['bin'][0])
-        return 1.0
+        b = (segs[-1].meta or {}).get('bin')
+        return float(b[0]) if b else 1.0
 
     def _detector_for(role):
         return getattr(args, f'{role}_detector', None) or args.detector
