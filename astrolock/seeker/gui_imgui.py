@@ -83,7 +83,9 @@ ROLES = ('guide', 'main')      # the two fixed roles: a wide guide cam that poin
 
 PANEL_W = 320                    # default right-panel width (logical px, pre-DPI)
 PANEL_MIN_W = 220
-ZOOM_MULTS = (1, 2, 4, 8, 16)    # zoom is a multiplier over the auto power-of-two fit (1 = fit-to-pane)
+ZOOM_MULTS = (0.25, 0.5, 1, 2, 4, 8, 16)   # multiplier over the auto power-of-two fit (1 = fit-to-pane;
+                                            # <1 zooms OUT -- a tiny focus crop auto-fits at ~16x, where
+                                            # '-' used to be pinned at the floor and felt dead)
 MAXPIP = 4                       # pool of PIP panes along the bottom; each shows a stream not in the big pane
 
 
@@ -509,7 +511,7 @@ def main(argv=None):
 
     def _zoom_step(stream, delta):
         s = view_settings.setdefault(stream, _default_settings())
-        i = ZOOM_MULTS.index(s['zoom']) if s['zoom'] in ZOOM_MULTS else 0
+        i = ZOOM_MULTS.index(s['zoom']) if s['zoom'] in ZOOM_MULTS else ZOOM_MULTS.index(1)
         s['zoom'] = ZOOM_MULTS[max(0, min(len(ZOOM_MULTS) - 1, i + delta))]
 
     # ---- per-stream camera data (GL textures + frames + detections) --------------------------
@@ -920,14 +922,16 @@ def main(argv=None):
             npts = len(sc['dx'])
             if npts:
                 mult = focus_ui['com_mult']
-                ctr = cam['fw'] / 2.0                     # crop centre in frame px (mono crop, ox == 1)
-                cgx, cgy = T(ctr, ctr)
+                # EMA crop centre: the focus frame is [EMA | instantaneous] side by side, so the
+                # EMA's centre is at a quarter of the width (mono crop, ox == 1).
+                ctrx, ctry = cam['fw'] / 4.0, cam['fh'] / 2.0
+                cgx, cgy = T(ctrx, ctry)
                 dl.add_line(A(cgx - S(6), cgy), A(cgx + S(6), cgy), C((120, 128, 138, 150)), 1.0)
                 dl.add_line(A(cgx, cgy - S(6)), A(cgx, cgy + S(6)), C((120, 128, 138, 150)), 1.0)
                 k = min(10, npts)
                 for j in range(npts - k, npts):
                     aa = 0.5 + 0.5 * (j - (npts - k)) / max(1, k - 1)    # 0.5 (oldest) -> 1.0 (newest)
-                    X, Y = T(ctr + sc['dx'][j] * mult, ctr + sc['dy'][j] * mult)
+                    X, Y = T(ctrx + sc['dx'][j] * mult, ctry + sc['dy'][j] * mult)
                     dl.add_circle_filled(A(X, Y), S(3), C((90, 230, 220, int(255 * aa))))
 
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
@@ -1356,7 +1360,7 @@ def main(argv=None):
             w.open_segment(session_mod.segment_stamp(), 1 << 12, 1, pixel_depth=8,
                            cap=256, raw=True)
         payload = json.dumps({'pos': pos}, separators=(',', ':')).encode('utf-8')
-        w.write(np.frombuffer(payload, np.uint8), t_mono_ns=time.monotonic_ns())
+        w.write(np.frombuffer(payload, np.uint8), t_mono_ns=session_mod.mono_ns())
         sweep_ui['confirmed'] = pos
 
     def _poll_sweep():

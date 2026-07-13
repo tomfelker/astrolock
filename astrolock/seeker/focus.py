@@ -169,7 +169,7 @@ class FocusEma:
             'com': [round(dx, 3), round(dy, 3)],
         }
         sat = self.peak_meter > (0.9 * self.scale)                    # near full well -> peak unreliable
-        return ema, metrics, sat
+        return ema, star, metrics, sat
 
 
 def _ema_frame_u16(ema, scale, blank=None):
@@ -251,9 +251,12 @@ def main(argv=None):
         nonlocal cur, ema, scale, strehl_done
         cur = seg
         crop = _effective_crop(seg.header, args.crop)       # fits the analysis image; writer + EMA agree
-        out.open_segment(session_mod.segment_stamp(), crop, crop,
+        out.open_segment(session_mod.segment_stamp(), crop * 2, crop,   # [EMA | this frame's star]
                          color_id=ser_mod.ColorId.MONO, pixel_depth=16,
-                         shm=args.shm_ser, cap=args.shm_frames)
+                         shm=args.shm_ser, cap=args.shm_frames,
+                         # We roll in lockstep with the input, so src_seg + each record's
+                         # src_index fully names the source frame -- never a bare index.
+                         meta={'src_seg': seg.ident})
         # The EMA SURVIVES segment rolls (they're just the stream's paging, ~every few seconds);
         # it only rebuilds when the geometry actually changes -- never cleared otherwise.
         if ema is None or ema.crop != crop:
@@ -316,15 +319,24 @@ def main(argv=None):
         else:
             pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))   # hot pixels can't win
             target = (pk % work.shape[1], pk // work.shape[1])
-        star_ema, metrics, sat = ema.update(work, target)
+        star_ema, star_now, metrics, sat = ema.update(work, target)
         # Extras schema ('<6f'): strehl NaN when the aperture is unknown; com_rad NaN when the
         # plate scale is (consumers turn NaN back into None/absent).
         strehl = (_normalized_peak(star_ema) / strehl_ref) if strehl_ref else float('nan')
         crx = metrics['com'][0] * rad_per_px if rad_per_px is not None else float('nan')
         cry = metrics['com'][1] * rad_per_px if rad_per_px is not None else float('nan')
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
-        out.write(_ema_frame_u16(star_ema, scale, sat if even else None),
-                  t_mono_ns=time.perf_counter_ns(), src_index=i, flags=1 if present else 0,
+        # Side-by-side: the EMA (left) next to the RAW star crop this instant (right) -- the
+        # right half is the direct check that the finder is on the star at all.
+        import numpy as _np
+        pair = _np.concatenate([_ema_frame_u16(star_ema, scale, sat if even else None),
+                                _ema_frame_u16(star_now, scale)], axis=1)
+        # Stamp with the SOURCE frame's capture time (not our processing time): the metrics
+        # describe the light at capture, and consumers (graph x-axis, the sweep's settle gate)
+        # should be clocked off that, immune to our own lag.
+        src_t = cur.record(i)['t_mono_ns'] or session_mod.mono_ns()
+        out.write(pair,
+                  t_mono_ns=src_t, src_index=i, flags=1 if present else 0,
                   extras=(metrics['peak'], metrics['peak_frame'], metrics['hfd'], strehl,
                           metrics['com'][0], metrics['com'][1], crx, cry))
         total += 1
@@ -416,7 +428,7 @@ def analyze_ser(args, device):
                   f"stride {args.stride}", flush=True)
         pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))
         target = (pk % work.shape[1], pk // work.shape[1])
-        star_ema, metrics, sat = ema.update(work, target)
+        star_ema, _star_now, metrics, sat = ema.update(work, target)
         row = {'i': i, 'tx': target[0], 'ty': target[1],
                'peak': metrics['peak'], 'peak_frame': metrics['peak_frame'],
                'hfd': metrics['hfd'],

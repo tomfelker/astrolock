@@ -122,9 +122,10 @@ def main(argv=None):
                    help="extended detector: min compactness to call a target present (~1 = tightly "
                         "clumped, ~0.5 = uniform noise), in both axes")
     # Focus/collimation process (one optional, toggled live from the GUI Focus tab).
-    p.add_argument('--focus-crop', type=int, default=63,
-                   help="focus: star crop size (px, forced odd) -- the EMA star image")
-    p.add_argument('--focus-search', type=int, default=128,
+    p.add_argument('--focus-crop', type=int, default=127,
+                   help="focus: star crop size (px, forced odd) -- the EMA star image "
+                        "(big enough for a defocused donut, not just the in-focus core)")
+    p.add_argument('--focus-search', type=int, default=256,
                    help="focus: search ROI around the target to find the peak in (px)")
     p.add_argument('--focus-alpha', type=float, default=0.05,
                    help="focus: EMA rate for the star crop (bigger = faster to settle, noisier)")
@@ -362,7 +363,8 @@ def main(argv=None):
     track_role = None         # the role whose detections currently feed the sky-space model (guide or main)
     track_target = None       # model-predicted target px in the source frame (the smooth blue pipper)
     track_detect_px = None    # raw detection px of the locked target in the source frame (the green marker)
-    track_seen_index = -1
+    track_seen_det = None          # (seg ident, index) of the last detection acted on -- NEVER a
+                                   # bare index: indices restart per segment; alone they can't name a frame
     track_center = None       # (cx, cy) true frame centre at lock time, for live boresight re-offset
     # Camera handoff (guide acquires -> promote to the narrow main cam once it stably sees the target,
     # closing the loop directly in main px so the guide->main boresight error self-corrects; demote back
@@ -700,7 +702,11 @@ def main(argv=None):
     det_fos = {role: framestream.StreamFollower(session_dir, f'{role}_det', keep_all=True)
                for role in roles}                    # detections stream (raw JSON payloads)
     latest_blobs = {role: [] for role in roles}
-    latest_det_index = {role: -1 for role in roles}
+    # A detection names its frame as (cam segment ident, index) + carries the frame's OWN capture
+    # time. Never look a bare index up in "the current segment": the detector lags the cam, so
+    # near a roll that reads the WRONG segment's record (a phantom-motion timestamp under slew).
+    latest_det_key = {role: None for role in roles}      # (seg, index): frame identity
+    latest_det_t_s = {role: None for role in roles}      # that frame's capture time (s, mono clock)
     latest_ext = {role: None for role in roles}          # role -> extended-detector metrics (present/...)
 
     def update_detections():
@@ -714,7 +720,9 @@ def main(argv=None):
                     rec = json.loads(bytes(seg.read(i)).decode('utf-8'))
                     i += 1
                     latest_blobs[role] = rec.get('blobs', [])
-                    latest_det_index[role] = rec.get('index', latest_det_index[role])
+                    latest_det_key[role] = (rec.get('seg'), rec.get('index'))
+                    t_ns = rec.get('t_mono_ns')
+                    latest_det_t_s[role] = t_ns * 1e-9 if t_ns else None
                     latest_ext[role] = rec.get('ext')    # extended: {'present', 'com', ...} or None
                 seg._used = i
                 if seg.finalized() and i >= seg.committed() and len(fo_.segs) > 1:
@@ -731,15 +739,6 @@ def main(argv=None):
             if 'bin' in r:
                 return float(r['bin'][0])
         return 1.0
-
-    def frame_time_s(role, index):
-        """Capture time (seconds) of frame `index` for a role, from the cam's frame sidecar.
-        The whole control loop is clocked off these so PID dt is the true inter-frame interval
-        (the cam's monotonic clock), not the backend's polling jitter."""
-        if index < 0:
-            return None
-        t_ns = followers[role].frame_time_ns(index)
-        return t_ns * 1e-9 if t_ns is not None else None
 
     def _detector_for(role):
         return getattr(args, f'{role}_detector', None) or args.detector
@@ -910,7 +909,7 @@ def main(argv=None):
         print("[backend] mount disconnected", flush=True)
 
     def apply_command(cmd):
-        nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_index, gui_quit
+        nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_det, gui_quit
         nonlocal track_center, mount_desired_url, follow_enabled, track_primary, handoff_fine, handoff_conf
         nonlocal track_pref, focus_proc, focus_role, track_delay_s, track_started_t
         t = cmd.get('type')
@@ -942,7 +941,7 @@ def main(argv=None):
                 # Blobs are in frame image space; hold the target at the frame centre. rad_per_px
                 # is per *sensor* pixel (from this role's optics), so scale by the cam's binning.
                 rpp = rad_per_px_by_role.get(role, rad_per_px) * frame_binning(role)
-                ft = frame_time_s(role, latest_det_index[role])    # clock off the frame, not wall time
+                ft = latest_det_t_s[role]                 # the detection frame's OWN capture time
                 if ft is not None:
                     from astrolock.seeker.skytracker import SkyTracker
                     from astrolock.seeker.target_model import EmaAngularVelModel
@@ -961,10 +960,10 @@ def main(argv=None):
                                          lock_min_time=args.track_lock_min_time,
                                          sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
                     tracker.start(float(px[0]), float(px[1]), ft, mount.get_state())
-                    track_seen_index = latest_det_index[role]
+                    track_seen_det = latest_det_key[role]
                     tracking = True
                     coasting = False
-                    track_started_t = time.perf_counter()     # the follow delay counts from here
+                    track_started_t = session_mod.mono_s()    # the follow delay counts from here
                     if not follow_enabled or track_delay_s > 0:
                         mount.set_rates(0.0, 0.0)             # watch-only / learn-first: hold still
                     track_role = role
@@ -1168,7 +1167,7 @@ def main(argv=None):
                     restart_cam(role, stop_first=True)                 # format change -> relaunch (later)
                 print(f"[backend] {role} control {name} = {value} ({'live' if live else 'relaunch'})", flush=True)
 
-    start = time.perf_counter()
+    start = session_mod.mono_s()
     last_health = start
     last_cleanup = start
     handoff_last = start          # for the handoff integrator's real-time dt (framerate-independent)
@@ -1176,7 +1175,8 @@ def main(argv=None):
     try:
         while True:
             time.sleep(0.05)                      # ~20 Hz control loop
-            now = time.perf_counter()
+            now = session_mod.mono_s()            # SAME timeline as every t_mono_ns stamp: this
+                                                  # 'now' meets frame times in the tracker/servo
 
             for cmd in cmd_server.drain():
                 apply_command(cmd)
@@ -1190,10 +1190,10 @@ def main(argv=None):
             track_status = None
             if tracking and tracker is not None and not estop:
                 role = track_role
-                if latest_det_index[role] != track_seen_index:   # act once per new frame...
-                    ft = frame_time_s(role, latest_det_index[role])
+                if latest_det_key[role] != track_seen_det:       # act once per new frame...
+                    ft = latest_det_t_s[role]
                     if ft is not None:                            # ...clocked by its capture time
-                        track_seen_index = latest_det_index[role]
+                        track_seen_det = latest_det_key[role]
                         # SkyTracker returns final axis rates -- it owns the alt-az IK and its own pole
                         # handling (tips altitude over the top), given the mount-pose history + now.
                         raz, ralt, track_status, tpx = tracker.update(
@@ -1245,7 +1245,7 @@ def main(argv=None):
                     want = track_primary if handoff_conf <= args.handoff_demote_s else handoff_fine
                 if want != track_role and followers[want].header is not None:
                     tracker.switch_role(*track_geom(want), single_target=_detector_for(want) == 'extended')
-                    track_role, track_seen_index = want, latest_det_index[want]
+                    track_role, track_seen_det = want, latest_det_key[want]
                     print(f"[backend] handoff: now tracking on {want}", flush=True)
             handoff_last = now
 
@@ -1296,7 +1296,7 @@ def main(argv=None):
                 backend_status = {'lost': 'target lost', 'slew': 'slewing'}.get(mode, 'idle')
 
             state_slot.write({
-                't_mono_ns': time.perf_counter_ns(),
+                't_mono_ns': session_mod.mono_ns(),
                 't_utc': session_mod.utc_now_iso(),
                 'mode': mode,
                 'status': backend_status,               # freeform backend status line for the GUI
