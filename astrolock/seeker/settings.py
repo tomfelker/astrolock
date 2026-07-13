@@ -55,11 +55,17 @@ def list_settings():
 
 
 def load(name):
-    """The settings dict saved under `name`, or {} if it's missing / unreadable."""
+    """The settings dict saved under `name`, or {} if it doesn't exist. A file that EXISTS but
+    won't parse is reported loudly -- silently returning {} would let the GUI start on defaults
+    and overwrite the user's saved calibration without a word."""
     try:
         with open(_path(name), encoding='utf-8') as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"[settings] could NOT load {name!r} ({e}); starting from defaults -- "
+              f"saving now would overwrite it", flush=True)
         return {}
 
 

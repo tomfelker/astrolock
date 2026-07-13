@@ -953,7 +953,10 @@ def main(argv=None):
                         b['size_px'] = b['size_px'] * coord_scale
         # The record's t_mono_ns is the FRAME'S capture time, never "now": the backend pairs the
         # blobs with the mount pose at this instant, and our processing lag must not skew that.
-        frame_t_ns = cur.record(i)['t_mono_ns'] or session_mod.mono_ns()
+        # The cam ALWAYS stamps; a zero is a broken producer -- refuse to invent a time for it.
+        frame_t_ns = cur.record(i)['t_mono_ns']
+        if not frame_t_ns:
+            raise ValueError(f"frame {i} of {cur.ident} has no capture stamp")
         _emit({'index': i, 't_mono_ns': frame_t_ns,
                'proc_ms': round((time.perf_counter() - t_start) * 1e3, 1),
                'blobs': blobs, 'status': status, **extra}, i)

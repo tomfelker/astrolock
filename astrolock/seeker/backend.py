@@ -944,6 +944,9 @@ def main(argv=None):
                 # is per *sensor* pixel (from this role's optics), so scale by the cam's binning.
                 rpp = rad_per_px_by_role.get(role, rad_per_px) * frame_binning(role)
                 ft = latest_det_t_s[role]                 # the detection frame's OWN capture time
+                if ft is None:                            # never eat a user's lock click silently
+                    print(f"[backend] ignoring track on {role}: no detection with a capture "
+                          f"time yet", flush=True)
                 if ft is not None:
                     from astrolock.seeker.skytracker import SkyTracker
                     from astrolock.seeker.target_model import EmaAngularVelModel

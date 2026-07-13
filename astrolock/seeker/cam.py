@@ -205,6 +205,8 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         try:
             roi_win = [int(v) for v in str(roi).split(',')]   # backend's native centered window [x0,y0,w,h]
         except ValueError:
+            # The ROI comes from OUR backend -- malformed means a bug, not user input to shrug off.
+            print(f"[cam] malformed --roi {roi!r}; using full frame", flush=True)
             roi_win = None
     if roi_win:
         _x0, _y0, _w, _h = roi_win
@@ -673,7 +675,7 @@ def main(argv=None):
         try:
             frame_meta['roi'] = [int(v) for v in args.roi.split(',')]
         except ValueError:
-            pass
+            print(f"[cam:{args.role}] malformed --roi {args.roi!r}; meta keeps full frame", flush=True)
 
     # Publish the camera's live controls (name/kind/range/value) so the backend + GUI can render them.
     caps_path = os.path.join(out_dir, f'caps_{args.role}.json')

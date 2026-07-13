@@ -333,8 +333,11 @@ def main(argv=None):
                                 _ema_frame_u16(star_now, scale)], axis=1)
         # Stamp with the SOURCE frame's capture time (not our processing time): the metrics
         # describe the light at capture, and consumers (graph x-axis, the sweep's settle gate)
-        # should be clocked off that, immune to our own lag.
-        src_t = cur.record(i)['t_mono_ns'] or session_mod.mono_ns()
+        # should be clocked off that, immune to our own lag. The cam ALWAYS stamps; a zero here
+        # is a broken producer, and papering over it with "now" would hide that.
+        src_t = cur.record(i)['t_mono_ns']
+        if not src_t:
+            raise ValueError(f"frame {i} of {cur.ident} has no capture stamp")
         out.write(pair,
                   t_mono_ns=src_t, src_index=i, flags=1 if present else 0,
                   extras=(metrics['peak'], metrics['peak_frame'], metrics['hfd'], strehl,

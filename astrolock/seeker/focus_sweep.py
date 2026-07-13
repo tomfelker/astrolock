@@ -110,6 +110,8 @@ def main(argv=None):
                 rec = seg.record(i)
                 blob = json.loads(bytes(seg.read(i)).decode('utf-8'))
                 i += 1
+                # Deliberate grace, not failure-eating: an external actuator that doesn't stamp
+                # its report gets its ARRIVAL time -- only the report/collect ordering matters.
                 t = rec['t_mono_ns'] or session_mod.mono_ns()
                 if t >= after_ns and abs(float(blob.get('pos', math.nan)) - want) <= tol:
                     hit = t
