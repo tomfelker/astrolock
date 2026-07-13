@@ -556,7 +556,6 @@ def main(argv=None):
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
-            '--frame-limit', str(args.segment_frames), '--file-limit', '-1',
             '--control-file', cf,
             *cam_sel, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
         ])
@@ -699,7 +698,7 @@ def main(argv=None):
 
     followers = {role: SerFollower(session_dir, role) for role in roles}
 
-    det_fos = {role: framestream.StreamFollower(session_dir, f'{role}_det', keep_all=True)
+    det_fos = {role: framestream.StreamFollower(session_dir, f'{role}_det')
                for role in roles}                    # detections stream (raw JSON payloads)
     latest_blobs = {role: [] for role in roles}
     # A detection names its frame as (cam segment ident, index) + carries the frame's OWN capture
@@ -713,22 +712,16 @@ def main(argv=None):
         for role in roles:
             fo_ = det_fos[role]
             fo_.poll()
-            while fo_.segs:                          # drain every new detection record, in order
-                seg = fo_.segs[0]
-                i = getattr(seg, '_used', 0)
-                while i < seg.committed():
-                    rec = json.loads(bytes(seg.read(i)).decode('utf-8'))
-                    i += 1
-                    latest_blobs[role] = rec.get('blobs', [])
-                    latest_det_key[role] = (rec.get('seg'), rec.get('index'))
-                    t_ns = rec.get('t_mono_ns')
-                    latest_det_t_s[role] = t_ns * 1e-9 if t_ns else None
-                    latest_ext[role] = rec.get('ext')    # extended: {'present', 'com', ...} or None
-                seg._used = i
-                if seg.finalized() and i >= seg.committed() and len(fo_.segs) > 1:
-                    fo_.release(seg)
-                    continue
-                break
+            for rd, i in fo_.drain():                # every new detection record, in order
+                try:
+                    rec = json.loads(bytes(rd.read(i)).decode('utf-8'))
+                except framestream.Lapped:
+                    continue                         # ancient record overwritten; fo_.lost counts it
+                latest_blobs[role] = rec.get('blobs', [])
+                latest_det_key[role] = (rec.get('seg'), rec.get('index'))
+                t_ns = rec.get('t_mono_ns')
+                latest_det_t_s[role] = t_ns * 1e-9 if t_ns else None
+                latest_ext[role] = rec.get('ext')    # extended: {'present', 'com', ...} or None
 
     def frame_binning(role):
         """Sensor pixels per frame pixel for a role, from the live segment's header meta.
@@ -736,10 +729,7 @@ def main(argv=None):
         returned 1.0, halving the reconstruction plate scale for a 2x2-binned cam: pixel
         motion then cancelled only HALF the mount motion, so a fixed target appeared to flee
         at half the slew rate and every lock overshot.)"""
-        segs = followers[role].segs
-        if not segs:
-            return 1.0
-        b = (segs[-1].meta or {}).get('bin')
+        b = (followers[role].meta or {}).get('bin')
         return float(b[0]) if b else 1.0
 
     def _detector_for(role):
@@ -842,27 +832,21 @@ def main(argv=None):
             launch_detect(role)                    # safety: detect normally rolls on its own
 
     def delete_old_segments():
-        """Rolling GC of live-session leftovers. v3 shm segments leave NOTHING per segment; the
-        only per-segment disk artifacts are .dat heaps (file-store sessions) and the detections
-        sidecars (keyed by segment GUID, so age-based). Head files are tiny and append-only.
-        Recordings live in --recordings-dir and are never touched."""
+        """Rolling GC of live-session leftovers. A ring stream leaves nothing per frame -- the
+        only per-stream disk artifacts are .dat rings (file-store sessions), and only ones
+        orphaned by a reconfigure are worth sweeping. Head files are tiny and append-only;
+        recordings live in --recordings-dir and are never touched."""
         if args.keep:
             return
         streams = [n for role in roles for n in (role, f'{role}_debug', f'{role}_focus')]
         for name in streams:
-            dats = sorted(glob.glob(os.path.join(session_dir, f'*_{name}.dat')))
-            for sp in dats[:-2]:
+            dats = sorted(glob.glob(os.path.join(session_dir, f'{name}_*.dat')),
+                          key=os.path.getmtime)
+            for sp in dats[:-1]:                  # keep the live ring; reconfigures are rare
                 try:
                     os.remove(sp)
                 except OSError:
                     pass
-        cutoff = time.time() - 120.0
-        for fp in glob.glob(os.path.join(session_dir, '*.detections.jsonl')):
-            try:
-                if os.path.getmtime(fp) < cutoff:
-                    os.remove(fp)                 # open handles (GUI tailers) block this -> retried
-            except OSError:
-                pass
 
     def connect_mount(url):
         """Replace the current mount driver with a fresh one for `url` ('sim' or a celestron URL),

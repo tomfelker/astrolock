@@ -176,11 +176,21 @@ class SerWriter:
             raise ValueError(
                 f"frame is {arr.nbytes} bytes, expected {self._bytes_per_frame} "
                 f"({self.width}x{self.height}, depth {self.pixel_depth_per_plane})")
-        self._file.write(arr.tobytes())
+        self._file.write(arr)        # buffer protocol: no intermediate bytes copy (shm -> file)
         self._file.flush()
         self._timestamps.append(_ser_ticks(t_utc or dt.datetime.now(dt.timezone.utc)))
         self.frame_count += 1
         return self.frame_count - 1  # index of the frame just written
+
+    def truncate_last_frame(self):
+        """Un-write the most recent frame: its source bytes were overwritten mid-read (a lapped
+        ring slot), so what landed in the file is torn. Seek back over it, drop its timestamp;
+        the next write_frame overwrites in place."""
+        if self.frame_count == 0:
+            return
+        self.frame_count -= 1
+        self._timestamps.pop()
+        self._file.seek(HEADER_SIZE + self.frame_count * self._bytes_per_frame)
 
     def close(self):
         if self._closed:

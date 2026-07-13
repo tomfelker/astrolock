@@ -1,80 +1,91 @@
 """
-Follower: the skip-to-newest consumer of a framestream (v2 chains).
+Follower: the frame-ref convenience wrapper over framestream.StreamFollower.
 
-Wraps framestream.StreamFollower with the frame-ref API the GUI/backend grew up with. A frame
-is named by (segment id, index) together -- an index is only meaningful against its segment --
-and read_frame refuses a ref for a segment we've released. The segment id remains the historical
-'<stem>.ser' string (virtual: v2 segments store pixels in shm or a .dat heap); consumers use it
-only as an identity and to derive sibling sidecar names (detections).
+A frame is named by (stream ident, ABSOLUTE index) together -- indices never wrap or restart
+within a ring, so a FrameRef is globally unambiguous. The ident keeps the historical
+'<stem>.ser' string shape (virtual): consumers use it only as an identity.
+
+view(ref) is the zero-copy read (validate-on-exit, raises framestream.Lapped if the writer
+reused the slot mid-use); read_frame(ref) is the copying convenience.
 """
 
 import collections
+from contextlib import contextmanager
 
 from astrolock.seeker import framestream
 
 FrameRef = collections.namedtuple('FrameRef', ['ser_path', 'index'])
 
 
-def _seg_id(seg):
-    # Historical '<stem>.ser' shape, from the segment's ident (shm GUID / .dat basename):
-    # consumers use it as an identity and to derive sibling names (detections).
-    return seg.ident + '.ser'
+def _seg_id(ident):
+    return ident + '.ser'
 
 
 class SerFollower:
-    """Follow one stream within a session directory, always chasing the newest frame."""
+    """Follow one stream within a session directory, chasing the newest frame."""
 
     def __init__(self, session_dir, role):
         self.session_dir = str(session_dir)
         self.role = role
         self._fo = framestream.StreamFollower(session_dir, role)
 
-    def _newest(self):
-        self._fo.poll()
-        return self._fo.segs[-1] if self._fo.segs else None
+    def _reader(self, ser_path):
+        for r in self._fo._readers:
+            if _seg_id(r.ident) == ser_path:
+                return r
+        raise IndexError(f'{ser_path} is not an attached ring (reconfigured away?)')
 
     def committed_count(self):
-        seg = self._newest()
-        return seg.committed() if seg is not None else 0
+        self._fo.poll()
+        return self._fo.committed()
 
     def latest_ref(self):
-        """FrameRef of the newest committed frame (or None), without reading its pixels."""
+        """FrameRef of the newest committed frame (or None), without touching its pixels."""
         self._fo.poll()
         got = self._fo.latest()
-        return FrameRef(_seg_id(got[0]), got[1]) if got else None
+        return FrameRef(_seg_id(got[0].ident), got[1]) if got else None
+
+    @contextmanager
+    def view(self, ref):
+        """ZERO-COPY view of the frame named by ref: yields (record, payload). Raises
+        framestream.Lapped on exit if the writer reused the slot mid-use (discard the output),
+        IndexError if the ring is gone / the frame not committed."""
+        with self._reader(ref.ser_path).view(ref.index) as (rec, payload):
+            yield rec, payload
 
     def read_frame(self, ref):
-        """Read the frame named by a FrameRef. Refuses (IndexError) a ref for a segment we've
-        rolled past and released -- never silently the wrong frame from a fresher segment."""
-        for seg in self._fo.segs:
-            if _seg_id(seg) == ref.ser_path:
-                return seg.read(ref.index)
-        raise IndexError(f"frame {ref.index} is from a released segment {ref.ser_path}")
+        """Copying read of the frame named by ref."""
+        return self._reader(ref.ser_path).read(ref.index)
 
     def read_latest(self):
-        """(FrameRef, frame) for the newest committed frame, or None if none yet."""
+        """(FrameRef, frame copy) for the newest committed frame, or None if none yet."""
         self._fo.poll()
         got = self._fo.latest()
         if not got:
             return None
-        seg, i = got
-        return FrameRef(_seg_id(seg), i), seg.read(i)
+        r, i = got
+        return FrameRef(_seg_id(r.ident), i), r.read(i)
 
     @property
     def header(self):
-        seg = self._fo.segs[-1] if self._fo.segs else None
-        return seg.header if seg is not None else None
+        return self._fo.header
+
+    @property
+    def meta(self):
+        return self._fo.meta
 
     @property
     def ser_path(self):
-        """Identity of the currently-followed segment ('<stem>.ser', virtual)."""
-        seg = self._newest()
-        return _seg_id(seg) if seg is not None else None
+        """Identity of the live ring ('<stem>.ser', virtual)."""
+        ident = self._fo.ident
+        return _seg_id(ident) if ident else None
 
-    @property
-    def segs(self):
-        """The held SegmentReaders (for in-memory wake probes)."""
-        return self._fo.segs
+    def poll(self):
+        self._fo.poll()
+
+    def committed(self):
+        """Committed count of the live ring WITHOUT polling (pure memory read; wake probes)."""
+        return self._fo.committed()
 
     def close(self):
         self._fo.close()

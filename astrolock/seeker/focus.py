@@ -230,9 +230,9 @@ def main(argv=None):
     if args.ser:
         return analyze_ser(args, device)
 
-    # Follow the cam stream chain; the star OUTPUT is one stream for the whole run, rolling
-    # its own segments (fresh on every input-segment switch, and when a shm segment fills).
-    fo = framestream.StreamFollower(args.session, args.role, keep_all=True)
+    # Follow the cam stream; the star OUTPUT ring reconfigures only when the input ring does
+    # (a geometry change -- the only roll left anywhere).
+    fo = framestream.StreamFollower(args.session, args.role)
 
     def find_sigma0():
         """Star-finding blur sigma: explicit --find-blur-px, else 2.0 until the optics-derived
@@ -244,21 +244,19 @@ def main(argv=None):
     out = framestream.FrameStream(args.session, f'{args.role}_focus',
                                   extras=('<8f', ['peak', 'peak_frame', 'hfd', 'strehl',
                                                   'dx', 'dy', 'com_rad_x', 'com_rad_y']))
-    cur = None                                              # current input SegmentReader
+    cur = None                                              # current input RingReader
     ema = None
 
-    def switch_to(seg):
+    def switch_to(rd):
         nonlocal cur, ema, scale, strehl_done
-        cur = seg
-        crop = _effective_crop(seg.header, args.crop)       # fits the analysis image; writer + EMA agree
-        out.open_segment(session_mod.segment_stamp(), crop * 2, crop,   # [EMA | this frame's star]
-                         color_id=ser_mod.ColorId.MONO, pixel_depth=16,
-                         shm=args.shm_ser, cap=args.shm_frames,
-                         # We roll in lockstep with the input, so src_seg + each record's
-                         # src_index fully names the source frame -- never a bare index.
-                         meta={'src_seg': seg.ident})
-        # The EMA SURVIVES segment rolls (they're just the stream's paging, ~every few seconds);
-        # it only rebuilds when the geometry actually changes -- never cleared otherwise.
+        cur = rd
+        crop = _effective_crop(rd.header, args.crop)        # fits the analysis image; writer + EMA agree
+        out.configure(crop * 2, crop,                       # [EMA | this frame's star]
+                      color_id=ser_mod.ColorId.MONO, pixel_depth=16,
+                      shm=args.shm_ser, frames=args.shm_frames,
+                      # src_seg + each record's ABSOLUTE src_index fully names the source frame.
+                      meta={'src_seg': rd.ident})
+        # The EMA survives everything except an actual geometry change (never cleared otherwise).
         if ema is None or ema.crop != crop:
             fs = ema.find_sigma if ema is not None else find_sigma0()
             ema = FocusEma(crop, args.search, args.alpha, scale=None, find_sigma=fs)
@@ -267,7 +265,7 @@ def main(argv=None):
 
     latest_blobs = []
     latest_tracking = False        # blobs are only trusted when they answer a tracker lock
-    next_index = 0
+    last_det = None                # (det ring ident, index) of the last-applied detection
     scale = None
     total = 0
     strehl_ref = None            # ideal (diffraction-limited) normalized peak; computed once, kept across segments
@@ -351,37 +349,29 @@ def main(argv=None):
             det_fo.poll()                             # refresh the target location (latest record)
             got_det = det_fo.latest()
             if got_det is not None:
-                dseg, di = got_det
-                if getattr(dseg, '_used', -1) != di:
-                    dseg._used = di
+                drd, di = got_det
+                if last_det != (drd.ident, di):
+                    last_det = (drd.ident, di)
                     import json as _json
-                    d = _json.loads(bytes(dseg.read(di)).decode('utf-8'))
+                    d = _json.loads(bytes(drd.read(di)).decode('utf-8'))
                     latest_blobs = d.get('blobs', [])
                     latest_tracking = bool(d.get('tracking'))
             fo.poll()
             worked = False
-            seg = fo.segs[0] if fo.segs else None      # SEQUENTIAL: exactly one EMA sample per
-            if seg is not None:                        # frame, in order, stalls notwithstanding
-                if seg is not cur:
-                    switch_to(seg)
+            # SEQUENTIAL: exactly one EMA sample per frame, in order, in bounded bites (stay
+            # live); frames the producer lapped are skipped and counted by the follower.
+            for rd, i in fo.drain(limit=8):
+                if rd is not cur:
+                    switch_to(rd)
                     latest_blobs = []
                     latest_tracking = False
-                    next_index = 0
-                n = min(seg.committed(), next_index + 8)   # catch up in bounded bites (stay live)
-                while next_index < n:
-                    process(next_index)
-                    next_index += 1
-                    worked = True
-                if (seg.finalized() and next_index >= seg.committed()
-                        and (len(fo.segs) > 1 or seg.stream_ended())):
-                    done = seg.stream_ended()
-                    fo.release(seg)
-                    cur = None
-                    if done:
-                        break
+                try:
+                    process(i)
+                except framestream.Lapped:
                     continue
+                worked = True
             if not worked:
-                if fo.ended() and seg is None:
+                if fo.ended():
                     break                              # cam stream ended cleanly; we're done
                 time.sleep(args.poll)
     except KeyboardInterrupt:

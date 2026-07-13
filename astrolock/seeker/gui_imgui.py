@@ -157,7 +157,7 @@ def _waker(glfw_mod, wake, stop):
         for seg in (wake.get('probes') or ()):
             try:
                 counts.append(seg.committed())
-            except (AttributeError, ValueError):   # render thread closed it mid-probe: benign race
+            except (AttributeError, ValueError, IndexError):   # closed/repolled mid-probe: benign race
                 counts.append(-1)
         counts = tuple(counts)
         if counts != last_counts:
@@ -521,21 +521,14 @@ def main(argv=None):
         """Drain new detection records (raw JSON payloads) for a role, in order."""
         fo_ = det_fos.get(role)
         if fo_ is None:
-            fo_ = det_fos[role] = framestream.StreamFollower(args.session, f'{role}_det',
-                                                             keep_all=True)
+            fo_ = det_fos[role] = framestream.StreamFollower(args.session, f'{role}_det')
         fo_.poll()
         out_ = []
-        while fo_.segs:
-            seg_ = fo_.segs[0]
-            i = getattr(seg_, '_used', 0)
-            while i < seg_.committed():
-                out_.append(json.loads(bytes(seg_.read(i)).decode('utf-8')))
-                i += 1
-            seg_._used = i
-            if seg_.finalized() and i >= seg_.committed() and len(fo_.segs) > 1:
-                fo_.release(seg_)
+        for rd, i in fo_.drain():
+            try:
+                out_.append(json.loads(bytes(rd.read(i)).decode('utf-8')))
+            except framestream.Lapped:
                 continue
-            break
         return out_
 
     def update_cam(stream):
@@ -544,18 +537,17 @@ def main(argv=None):
         display the exact frame it last processed (not the newest), so the boxes sit on the object.
         Returns True if a new frame was uploaded."""
         f = followers.get(stream) or followers.setdefault(stream, SerFollower(args.session, stream))
-        res = f.read_latest()
-        if res is None or f.header is None:
+        ref = f.latest_ref()
+        if ref is None or f.header is None:
             return False
-        ref, frame = res                                 # ref = (segment, index) of the newest committed frame
-        seg, idx = ref.ser_path, ref.index               # every index below is an index into `seg`
+        seg, idx = ref.ser_path, ref.index               # (ring ident, ABSOLUTE index)
         if stream in perf['cam']:                        # production rate = newest-index delta *within* a segment
             pseg, pidx = perf['idx'].get(stream, (seg, idx))
             perf['cam'][stream].hit(idx - pidx if (pseg == seg and idx >= pidx) else 0)
             perf['idx'][stream] = (seg, idx)
         cam = cams.get(stream)
         if cam is None:
-            fh0, fw0 = frame.shape[0], frame.shape[1]
+            fh0, fw0 = f.header.image_height, f.header.image_width
             nb = 2 if bayer.is_bayer(f.header.color_id) else 1
             w, h = fw0 // nb, fh0 // nb
             cam = cams[stream] = dict(gl=_StreamGL(ctx, prog, vao), w=w, h=h, fw=fw0, fh=fh0,
@@ -586,32 +578,31 @@ def main(argv=None):
         show_idx = cam['det_idx'] if 0 <= cam['det_idx'] <= idx else idx
         if show_idx == cam['last_idx']:
             return False
-        if show_idx == idx:
-            disp = frame                                 # already have the newest frame in hand
-        else:
-            try:
-                disp = f.read_frame(FrameRef(seg, show_idx))    # refuses (-> retry) if we've since rolled past seg
-            except (IndexError, ValueError):
-                return False                             # rollover race / not yet readable -- retry next tick
-        fh, fw = disp.shape[0], disp.shape[1]
-        _t = time.perf_counter()
-        w, h = cam['gl'].upload(disp, f.header.color_id, args.gamma, wb)
-        _prof('upload', (time.perf_counter() - _t) * 1e3)
+        hist = None
+        try:
+            # ZERO-COPY: the GL upload (and the histogram subsample) read the ring slot in
+            # place; the view's exit validates the slot wasn't reused mid-use.
+            with f.view(FrameRef(seg, show_idx)) as (_rec, disp):
+                fh, fw = disp.shape[0], disp.shape[1]
+                _t = time.perf_counter()
+                w, h = cam['gl'].upload(disp, f.header.color_id, args.gamma, wb)
+                _prof('upload', (time.perf_counter() - _t) * 1e3)
+                # Histogram inset (off by default): raw-mosaic subsample through the display
+                # gamma (WB-less -- close enough to WYSIWYG).
+                if view_settings.get(stream, {}).get('histogram'):
+                    white = float(np.iinfo(disp.dtype).max)
+                    samp = (disp[::8, ::8].astype(np.float32) / white).clip(0.0, 1.0)
+                    if args.gamma and args.gamma != 1.0:
+                        samp **= (1.0 / args.gamma)
+                    counts, _ = np.histogram(samp, bins=64, range=(0.0, 1.0))
+                    m = counts.max()
+                    hist = np.sqrt(counts / m) if m > 0 else None
+        except (IndexError, ValueError, framestream.Lapped):
+            return False                             # reconfigure race / lapped -- retry next tick
         if (w, h) != (cam['w'], cam['h']):               # frame size changed (source/optics switch)
             cam.update(w=w, h=h, fw=fw, fh=fh, ox=w / fw, oy=h / fh, color_id=f.header.color_id)
         cam['last_idx'] = show_idx
-        # The histogram inset is off by default; only pay for it when it's enabled for this stream.
-        # Judged from a raw-mosaic subsample through the display gamma (WB-less -- close enough to WYSIWYG).
-        if view_settings.get(stream, {}).get('histogram'):
-            white = float(np.iinfo(disp.dtype).max)
-            samp = (disp[::8, ::8].astype(np.float32) / white).clip(0.0, 1.0)
-            if args.gamma and args.gamma != 1.0:
-                samp **= (1.0 / args.gamma)
-            counts, _ = np.histogram(samp, bins=64, range=(0.0, 1.0))
-            m = counts.max()
-            cam['hist'] = np.sqrt(counts / m) if m > 0 else None
-        else:
-            cam['hist'] = None
+        cam['hist'] = hist
         return True
 
     # ---- pane drawing (letterboxed image + overlays into the pane child's draw list) ---------
@@ -1332,7 +1323,7 @@ def main(argv=None):
         sweep_ui['role'], sweep_ui['state'], sweep_ui['confirmed'] = role, None, None
         if sweep_ui['fo'] is not None:
             sweep_ui['fo'].close()
-        sweep_ui['fo'] = framestream.StreamFollower(args.session, f'{role}_sweep', keep_all=True)
+        sweep_ui['fo'] = framestream.StreamFollower(args.session, f'{role}_sweep')
         if not focus_ui['want']:
             _focus_start(role)                            # the sweep feeds on the focus stream
         sweep_ui['start'] = _flt(ui['txt']['sweep_start'], sweep_ui['start'])   # parsed only here
@@ -1356,9 +1347,8 @@ def main(argv=None):
                 w.close()
             w = sweep_ui['writer'] = framestream.FrameStream(args.session, f'{role}_focuser')
             sweep_ui['writer_role'] = role
-        if w._seg is None or w.full:
-            w.open_segment(session_mod.segment_stamp(), 1 << 12, 1, pixel_depth=8,
-                           cap=256, raw=True)
+        if not w.configured:
+            w.configure(1 << 12, 1, pixel_depth=8, frames=256, raw=True)
         payload = json.dumps({'pos': pos}, separators=(',', ':')).encode('utf-8')
         w.write(np.frombuffer(payload, np.uint8), t_mono_ns=session_mod.mono_ns())
         sweep_ui['confirmed'] = pos
@@ -1369,20 +1359,10 @@ def main(argv=None):
         if fo_ is None:
             return
         fo_.poll()
-        blob = None
-        while fo_.segs:
-            seg = fo_.segs[0]
-            i = getattr(seg, '_used', 0)
-            while i < seg.committed():
-                blob = bytes(seg.read(i))
-                i += 1
-            seg._used = i
-            if seg.finalized() and i >= seg.committed() and len(fo_.segs) > 1:
-                fo_.release(seg)
-                continue
-            break
-        if blob is not None:
-            sweep_ui['state'] = json.loads(blob.decode('utf-8'))
+        got = fo_.latest()                                # latest wins; never lappable
+        if got is not None and sweep_ui.get('_seen') != (got[0].ident, got[1]):
+            sweep_ui['_seen'] = (got[0].ident, got[1])
+            sweep_ui['state'] = json.loads(bytes(got[0].read(got[1])).decode('utf-8'))
 
     def _poll_focus_metrics():
         """Read the star stream's binary record extras (peak/strehl/com...) into the rolling
@@ -1391,36 +1371,29 @@ def main(argv=None):
         if not focus_ui['want']:
             return
         if focus_ui['fo'] is None:
-            focus_ui['fo'] = framestream.StreamFollower(args.session, f"{focus_ui['role']}_focus",
-                                                        keep_all=True)
+            focus_ui['fo'] = framestream.StreamFollower(args.session, f"{focus_ui['role']}_focus")
         fo_ = focus_ui['fo']
         fo_.poll()
         s = focus_ui['series']
-        while fo_.segs:
-            seg = fo_.segs[0]
-            i = getattr(seg, '_gui_used', 0)
-            while i < seg.committed():
-                rec = seg.record(i)
-                i += 1
-                t = rec['t_mono_ns']
-                if focus_ui['t0'] is None:
-                    focus_ui['t0'] = t * 1e-9
-                s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
-                s['peak'].append(rec['peak'])
-                s['peakf'].append(rec.get('peak_frame', rec['peak']))
-                h = rec.get('hfd')
-                s['hfd'].append(None if h is None or math.isnan(h) else h)
-                s['strehl'].append(None if math.isnan(rec['strehl']) else rec['strehl'])
-                s['dx'].append(rec['dx'])
-                s['dy'].append(rec['dy'])
-                if not math.isnan(rec['com_rad_x']):       # pixel-scale-free CoM -> screw dial (latest)
-                    focus_ui['com_rad'] = (rec['com_rad_x'], rec['com_rad_y'])
-                perf['focus'].hit()                        # one record = one focus frame produced
-            seg._gui_used = i
-            if seg.finalized() and i >= seg.committed() and len(fo_.segs) > 1:
-                fo_.release(seg)                           # fully consumed -> let the section go
+        for rd, i in fo_.drain():
+            try:
+                rec = rd.record(i)
+            except framestream.Lapped:
                 continue
-            break
+            t = rec['t_mono_ns']
+            if focus_ui['t0'] is None:
+                focus_ui['t0'] = t * 1e-9
+            s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
+            s['peak'].append(rec['peak'])
+            s['peakf'].append(rec.get('peak_frame', rec['peak']))
+            h = rec.get('hfd')
+            s['hfd'].append(None if h is None or math.isnan(h) else h)
+            s['strehl'].append(None if math.isnan(rec['strehl']) else rec['strehl'])
+            s['dx'].append(rec['dx'])
+            s['dy'].append(rec['dy'])
+            if not math.isnan(rec['com_rad_x']):           # pixel-scale-free CoM -> screw dial (latest)
+                focus_ui['com_rad'] = (rec['com_rad_x'], rec['com_rad_y'])
+            perf['focus'].hit()                            # one record = one focus frame produced
         for k in s:                                       # keep only the last FOCUS_MAX points
             if len(s[k]) > FOCUS_MAX:
                 del s[k][:len(s[k]) - FOCUS_MAX]
@@ -2103,10 +2076,8 @@ def main(argv=None):
         # v3: frames commit in RAM, so the waker PROBES shm headers directly (pure memory
         # reads, no syscalls) and stat-watches only the head files (segment/ended events),
         # detection sidecars, and the state file.
-        wake['probes'] = ([seg for fo_ in followers.values() for seg in fo_.segs
-                           if seg._buf is not None]
-                          + [seg for fo_ in det_fos.values() for seg in fo_.segs
-                             if seg._buf is not None])
+        wake['probes'] = tuple(followers.values()) + tuple(det_fos.values())
+        # (followers expose committed() as a pure memory read of the live ring's header)
         paths = [framestream.head_path(args.session, name) for name in followers]
         paths += [framestream.head_path(args.session, f'{r}_det') for r in det_fos]
         wake['paths'] = paths

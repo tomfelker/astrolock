@@ -87,16 +87,15 @@ def main(argv=None):
     threading.Thread(target=_stdin_watch, daemon=True).start()
 
     out = framestream.FrameStream(args.session, f'{args.role}_sweep')
-    fo_hfd = framestream.StreamFollower(args.session, f'{args.role}_focus', keep_all=True)
-    fo_pos = framestream.StreamFollower(args.session, f'{args.role}_focuser', keep_all=True)
+    fo_hfd = framestream.StreamFollower(args.session, f'{args.role}_focus')
+    fo_pos = framestream.StreamFollower(args.session, f'{args.role}_focuser')
 
     state = {'of': steps, 'need': args.frames_per_step, 'done': False}
 
     def publish(**kw):
         state.update(kw)
-        if out._seg is None or out.full:
-            out.open_segment(session_mod.segment_stamp(), 1 << 14, 1, pixel_depth=8,
-                             cap=256, raw=True)
+        if not out.configured:
+            out.configure(1 << 14, 1, pixel_depth=8, frames=256, raw=True)
         payload = json.dumps(state, separators=(',', ':')).encode('utf-8')
         out.write(np.frombuffer(payload, np.uint8), t_mono_ns=session_mod.mono_ns())
 
@@ -104,41 +103,33 @@ def main(argv=None):
         """Newest position report at ~want stamped after the request, else None."""
         fo_pos.poll()
         hit = None
-        for seg in fo_pos.segs:
-            i = getattr(seg, '_used', 0)
-            while i < seg.committed():
-                rec = seg.record(i)
-                blob = json.loads(bytes(seg.read(i)).decode('utf-8'))
-                i += 1
-                # Deliberate grace, not failure-eating: an external actuator that doesn't stamp
-                # its report gets its ARRIVAL time -- only the report/collect ordering matters.
-                t = rec['t_mono_ns'] or session_mod.mono_ns()
-                if t >= after_ns and abs(float(blob.get('pos', math.nan)) - want) <= tol:
-                    hit = t
-            seg._used = i
-        while len(fo_pos.segs) > 1 and getattr(fo_pos.segs[0], '_used', 0) \
-                >= fo_pos.segs[0].committed() and fo_pos.segs[0].finalized():
-            fo_pos.release(fo_pos.segs[0])
+        for rd, i in fo_pos.drain():
+            try:
+                rec = rd.record(i)
+                blob = json.loads(bytes(rd.read(i)).decode('utf-8'))
+            except framestream.Lapped:
+                continue
+            # Deliberate grace, not failure-eating: an external actuator that doesn't stamp
+            # its report gets its ARRIVAL time -- only the report/collect ordering matters.
+            t = rec['t_mono_ns'] or session_mod.mono_ns()
+            if t >= after_ns and abs(float(blob.get('pos', math.nan)) - want) <= tol:
+                hit = t
         return hit
 
     def drain_metrics(since_ns, sink, limit):
         """Feed per-frame peak_frame records captured after since_ns into sink, up to limit."""
         fo_hfd.poll()
-        while fo_hfd.segs and len(sink) < limit:
-            seg = fo_hfd.segs[0]
-            i = getattr(seg, '_used', 0)
-            while i < seg.committed() and len(sink) < limit:
-                rec = seg.record(i)
-                i += 1
-                pf = rec.get('peak_frame')
-                if rec['t_mono_ns'] < since_ns or pf is None or math.isnan(pf) or pf <= 0:
-                    continue
-                sink.append(pf)
-            seg._used = i
-            if seg.finalized() and i >= seg.committed() and len(fo_hfd.segs) > 1:
-                fo_hfd.release(seg)
+        for rd, i in fo_hfd.drain():
+            try:
+                rec = rd.record(i)
+            except framestream.Lapped:
                 continue
-            break
+            pf = rec.get('peak_frame')
+            if rec['t_mono_ns'] < since_ns or pf is None or math.isnan(pf) or pf <= 0:
+                continue
+            sink.append(pf)
+            if len(sink) >= limit:
+                break
 
     points = []                                # (pos, peak_frame) for every unsaturated frame
     sat = total = 0
@@ -172,7 +163,7 @@ def main(argv=None):
             while len(window) < args.frames_per_step and not stop.is_set():
                 n0 = len(window)
                 drain_metrics(since, window, args.frames_per_step)
-                if fo_hfd.ended() and not fo_hfd.segs:
+                if fo_hfd.ended():
                     break
                 if len(window) != n0:
                     publish(collected=len(window), points=pts_out(window, want))

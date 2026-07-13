@@ -803,37 +803,37 @@ def main(argv=None):
                              args.surprise_decay, args.surprise_var_floor_frac,
                              blur_px=args.surprise_blur_px)
 
-    # Follow the stream chain (head file -> segments); live skips to the newest frame, offline
-    # drains every frame in order. Temporal state (surprise) resets per segment, like before.
-    fo = framestream.StreamFollower(args.session, args.role, keep_all=not args.follow)
-    cur = None                                         # current SegmentReader
+    # Follow the stream (one ring per geometry); live skips to the newest frame, offline drains
+    # every frame in order. Temporal state (surprise) resets ONLY on a ring change -- which now
+    # means an actual geometry change, the one legitimate reset point.
+    fo = framestream.StreamFollower(args.session, args.role)
+    cur = None                                         # current RingReader
     prev = None
     surprise = new_surprise()
-    dbg = {'stream': None}                             # debug detection-surface stream (rolls on its own)
+    dbg = {'stream': None, 'geom': None}               # debug detection-surface stream
     next_index = 0
     scale = None
     total = 0
 
     # Detections are a raw-payload framestream ({role}_det): each record is the JSON detection
-    # dict as a variable-size heap blob (+ 'seg' = the cam segment it indexes into). Committing
-    # one is a pure shm store, so a drive breather can't stall detection->tracking.
+    # dict as a variable-size blob (+ 'seg' = the cam ring it indexes into). Committing one is
+    # a pure shm store, so a drive breather can't stall detection->tracking.
     det_out = framestream.FrameStream(args.session, f'{args.role}_det')
 
     def _emit(rec, i):
-        if det_out.frame_count == 0 and det_out._seg is None or det_out.full:
-            det_out.open_segment(session_mod.segment_stamp(), 1 << 17, 1, pixel_depth=8,
-                                 shm=args.shm_ser, cap=256, raw=True)
+        if not det_out.configured:
+            det_out.configure(1 << 17, 1, pixel_depth=8, shm=args.shm_ser, frames=256, raw=True)
         import numpy as _np
         payload = (json.dumps({**rec, 'seg': cur.ident}, separators=(',', ':'))
                    .encode('utf-8'))
         det_out.write(_np.frombuffer(payload, _np.uint8),
                       t_mono_ns=rec.get('t_mono_ns', 0), src_index=i)
 
-    def switch_to(seg):
+    def switch_to(rd):
         nonlocal cur, prev, surprise, scale, next_index
-        cur = seg
+        cur = rd
         prev = None
-        surprise = new_surprise()                      # fresh temporal state for the new segment
+        surprise = new_surprise()                      # geometry changed: temporal state restarts
         scale = None
         next_index = 0
 
@@ -968,9 +968,10 @@ def main(argv=None):
             if st is None:
                 st = dbg['stream'] = framestream.FrameStream(args.session, f'{args.role}_debug')
             dh, dw = debug_surface.shape
-            if st._seg is None or st.frame_count >= args.shm_frames:
-                st.open_segment(session_mod.segment_stamp(), dw, dh, color_id=ser_mod.ColorId.MONO,
-                                pixel_depth=16, shm=args.shm_ser, cap=args.shm_frames)
+            if dbg['geom'] != (dw, dh):
+                st.configure(dw, dh, color_id=ser_mod.ColorId.MONO, pixel_depth=16,
+                             shm=args.shm_ser, frames=args.shm_frames)
+                dbg['geom'] = (dw, dh)
             # A surprisal surface is in true sigma units -> FIXED scale (debug_hi, white = 10 sigma)
             # so standout is judgeable across frames; other surfaces autoscale per frame (hi=None).
             st.write(debug_frame_u16(debug_surface, hi=debug_hi),
@@ -987,9 +988,9 @@ def main(argv=None):
             if args.follow:
                 got = fo.latest()                # live: never build a backlog -- newest frame only
                 if got:
-                    seg, i = got
-                    if seg is not cur:
-                        switch_to(seg)
+                    rd, i = got
+                    if rd is not cur:
+                        switch_to(rd)
                     if i >= next_index:
                         next_index = i
                         process(next_index)
@@ -998,22 +999,15 @@ def main(argv=None):
                 if not worked and fo.ended():
                     break                        # stream ended cleanly and we're caught up
             else:
-                seg = fo.segs[0] if fo.segs else None
-                if seg is not None:
-                    if seg is not cur:
-                        switch_to(seg)
-                    while next_index < seg.committed():   # offline: every frame, in order
-                        process(next_index)                # (committed() is live -- a header read)
-                        next_index += 1
-                        worked = True
-                    if seg.finalized() and next_index >= seg.committed():
-                        stream_done = seg.stream_ended()
-                        fo.release(seg)
-                        cur = None
-                        if stream_done:
-                            break
-                        continue
-                elif fo.ended():
+                for rd, i in fo.drain():         # offline: every frame, in order, across rings
+                    if rd is not cur:
+                        switch_to(rd)
+                    try:
+                        process(i)
+                    except framestream.Lapped:
+                        continue                 # producer lapped us mid-read; fo.lost counts it
+                    worked = True
+                if not worked and fo.ended():
                     break
             if not worked:
                 time.sleep(args.poll)

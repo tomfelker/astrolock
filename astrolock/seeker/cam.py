@@ -692,105 +692,69 @@ def main(argv=None):
           f"control={args.control_file} -> {out_dir}", flush=True)
 
     stream = framestream.FrameStream(out_dir, args.role)
+    # ONE ring for the whole run (geometry is fixed per cam process; a resolution/bin/ROI
+    # change relaunches the cam). --shm-frames sizes the ring = the stream's entire
+    # write-behind budget; there are no rolls, no per-segment anything, no VM syscalls after
+    # this line. Live settings (exposure/gain) just apply -- they no longer split the stream.
+    stream.configure(width, height, color_id=color_id, pixel_depth=pixel_depth,
+                     shm=bool(args.shm_ser), frames=args.shm_frames if args.shm_ser else 64,
+                     meta=frame_meta)         # bin + roi (sensor->frame mapping)
     start = time.perf_counter()
     total = 0
     last_status = start
     last_status_n = 0
     stop = False
     try:
-        while not stop and cfg['file_limit'] != 0:
-            # With --shm-ser the cam is a PURE sensor->shm streamer: nothing lands on disk but
-            # the sidecar (sustained full-rate .ser writes grind consumer SSDs into GC stalls --
-            # see shmser.py). Recording is someone else's job (astrolock.seeker.recorder tails
-            # the stream). A shm segment is committed RAM, so it rolls at --shm-frames even if
-            # --frame-limit is longer (rolling is the design, not a cost).
-            use_shm = bool(args.shm_ser)
-            seg_limit = cfg['frame_limit']
-            if use_shm and (seg_limit == -1 or seg_limit > args.shm_frames):
-                seg_limit = args.shm_frames
-            stream.open_segment(session_mod.segment_stamp(), width, height, color_id=color_id,
-                                pixel_depth=pixel_depth,
-                                shm=use_shm, cap=max(1, seg_limit) if use_shm else 64,
-                                meta={**frame_meta,            # bin + roi (sensor->frame mapping)
-                                      **({'settings': applied} if applied else {})})
-            frames_in_file = 0
-            rolled = False
-            try:
-                while True:
-                    if control is not None:
-                        ctrl_changed = False
-                        for cmd in control.drain():
-                            if cmd.get('stop'):
-                                stop = True
-                            for k in ('frame_limit', 'file_limit', 'fps'):
-                                if k in cmd:
-                                    cfg[k] = cmd[k]
-                            if 'controls' in cmd and controls is not None:   # live camera controls
-                                for _n, _v in cmd['controls'].items():
-                                    got = controls['set'](_n, _v)
-                                    applied[_n] = got if got is not None else _v
-                                    ctrl_changed = True
-                        # Roll to a fresh .ser on a settings change so every segment stays uniform (no
-                        # per-frame resolution/exposure changes to reconstruct). Only if we've written
-                        # something -- an empty just-opened segment simply adopts the new value.
-                        if ctrl_changed and frames_in_file > 0 and not stop:
-                            break
-                    if stop or cfg['file_limit'] == 0:    # {stop} or shutdown -> finalize + exit
+        while True:
+            if control is not None:
+                for cmd in control.drain():
+                    if cmd.get('stop'):
                         stop = True
+                    for k in ('frame_limit', 'fps'):
+                        if k in cmd:
+                            cfg[k] = cmd[k]
+                    if 'controls' in cmd and controls is not None:   # live camera controls
+                        for _n, _v in cmd['controls'].items():
+                            got = controls['set'](_n, _v)
+                            applied[_n] = got if got is not None else _v
+            if stop:                                  # {stop} or shutdown -> finalize + exit
+                break
+            if cfg['frame_limit'] != -1 and total >= cfg['frame_limit']:
+                break                                 # tests/tools: a total-frame budget
+
+            loop_start = time.perf_counter()
+            cap_t_ns = None                            # a source may supply the true frame time
+            avail_ns = None                            # ...and a wall-clock before which not to commit
+            if capture is not None:
+                frame = capture()
+                if isinstance(frame, tuple):           # (frame, t_mono_ns[, available_at_ns])
+                    frame, cap_t_ns, *rest = frame     # e.g. sim: exposure midpoint + exposure-end
+                    avail_ns = rest[0] if rest else None
+                if frame is None:
+                    if args.source == 'playback' and not args.playback_loop:
+                        print(f"[cam:{args.role}] playback complete", flush=True)
                         break
+                    print(f"[cam:{args.role}] capture timeout, skipping", flush=True)
+                    continue
+            else:
+                frame = make_synthetic_frame(width, height, loop_start - start)
 
-                    loop_start = time.perf_counter()
-                    cap_t_ns = None                            # a source may supply the true frame time
-                    avail_ns = None                            # ...and a wall-clock before which not to commit
-                    if capture is not None:
-                        frame = capture()
-                        if isinstance(frame, tuple):           # (frame, t_mono_ns[, available_at_ns])
-                            frame, cap_t_ns, *rest = frame     # e.g. sim: exposure midpoint + exposure-end
-                            avail_ns = rest[0] if rest else None
-                        if frame is None:
-                            if args.source == 'playback' and not args.playback_loop:
-                                print(f"[cam:{args.role}] playback complete", flush=True)
-                                stop = True
-                                break
-                            print(f"[cam:{args.role}] capture timeout, skipping", flush=True)
-                            continue
-                    else:
-                        frame = make_synthetic_frame(width, height, loop_start - start)
+            stream.write_pixels(frame)                # pixels staged (claim precedes the touch)
+            if avail_ns is not None:                   # hold the commit until the exposure really ends
+                wait = (avail_ns - session_mod.mono_ns()) * 1e-9   # avail_ns is on the mono clock
+                if wait > 0:
+                    time.sleep(wait)
+            stream.commit(                             # the commit: one shm store
+                t_mono_ns=cap_t_ns if cap_t_ns is not None else session_mod.mono_ns(),
+                t_utc_ns=time.time_ns(),
+                src_index=total)
+            total += 1
 
-                    stream.write_pixels(frame)                # pixels flushed (may precede the commit line)
-                    if avail_ns is not None:                   # hold the commit until the exposure really ends
-                        wait = (avail_ns - session_mod.mono_ns()) * 1e-9   # avail_ns is on the mono clock
-                        if wait > 0:
-                            time.sleep(wait)
-                    stream.commit(                             # the commit: one shm store
-                        t_mono_ns=cap_t_ns if cap_t_ns is not None else session_mod.mono_ns(),
-                        t_utc_ns=time.time_ns(),
-                        src_index=frames_in_file)
-                    frames_in_file += 1
-                    total += 1
-
-                    # Per-second status -- commented out to keep stdout for rare events. Uncomment
-                    # for live debugging (fps / peak / exposure-gain).
-                    # if loop_start - last_status >= 1.0:
-                    #     fps = (total - last_status_n) / (loop_start - last_status)
-                    #     extra = f"  {get_settings()}" if get_settings else ""
-                    #     print(f"[cam:{args.role}] {total} frames, {fps:.1f} fps, "
-                    #           f"peak {int(frame.max())}, important={cfg['important']}{extra}", flush=True)
-                    #     last_status, last_status_n = loop_start, total
-
-                    if seg_limit != -1 and frames_in_file >= seg_limit:
-                        rolled = True
-                        break
-
-                    period = 1.0 / cfg['fps'] if cfg['fps'] > 0 else 0.0
-                    if period:
-                        sleep = period - (time.perf_counter() - loop_start)
-                        if sleep > 0:
-                            time.sleep(sleep)
-            finally:
-                pass                                   # rolls finalize in open_segment; exit closes below
-            if rolled and not stop and cfg['file_limit'] != -1:
-                cfg['file_limit'] -= 1                 # consumed one of our file budget
+            period = 1.0 / cfg['fps'] if cfg['fps'] > 0 else 0.0
+            if period:
+                sleep = period - (time.perf_counter() - loop_start)
+                if sleep > 0:
+                    time.sleep(sleep)
     except KeyboardInterrupt:
         print(f"[cam:{args.role}] interrupted", flush=True)
     finally:

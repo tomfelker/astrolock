@@ -46,42 +46,31 @@ def test_focus_sweep():
     focus = framestream.FrameStream(out, 'main_focus',
                                     extras=('<8f', ['peak', 'peak_frame', 'hfd', 'strehl',
                                                     'dx', 'dy', 'com_rad_x', 'com_rad_y']))
+    focus.configure(8, 8, frames=64)
     focuser = framestream.FrameStream(out, 'main_focuser')
-    fo_sweep = framestream.StreamFollower(out, 'main_sweep', keep_all=True)
+    focuser.configure(1 << 12, 1, pixel_depth=8, frames=256, raw=True)
+    fo_sweep = framestream.StreamFollower(out, 'main_sweep')
     frame = np.zeros((8, 8), np.uint16)
     pos = None
     state = {}
     deadline = time.time() + 30
     while th.is_alive() and time.time() < deadline:
         fo_sweep.poll()
-        for seg in fo_sweep.segs:                        # latest state blob wins
-            i = getattr(seg, '_used', 0)
-            while i < seg.committed():
-                state = json.loads(bytes(seg.read(i)).decode('utf-8'))
-                i += 1
-            seg._used = i
+        for rd, i in fo_sweep.drain():                   # latest state blob wins
+            state = json.loads(bytes(rd.read(i)).decode('utf-8'))
         if state.get('awaiting') == 'position' and state.get('want_pos') != pos:
             pos = state['want_pos']                      # "moved": echo the request back
-            if focuser._seg is None or focuser.full:
-                focuser.open_segment(session_mod.segment_stamp(), 1 << 12, 1, pixel_depth=8,
-                                     cap=256, raw=True)
             focuser.write(np.frombuffer(json.dumps({'pos': pos}).encode('utf-8'), np.uint8),
                           t_mono_ns=session_mod.mono_ns())
         if pos is not None:                              # the "focus process": known peak curve
-            if focus._seg is None or focus.full:
-                focus.open_segment(session_mod.segment_stamp(), 8, 8, cap=64)
             focus.write(frame, t_mono_ns=session_mod.mono_ns(),
                         extras=(0.5, _peak_of(pos), 20.0, 0.5, 0.0, 0.0, math.nan, math.nan))
         time.sleep(0.005)
     th.join(10)
     assert not th.is_alive(), "sweep never finished"
     fo_sweep.poll()                                      # the final 'done' blob lands at exit
-    for seg in fo_sweep.segs:
-        i = getattr(seg, '_used', 0)
-        while i < seg.committed():
-            state = json.loads(bytes(seg.read(i)).decode('utf-8'))
-            i += 1
-        seg._used = i
+    for rd, i in fo_sweep.drain():
+        state = json.loads(bytes(rd.read(i)).decode('utf-8'))
     assert state.get('done') and not state.get('aborted'), state
     assert abs(state['p0'] - P0) < 0.05, state
     assert abs(state['peak0'] - PK0) < 0.05, state
