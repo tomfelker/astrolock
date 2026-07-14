@@ -68,9 +68,19 @@ class SkyTracker:
         self._mount_rate = (0.0, 0.0)
 
     def target_speed_rad_s(self):
-        """Magnitude of the model's current angular-velocity estimate (rad/s), for status display."""
-        av = getattr(self.model, 'ang_vel', None)
-        return float(torch.linalg.norm(av)) if av is not None else 0.0
+        """Apparent SKY angular speed of the model's prediction (rad/s), for status display.
+        Computed numerically from predict(), so it reads the same thing for any model -- an
+        orbit model's internal ang_vel is about the EARTH'S centre, not the sky."""
+        t = getattr(self.model, 't', None)
+        if t is None:
+            return 0.0
+        d0 = self.model.predict(t)
+        if d0 is None:
+            return 0.0
+        dt = 0.2
+        d1 = self.model.predict(t + dt)
+        s = torch.linalg.norm(torch.linalg.cross(d0, d1))
+        return float(torch.atan2(s, torch.dot(d0, d1))) / dt
 
     def diagnostics(self):
         """(info_lines, warnings) printed by the backend at lock time."""

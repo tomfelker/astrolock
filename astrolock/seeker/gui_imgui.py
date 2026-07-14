@@ -408,7 +408,8 @@ def main(argv=None):
               'pip_map': {}, 'pip_slots': []}
     boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
     track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True,   # Tracking panel state; backend defaults
-                'delay': 0.0}                                            # post-lock mount-hold (s)
+                'delay': 0.0,                                            # post-lock mount-hold (s)
+                'model': 'ema', 'alt_km': 250.0}                         # target model (next lock)
     sim_ui = {'r0': 0.0, 'bortle': 4}                     # Simulation panel: seeing r0 (m) + Bortle sky class
     focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'fo': None,
                 't0': None, 'com_mult': 10.0,             # collimation-trail exaggeration on the star view
@@ -427,6 +428,7 @@ def main(argv=None):
     # Immediate-mode UI state: text-input buffers + selections the panel reads/writes each frame.
     ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'track_delay': f"{track_ui['delay']:g}",
                   'sim_r0': f"{sim_ui['r0']:g}", 'track_smooth': f"{track_ui['smoothing']:g}",
+                  'track_alt': f"{track_ui['alt_km']:g}",
                   'focus_alpha': f"{focus_ui['alpha']:g}", 'focus_com_mult': f"{focus_ui['com_mult']:g}",
                   'sweep_start': f"{sweep_ui['start']:g}", 'sweep_end': f"{sweep_ui['end']:g}",
                   'sweep_step': f"{sweep_ui['step']:g}",
@@ -1186,6 +1188,7 @@ def main(argv=None):
             'boresight': [boresight_ui['x'], boresight_ui['y']],
             'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
                          'auto_switch': track_ui['auto_switch'], 'delay': track_ui['delay'],
+                         'model': track_ui['model'], 'alt_km': track_ui['alt_km'],
                          'follow': bool((ctrl['state'] or {}).get('follow_enabled', True))},
             'sim': {'r0': sim_ui['r0'], 'bortle': sim_ui['bortle']},   # per-cam defocus rides with the cam caps
             'focus': {'com_mult': focus_ui['com_mult'], 'screw_phase': focus_ui['screw_phase'],
@@ -1236,6 +1239,12 @@ def main(argv=None):
             ui['txt']['track_delay'] = f"{track_ui['delay']:g}"
             _send({'type': 'set_track_delay', 'value': track_ui['delay']})
             ctrl['delay_init'] = True                   # don't let the state-init clobber the loaded value
+        if trk.get('model') in ('ema', 'greatcircle') or 'alt_km' in trk:
+            track_ui['model'] = trk.get('model', track_ui['model'])
+            track_ui['alt_km'] = max(1.0, float(trk.get('alt_km', track_ui['alt_km'])))
+            ui['txt']['track_alt'] = f"{track_ui['alt_km']:g}"
+            _send({'type': 'set_track_model', 'model': track_ui['model'],
+                   'alt_km': track_ui['alt_km']})
         if 'follow' in trk:
             _send({'type': 'follow', 'on': bool(trk['follow'])})
         sim = data.get('sim') or {}
@@ -1988,6 +1997,32 @@ def main(argv=None):
                 if imgui.button(('* ' if cur_pref == val else '  ') + lbl + f"##trk_pref_{val}", (S(56), 0)):
                     _set_track_pref(val)
                 imgui.end_disabled()
+            cur_model = st.get('track_model') or track_ui['model']
+            imgui.text("Model:")
+            _tip("Target motion model (applies at the NEXT lock). Sky: constant angular velocity "
+                 "across the sky -- right for anything far (stars, planes at range). Orbit: a "
+                 "constant-altitude great circle about the Earth's centre -- right for LEO "
+                 "passes, where the zenith speed-up and horizon slow-down are perspective the "
+                 "Sky model has to chase but the orbit geometry produces for free.")
+            for val, lbl in (('ema', 'Sky'), ('greatcircle', 'Orbit')):
+                imgui.same_line()
+                if imgui.button(('* ' if cur_model == val else '  ') + lbl + f"##trk_model_{val}",
+                                (S(56), 0)):
+                    track_ui['model'] = val
+                    _send({'type': 'set_track_model', 'model': val, 'alt_km': track_ui['alt_km']})
+            imgui.same_line()
+            imgui.begin_disabled(cur_model != 'greatcircle')
+
+            def _commit_alt(txt):
+                track_ui['alt_km'] = max(1.0, _flt(txt, track_ui['alt_km']))
+                _send({'type': 'set_track_model', 'model': track_ui['model'],
+                       'alt_km': track_ui['alt_km']})
+                return f"{track_ui['alt_km']:g}"
+            _input_commit('track_alt', S(48), _commit_alt)
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "km")
+            imgui.end_disabled()
+            _tip("Assumed target altitude for the Orbit model.")
             ch, v = imgui.checkbox("Auto switch to main pane##auto_switch", track_ui['auto_switch'])
             if ch:
                 track_ui['auto_switch'] = v

@@ -190,6 +190,13 @@ def main(argv=None):
                    help="EMA time constant for the target angular-velocity estimate "
                         "(bigger = smoother but laggier rate; smaller = snappier but noisier). "
                         "Live-adjustable in the GUI Tracking panel")
+    p.add_argument('--track-model', default='greatcircle', choices=['ema', 'greatcircle'],
+                   help="target motion model at lock: 'ema' = constant angular velocity across "
+                        "the SKY (right for anything far); 'greatcircle' = constant-altitude "
+                        "great circle about the Earth's centre (LEO passes: the zenith speed-up "
+                        "is perspective the geometry produces for free). GUI: Tracking > Model")
+    p.add_argument('--track-alt-km', type=float, default=415.0,
+                   help="greatcircle model: assumed target altitude (km)")
     p.add_argument('--track-min-intercept-s', type=float, default=1.0,
                    help="min intercept time; also sets the position-correction stiffness (P ~ 1/this)")
     p.add_argument('--track-command-latency-s', type=float, default=0.0,
@@ -205,7 +212,7 @@ def main(argv=None):
     p.add_argument('--track-roi-size', type=int, default=128,
                    help="while tracking, publish a square ROI (this many frame px) around the predicted "
                         "target so detect can work just that window instead of the whole frame. 0 = full-frame.")
-    p.add_argument('--track-delay-s', type=float, default=0.0,
+    p.add_argument('--track-delay-s', type=float, default=0.3,
                    help="after a new lock, hold the mount still for this long while the tracker learns "
                         "the target's angular velocity -- a better estimate before the catch-up slew "
                         "means a better chance of re-acquiring if the slew loses it. Live-adjustable "
@@ -933,7 +940,12 @@ def main(argv=None):
                           f"time yet", flush=True)
                 if ft is not None:
                     from astrolock.seeker.skytracker import SkyTracker
-                    from astrolock.seeker.target_model import EmaAngularVelModel
+                    from astrolock.seeker.target_model import (EmaAngularVelModel,
+                                                               GreatCircleModel)
+                    model = (GreatCircleModel(smoothing_s=args.track_rate_smoothing_s,
+                                              altitude_m=args.track_alt_km * 1e3)
+                             if args.track_model == 'greatcircle' else
+                             EmaAngularVelModel(smoothing_s=args.track_rate_smoothing_s))
                     cx0, cy0 = hdr.image_width / 2.0, hdr.image_height / 2.0
                     track_center = (cx0, cy0)                 # true optical centre (for live re-offset)
                     if role == 'guide':                       # aim so the target lands in the main cam:
@@ -941,7 +953,7 @@ def main(argv=None):
                         cy0 += boresight['y'] / rpp           # the guide centre (used for recon + setpoint)
                     tracker = SkyTracker(cx0, cy0, rpp,
                                          max_rate_rad_s=max_rate,
-                                         model=EmaAngularVelModel(smoothing_s=args.track_rate_smoothing_s),
+                                         model=model,
                                          min_intercept_s=args.track_min_intercept_s,
                                          command_latency_s=args.track_command_latency_s,
                                          max_horizon_s=args.track_max_horizon_s,
@@ -990,6 +1002,15 @@ def main(argv=None):
             if tracker is not None and hasattr(tracker.model, 'smoothing_s'):
                 tracker.model.smoothing_s = v         # ...and applied to the running lock right now
             print(f"[backend] track rate smoothing = {v:.2f}s", flush=True)
+        elif t == 'set_track_model':                  # target motion model for the NEXT lock
+            m = cmd.get('model')
+            if m in ('ema', 'greatcircle'):
+                args.track_model = m
+            if 'alt_km' in cmd:
+                args.track_alt_km = max(1.0, float(cmd['alt_km']))
+            print(f"[backend] track model = {args.track_model}"
+                  + (f" (alt {args.track_alt_km:g} km)" if args.track_model == 'greatcircle'
+                     else ""), flush=True)
         elif t == 'set_track_pref':                   # which cam drives tracking: 'guide' / 'main' / 'auto'
             p = cmd.get('pref')
             if p in ('guide', 'main', 'auto'):
@@ -1303,6 +1324,8 @@ def main(argv=None):
                 'track_delay_left': round(delay_left, 1),
                 'track_role': track_role if tracking else None,
                 'track_pref': track_pref,               # GUI radio: guide / main / auto
+                'track_model': args.track_model,        # target model at the next lock (+ alt)
+                'track_alt_km': args.track_alt_km,
                 'target_px': track_target if tracking else None,        # model prediction (blue pipper)
                 'detect_px': track_detect_px if tracking else None,     # raw detection (green marker)
                 # Handoff telemetry: which finer role we may promote to, the evidence accumulator, and

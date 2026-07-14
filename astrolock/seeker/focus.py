@@ -279,6 +279,9 @@ def main(argv=None):
 
     def process(i):
         nonlocal scale, total, strehl_ref, strehl_done, rad_per_px
+        # Record + pixels read together, UP FRONT: processing can be slow (GPU warmup), and the
+        # slot may be lapped before we finish -- a late record re-read would raise mid-write.
+        rec_in = cur.record(i)
         frame = cur.read(i)
         cid = cur.header.color_id
         if scale is None:
@@ -333,7 +336,7 @@ def main(argv=None):
         # describe the light at capture, and consumers (graph x-axis, the sweep's settle gate)
         # should be clocked off that, immune to our own lag. The cam ALWAYS stamps; a zero here
         # is a broken producer, and papering over it with "now" would hide that.
-        src_t = cur.record(i)['t_mono_ns']
+        src_t = rec_in['t_mono_ns']
         if not src_t:
             raise ValueError(f"frame {i} of {cur.ident} has no capture stamp")
         out.write(pair,

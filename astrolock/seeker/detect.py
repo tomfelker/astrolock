@@ -863,6 +863,10 @@ def main(argv=None):
     def process(i):
         nonlocal prev, scale, total
         t_start = time.perf_counter()                              # whole-frame cost -> proc_ms in the record
+        # Record + pixels read together, UP FRONT: processing can be arbitrarily slow (the
+        # first frame pays torch.compile, ~15s) and the slot may be lapped long before we
+        # finish -- a late re-read of the record would raise mid-emit.
+        rec_in = cur.record(i)
         frame = cur.read(i)
         cid = cur.header.color_id
         if scale is None:
@@ -954,7 +958,7 @@ def main(argv=None):
         # The record's t_mono_ns is the FRAME'S capture time, never "now": the backend pairs the
         # blobs with the mount pose at this instant, and our processing lag must not skew that.
         # The cam ALWAYS stamps; a zero is a broken producer -- refuse to invent a time for it.
-        frame_t_ns = cur.record(i)['t_mono_ns']
+        frame_t_ns = rec_in['t_mono_ns']
         if not frame_t_ns:
             raise ValueError(f"frame {i} of {cur.ident} has no capture stamp")
         _emit({'index': i, 't_mono_ns': frame_t_ns,
@@ -993,7 +997,10 @@ def main(argv=None):
                         switch_to(rd)
                     if i >= next_index:
                         next_index = i
-                        process(next_index)
+                        try:
+                            process(next_index)
+                        except framestream.Lapped:
+                            pass                     # writer outran us mid-frame; take the next
                         next_index += 1
                         worked = True
                 if not worked and fo.ended():
