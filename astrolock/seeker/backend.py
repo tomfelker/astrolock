@@ -72,11 +72,14 @@ def main(argv=None):
                    help="comma-separated roles to run detection on. Default both: the guide runs the "
                         "multi-blob detector (--detector) for acquisition, the main runs its "
                         "single-extended-target detector (--main-detector) for the handoff.")
-    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise', 'extended'],
+    p.add_argument('--detector', default='doh',
+                   choices=['bandpass', 'doh', 'surprise', 'extended', 'circmean'],
                    help="detection surface: 'doh' (default) = determinant of the Hessian, 'bandpass', "
                         "'surprise' (per-pixel temporal surprise + decaying peak-hold; finds faint fast "
-                        "movers / satellite trails), or 'extended' (symmetric single-extended-target "
-                        "marginal+compactness detector for the main cam). Per-role override: --<role>-detector")
+                        "movers / satellite trails), 'extended' (symmetric single-extended-target "
+                        "marginal+compactness detector for the main cam), or 'circmean' (toroidal-COM "
+                        "single-target detector: band-pass + circular-mean Rayleigh test; robust to "
+                        "hollow/dim targets + hot-pixel fields). Per-role override: --<role>-detector")
     p.add_argument('--doh-sigma', type=float, default=0.0, help="doh detector: Gaussian scale px (0 = psf default)")
     p.add_argument('--surprise-decay', type=float, default=0.85,
                    help="surprise detector: trail peak-hold decay (->1 integrates longer for fainter trails)")
@@ -121,6 +124,16 @@ def main(argv=None):
     p.add_argument('--ext-density', type=float, default=0.7,
                    help="extended detector: min compactness to call a target present (~1 = tightly "
                         "clumped, ~0.5 = uniform noise), in both axes")
+    # Circmean detector ('circmean') knobs -- the toroidal-COM single-target detector (main-cam).
+    p.add_argument('--circ-down', type=int, default=4,
+                   help="circmean detector: extra downscale before detection (denoise + speed)")
+    p.add_argument('--circ-bg-radius', type=int, default=64,
+                   help="circmean detector: box-blur background radius in DOWNSCALED px (kills vignette)")
+    p.add_argument('--circ-nsigma', type=float, default=5.0,
+                   help="circmean detector: two-tailed residual threshold in robust (MAD) sigmas (~5)")
+    p.add_argument('--circ-z', type=float, default=15.0,
+                   help="circmean detector: present when the Rayleigh min(Zx,Zy)=n*R^2 clears this "
+                        "(noise p ~ e^-Z/axis; real targets Z=60..8000, black sky <=4)")
     # Focus/collimation process (one optional, toggled live from the GUI Focus tab).
     p.add_argument('--focus-crop', type=int, default=127,
                    help="focus: star crop size (px, forced odd) -- the EMA star image "
@@ -173,11 +186,14 @@ def main(argv=None):
     p.add_argument('--main-optic', default='Celestron CPC 1100', help="main optic name in the optics DB")
     p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
     # Per-role detector override (default: --detector). Typical: main-cam extended-target tracking.
-    p.add_argument('--guide-detector', default=None, choices=['bandpass', 'doh', 'surprise', 'extended'],
+    p.add_argument('--guide-detector', default=None,
+                   choices=['bandpass', 'doh', 'surprise', 'extended', 'circmean'],
                    help="override --detector for the guide role (default: --detector)")
-    p.add_argument('--main-detector', default='extended', choices=['bandpass', 'doh', 'surprise', 'extended'],
+    p.add_argument('--main-detector', default='extended',
+                   choices=['bandpass', 'doh', 'surprise', 'extended', 'circmean'],
                    help="detector for the main role (default 'extended': the narrow-field single-target "
-                        "detector that drives the guide->main handoff)")
+                        "detector that drives the guide->main handoff; 'circmean' is the newer, more "
+                        "robust single-target detector)")
     p.add_argument('--guide-bin', type=int, default=2,
                    help="guide camera NxN binning (default 2x2): combine NxN pixels. A color cam "
                         "binned 2x2 reads out mono at ~the debayered resolution -- the natural guide "
@@ -592,6 +608,10 @@ def main(argv=None):
                                      '--tile-mask-px', str(args.tile_mask_px),
                                      '--ext-nsigma', str(args.ext_nsigma),
                                      '--ext-density', str(args.ext_density),
+                                     '--circ-down', str(args.circ_down),
+                                     '--circ-bg-radius', str(args.circ_bg_radius),
+                                     '--circ-nsigma', str(args.circ_nsigma),
+                                     '--circ-z', str(args.circ_z),
                                      '--snr', str(args.snr), '--max-candidates', str(args.max_candidates),
                                      '--min-blob-px', str(args.min_blob_px),
                                      '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile),
@@ -741,6 +761,13 @@ def main(argv=None):
 
     def _detector_for(role):
         return getattr(args, f'{role}_detector', None) or args.detector
+
+    # The full-frame single-target detectors: present/absent + one COM, no per-target ROI. Both drive
+    # the guide->main handoff and never take a tracking ROI (the backend runs them full-frame always).
+    SINGLE_TARGET_DETECTORS = ('extended', 'circmean')
+
+    def _single_target(role):
+        return _detector_for(role) in SINGLE_TARGET_DETECTORS
 
     def track_geom(role):
         """Reconstruction geometry for tracking on `role`: (cx, cy, rad_per_px, sign_az, sign_alt). The
@@ -973,7 +1000,7 @@ def main(argv=None):
                     track_primary = role
                     handoff_conf = 0.0
                     handoff_fine = next((r for r in roles if r != role and r in detect_roles
-                                         and _detector_for(r) == 'extended'), None) if args.handoff else None
+                                         and _single_target(r)), None) if args.handoff else None
                     estop = False
                     print(f"[backend] acquired target on {role} at "
                           f"({float(px[0]):.0f},{float(px[1]):.0f})px"
@@ -1254,7 +1281,7 @@ def main(argv=None):
                 else:                                                # 'auto', currently on main
                     want = track_primary if handoff_conf <= args.handoff_demote_s else handoff_fine
                 if want != track_role and followers[want].header is not None:
-                    tracker.switch_role(*track_geom(want), single_target=_detector_for(want) == 'extended')
+                    tracker.switch_role(*track_geom(want), single_target=_single_target(want))
                     track_role, track_seen_det = want, latest_det_key[want]
                     print(f"[backend] handoff: now tracking on {want}", flush=True)
             handoff_last = now
@@ -1277,12 +1304,12 @@ def main(argv=None):
             track_rois = {}
             if tracking and tracker is not None and args.track_roi_size > 0:
                 # The active source's ROI -- but only if its detector actually uses one (the main cam's
-                # extended detector is full-frame, so no ROI for it).
-                if track_target and _detector_for(track_role) != 'extended':
+                # extended/circmean single-target detectors are full-frame, so no ROI for them).
+                if track_target and not _single_target(track_role):
                     track_rois[track_role] = [round(track_target[0]), round(track_target[1]), args.track_roi_size]
                 # The fallback (guide) keeps ROI-tracking too, projected into its own frame.
                 fb = track_primary
-                if (fb and fb != track_role and fb in detect_roles and _detector_for(fb) != 'extended'
+                if (fb and fb != track_role and fb in detect_roles and not _single_target(fb)
                         and followers[fb].header is not None):
                     hdr = followers[fb].header
                     grpp = rad_per_px_by_role.get(fb, rad_per_px) * frame_binning(fb)

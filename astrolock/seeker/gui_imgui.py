@@ -786,9 +786,13 @@ def main(argv=None):
                 if com:
                     mx_, my_ = T(com[0], com[1])
                     dl.add_circle(A(mx_, my_), S(6), C(gcol), 0, 1.5)
-            d = ext.get('density') or [0.0, 0.0]
-            _text(dl, A(S(8), SH - S(38)), f"{'TARGET' if present else 'no target'}  "
-                  f"density {d[0]:.2f} {d[1]:.2f}", S(13), gcol)
+            if ext.get('z') is not None:                        # circmean: Rayleigh Z + surviving-pixel count
+                readout = f"Z {ext['z']:.0f}  n {ext.get('n', 0)}"
+            else:                                               # extended: per-axis compactness
+                d = ext.get('density') or [0.0, 0.0]
+                readout = f"density {d[0]:.2f} {d[1]:.2f}"
+            _text(dl, A(S(8), SH - S(38)),
+                  f"{'TARGET' if present else 'no target'}  {readout}", S(13), gcol)
 
         # --- Reticles = tracker inputs/info: crosshairs + main-cam FoV rect (red; pinhole tan-ratio) ---
         RED = COL_INPUT

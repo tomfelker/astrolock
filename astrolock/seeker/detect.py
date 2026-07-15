@@ -692,6 +692,66 @@ def marginal_target(work, *, nsigma=4.0, density_thresh=0.7):
             'peak': peak}
 
 
+def circmean_target(work, *, down=4, bg_radius=64, k_sigma=5.0, z_thresh=15.0):
+    """Toroidal-COM single-target detector ('circmean') -- the narrow-field main-cam alternative to
+    marginal_target, robust to hollow/dim targets and to hot-pixel fields that the marginal projection
+    chokes on. Pipeline: downscale -> box-blur band-pass -> two-tailed k-sigma threshold -> per-axis
+    CIRCULAR mean of the surviving-pixel mask (wrap each axis into a circle; the frame becomes a torus).
+
+    Detection is the Rayleigh statistic ``Z = n*R^2`` per axis, where R is the mean-resultant length of
+    the mask's angles and n the surviving-pixel count -- the textbook test for circular non-uniformity.
+    Under noise Z ~ Exp (p ~ e^-Z) INDEPENDENT of n, so it self-calibrates: a UNIFORM field of hot
+    pixels has its unit vectors cancel (R->0) no matter how many, and a lone survivor gives n=1 -> Z=1
+    -- neither can fake a target -- while n aligned pixels of a real clump give Z >> 1 (measured Z=60 on
+    a hollow defocused star, 400-8000 on real ISS/Tiangong passes). ``present`` := min(Zx, Zy) >= z_thresh
+    (the min rejects a hot ROW or COLUMN: concentrated on one axis, uniform on the other). The circular
+    mean's argument is the toroidal centre of mass -- edge-wrap-robust and, unlike an intensity marginal,
+    it doesn't dilute a compact target's flux across the whole axis. Two-tailed, so a dark daytime
+    silhouette counts as well as a bright target.
+
+    R is exactly the normalized magnitude of the k=1 Fourier mode of the axis marginal, so this is the
+    "fundamental harmonic" of the thresholded image. All coords in WORK px (the caller scales to frame
+    px). See astrolock_seeker.md."""
+    work = torch.as_tensor(work, dtype=torch.float32)
+    ds = torch.nn.functional.avg_pool2d(work[None, None], down)[0, 0] if down > 1 else work
+    resid = ds - box_blur(ds, bg_radius)                     # local background removed (vignette dies here)
+    flat = resid.reshape(-1)
+    med = torch.median(flat)
+    sigma = 1.4826 * torch.median(torch.abs(flat - med)) + 1e-6      # robust noise (MAD)
+    mask = (torch.abs(resid - med) > k_sigma * sigma).float()
+    H, W = resid.shape
+
+    def axis_stat(length, sum_dim):
+        marg = mask.sum(dim=sum_dim)                         # length-`length` per-column/row ON-count
+        ang = (2.0 * math.pi / length) * torch.arange(length, dtype=torch.float32, device=work.device)
+        C = float((marg * torch.cos(ang)).sum())
+        S = float((marg * torch.sin(ang)).sum())
+        tot = float(marg.sum())
+        if tot <= 0:
+            return 0.0, length / 2.0, 0.0
+        R = math.hypot(C, S) / tot                           # mean resultant length in [0,1]
+        com = (math.atan2(S, C) % (2.0 * math.pi)) * length / (2.0 * math.pi)
+        return tot * R * R, com, R                           # (Rayleigh Z=n*R^2, toroidal COM, R)
+
+    zx, cx, rx = axis_stat(W, 0)                             # x marginal: sum over rows
+    zy, cy, ry = axis_stat(H, 1)                             # y marginal: sum over cols
+    z = min(zx, zy)
+    n = float(mask.sum())
+    present = bool(z >= z_thresh and n > 0)
+
+    def half_px(R, length):                                 # ~2 circular stdevs, for a cosmetic bbox
+        R = min(max(R, 1e-6), 1.0 - 1e-9)
+        return min(2.0 * math.sqrt(-2.0 * math.log(R)) * length / (2.0 * math.pi), length / 2.0)
+
+    hx, hy = half_px(rx, W) * down, half_px(ry, H) * down
+    com_w = [cx * down, cy * down]
+    peak = float((ds * mask).max()) if n > 0 else 0.0        # brightest surviving (downscaled) pixel
+    return {'present': present, 'com': com_w,
+            'bbox': [com_w[0] - hx, com_w[1] - hy, 2.0 * hx, 2.0 * hy],
+            'z': z, 'zx': zx, 'zy': zy, 'n': int(n), 'peak': peak,
+            'resid': torch.abs(resid)}                       # residual magnitude for the debug movie
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker blob detector")
     p.add_argument('--session', required=True, help="session directory to follow")
@@ -703,14 +763,18 @@ def main(argv=None):
                    help="detect peaks this many sigma above the band-passed background")
     p.add_argument('--threshold', type=float, default=0.0,
                    help="optional relative floor: fraction of the brightest band-passed pixel (0 = off)")
-    p.add_argument('--detector', default='doh', choices=['bandpass', 'doh', 'surprise', 'extended'],
+    p.add_argument('--detector', default='doh',
+                   choices=['bandpass', 'doh', 'surprise', 'extended', 'circmean'],
                    help="detection surface: 'doh' (default) = determinant of the Hessian "
                         "(Gaussian-derivative blob detector; rejects edges/lines by construction), "
                         "'bandpass' (the older local-background subtraction), 'surprise' = per-pixel "
                         "temporal surprise + decaying peak-hold (finds faint fast movers / satellite "
-                        "trails that the single-frame surfaces miss; see SurpriseModel), or 'extended' = "
+                        "trails that the single-frame surfaces miss; see SurpriseModel), 'extended' = "
                         "the symmetric single-bright-or-dark extended-target detector (marginal projection "
-                        "+ compactness; for narrow-field main-cam tracking; see marginal_target)")
+                        "+ compactness; for narrow-field main-cam tracking; see marginal_target), or "
+                        "'circmean' = the toroidal-COM single-target detector (band-pass + circular-mean "
+                        "Rayleigh test; robust to hollow/dim targets and hot-pixel fields; see "
+                        "circmean_target -- the intended main-cam replacement for 'extended')")
     p.add_argument('--surprise-alpha-mean', type=float, default=0.15,
                    help="surprise: EMA rate for the per-pixel mean (bigger = adapts faster to drift)")
     p.add_argument('--surprise-alpha-var', type=float, default=0.08,
@@ -756,6 +820,18 @@ def main(argv=None):
     p.add_argument('--ext-density', type=float, default=0.7,
                    help="extended: min compactness to call a target present (~1 = tightly clumped target, "
                         "~0.5 = uniform noise), in both axes")
+    p.add_argument('--circ-down', type=int, default=4,
+                   help="circmean: extra downscale before detection (denoise + speed + hot-pixel "
+                        "suppression; keep the target several superpixels wide)")
+    p.add_argument('--circ-bg-radius', type=int, default=64,
+                   help="circmean: box-blur background radius in DOWNSCALED px (band-pass; kills vignette)")
+    p.add_argument('--circ-nsigma', type=float, default=5.0,
+                   help="circmean: two-tailed threshold on the band-passed residual, in robust (MAD) "
+                        "sigmas -- higher = fewer noise pixels dilute the circular mean (5 is the sweet "
+                        "spot; below ~4 the noise ON-count swamps it, above ~6 dim targets lose pixels)")
+    p.add_argument('--circ-z', type=float, default=15.0,
+                   help="circmean: present when the Rayleigh statistic min(Zx,Zy)=n*R^2 clears this "
+                        "(per-axis noise p ~ e^-Z; measured real targets Z=60..8000, black sky <=4)")
     p.add_argument('--shm-ser', action='store_true',
                    help="write the debug stream to shared-memory segments instead of disk (matches "
                         "the cams; live viewing only -- sections die with their processes)")
@@ -891,17 +967,33 @@ def main(argv=None):
                           'mass': [round(m, 1) for m in ext['mass']]}}
             st = (f"{'Target' if ext['present'] else 'No Target'} "
                   f"(Density X: {ext['density'][0]:.2f}, Y: {ext['density'][1]:.2f})")
-            return bl, ex, st
+            return bl, ex, st, work                                 # debug-ser shows the analysed frame
+
+        def run_circmean():
+            """The 'detection' phase, toroidal-COM style: full-frame single-target present-or-not via
+            the band-pass + circular-mean Rayleigh test (circmean_target). Returns frame coords."""
+            cm = circmean_target(work, down=args.circ_down, bg_radius=args.circ_bg_radius,
+                                 k_sigma=args.circ_nsigma, z_thresh=args.circ_z)
+            cs = coord_scale
+            com_f = [cm['com'][0] * cs, cm['com'][1] * cs]
+            bbox_f = [v * cs for v in cm['bbox']]
+            bl = ([{'px': com_f, 'bbox': bbox_f, 'moving': True,
+                    'score': round(cm['peak'] / (scale or 1.0), 4)}] if cm['present'] else [])
+            ex = {'ext': {'present': cm['present'], 'com': com_f, 'bbox': bbox_f,
+                          'z': round(cm['z'], 1), 'n': cm['n']}}
+            st = f"{'Target' if cm['present'] else 'No Target'} (Z={cm['z']:.0f}, n={cm['n']})"
+            return bl, ex, st, cm['resid']                         # debug-ser shows the band-pass residual
 
         # ---- phase dispatch ------------------------------------------------------------------
         # acquisition: no lock -> full-frame, many candidates (the user picks one).
         # tracking:    the backend broadcasts a predicted ROI for this role -> one answer,
         #              found by the per-phase --track-detector (independent of --detector).
-        # detection:   'extended' -- the main-cam single-large-target present-or-not test;
-        #              runs full-frame in every phase (the backend never sends it an ROI).
-        if args.detector == 'extended':
-            blobs, extra, status = run_extended()
-            debug_surface, debug_hi = work, None                   # debug-ser shows the analysed frame
+        # detection:   'extended'/'circmean' -- the main-cam single-target present-or-not tests;
+        #              run full-frame in every phase (the backend never sends them an ROI).
+        if args.detector in ('extended', 'circmean'):
+            blobs, extra, status, debug_surface = (
+                run_circmean() if args.detector == 'circmean' else run_extended())
+            debug_hi = None
             prev = None
         elif state['roi'] is not None:                             # tracking: one answer near the prediction
             if args.track_detector == 'matched':                   # stateless current-frame matched filter
