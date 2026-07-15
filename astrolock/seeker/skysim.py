@@ -54,7 +54,8 @@ class SkySimConfig:
     mag_flux_scale: float = 4.0e6             # electrons/s for a mag-0 source
     sky_bg_rate_e: float = 80.0              # sky background electrons / pixel / s
     read_noise_e: float = 2.0                 # read noise (electrons RMS); overridden by the sensor's if known
-    adu_per_e: float = 0.05                   # gain: electrons -> 12-bit ADU
+    adu_per_e: float = 0.05                   # gain: electrons -> ADU
+    adc_bits: int = 12                        # ADC resolution: saturates at 2^adc_bits-1 (8 = RAW8 fast mode)
     # Physical photometry: when aperture_mm > 0 AND qe > 0, mag_flux_scale / sky_bg_rate_e / adu_per_e are
     # DERIVED from real units in __init__ (aperture area, QE, throughput, plate scale, sky brightness, well).
     qe: float = 0.0                           # sensor peak quantum efficiency (e-/photon); 0 -> fixed fallback
@@ -83,14 +84,16 @@ def _enu(az, alt):
     return torch.stack([ca * torch.sin(az), ca * torch.cos(az), torch.sin(alt)], dim=-1)
 
 
-def _render_tail(fb, noise, bg_e, read_var, adu_per_e):
+def _render_tail(fb, noise, bg_e, read_var, adu_per_e, adu_max):
     """The render's elementwise tail: add the sky background, apply signal-dependent shot noise + read
     noise (unit-normal field * per-pixel std sqrt(signal + read^2) -- the Poisson->Gaussian approx), and
-    quantize to 12-bit ADU. One fusable elementwise chain; eager torch runs it as ~a dozen separate
-    full-array passes, so torch.compile fusing it into a single kernel is a big win (see _apply_tail)."""
+    quantize to ADU, saturating at adu_max (2^adc_bits-1). One fusable elementwise chain; eager torch
+    runs it as ~a dozen separate full-array passes, so torch.compile fusing it into a single kernel is a
+    big win (see _apply_tail)."""
     fb = torch.clamp(fb + bg_e, min=0.0)
     fb = fb + noise * torch.sqrt(fb + read_var)
-    return torch.clamp(torch.round(fb * adu_per_e), 0, 4095).to(torch.int32)
+    q = torch.round(fb * adu_per_e).clamp(min=0.0)
+    return torch.minimum(q, adu_max).to(torch.int32)             # saturate at the ADC full scale
 
 
 def _next_fast_len(n):
@@ -199,6 +202,7 @@ class SkySim:
         # solid angle -- a narrow cam sees a darker per-pixel sky, which is what lets faint spikes clear it.
         self.mag_flux_scale, self.sky_bg_rate_e = c.mag_flux_scale, c.sky_bg_rate_e
         self.adu_per_e, self.read_noise_e = c.adu_per_e, c.read_noise_e
+        self.adu_max = float((1 << c.adc_bits) - 1)          # ADC full scale (255 for 8-bit, 4095 for 12-bit)
         self.gain_mult = 1.0                       # live sensor gain multiplier (centibels: 10^(cB/200))
         if c.aperture_mm > 0 and c.qe > 0:
             area_cm2 = math.pi * (c.aperture_mm / 20.0) ** 2 * (1.0 - c.central_obstruction ** 2)  # (D/2 mm)/10=cm
@@ -207,7 +211,7 @@ class SkySim:
             self.mag_flux_scale = zp_e
             self.sky_bg_rate_e = zp_e * (10.0 ** (-0.4 * c.sky_mag_arcsec2)) * plate_arcsec ** 2
             if c.full_well_e > 0:
-                self.adu_per_e = 4095.0 / c.full_well_e     # 12-bit ADC saturates exactly at the full well
+                self.adu_per_e = self.adu_max / c.full_well_e  # ADC saturates exactly at the full well
         self.cx, self.cy = (c.boresight_px if c.boresight_px
                             else (c.width / 2.0, c.height / 2.0))
         # hidden tripod rotation: mount-frame ENU -> true ENU
@@ -384,7 +388,8 @@ class SkySim:
 
     def render(self, enc_az_rad, enc_alt_rad, rate_az_rad_s, rate_alt_rad_s,
                source_dirs, source_mag, exposure_s=0.1, substeps=6):
-        """Render one frame -> uint16 (H, W) ndarray (12-bit data left-shifted into 16 bits).
+        """Render one frame -> (H, W) ndarray: uint8 for an 8-bit ADC, else uint16 (data
+        left-justified into 16 bits, e.g. 12-bit -> 0xfff0 container).
 
         source_dirs: (T, S, 3) ENU unit dirs, one per source per substep (S == substeps).
         source_mag:  (T,) magnitudes. The boresight sweeps enc..enc+rate*exposure across the substeps.
@@ -427,5 +432,8 @@ class SkySim:
         adu = self._apply_tail(fb, noise,
                                torch.tensor(self.sky_bg_rate_e * exposure_s, dtype=torch.float32, device=dev),
                                torch.tensor(self.read_noise_e ** 2, dtype=torch.float32, device=dev),
-                               torch.tensor(self.adu_per_e * self.gain_mult, dtype=torch.float32, device=dev))
-        return (adu << 4).cpu().numpy().astype(np.uint16)     # 12-bit -> 0xfff0 container
+                               torch.tensor(self.adu_per_e * self.gain_mult, dtype=torch.float32, device=dev),
+                               torch.tensor(self.adu_max, dtype=torch.float32, device=dev))
+        if c.adc_bits <= 8:
+            return adu.cpu().numpy().astype(np.uint8)         # 8-bit container (RAW8-equivalent)
+        return (adu << (16 - c.adc_bits)).cpu().numpy().astype(np.uint16)   # left-justify into 16 bits

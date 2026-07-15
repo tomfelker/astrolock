@@ -151,6 +151,9 @@ def main(argv=None):
                    help="cam-loop max framerate cap (0 = unlimited, the default -- a real camera "
                         "self-paces by exposure + readout + USB; this is just an optional throttle, "
                         "settable live per role in the GUI). Sim/playback have their own pacing too.")
+    p.add_argument('--bit-depth', type=int, default=16, choices=[8, 16],
+                   help="capture container depth: 8 = RAW8 (half the USB bytes/frame -> higher fps), "
+                        "16 = full precision (12-bit ASI / 12-bit sim). Per-role, relaunch on change.")
     p.add_argument('--sim-downscale', type=int, default=1,
                    help="DEPRECATED: folded into binning (a sim downscale is an NxN bin). "
                         "Prefer --<role>-bin; this multiplies into every role's bin.")
@@ -417,6 +420,7 @@ def main(argv=None):
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
     bin_by_role = {}           # role -> physical NxN bin (recorded in frame metadata; scales plate scale)
     fps_by_role = {role: args.fps for role in roles}    # role -> cam-loop max-fps cap (0 = unlimited); live
+    depth_by_role = {role: args.bit_depth for role in roles}   # role -> capture bit depth (8 or 16); relaunch
     roi_by_role = {role: None for role in roles}        # role -> None (full) or (out_w, out_h) centered readout
                                                         # window in binned/output px (GUI picks square pow2)
     full_res_by_role = {}      # role -> (res_x, res_y) native px of the un-cropped sensor (for ROI sizing)
@@ -570,6 +574,17 @@ def main(argv=None):
             per_role_sky += [sky_follow_flag()]       # follow the current mount (re-evaluated each launch)
         if sources[role] == 'zwo' and roi_by_role.get(role) and role in roi_window_by_role:
             per_role_sky += ['--roi', ','.join(str(v) for v in roi_window_by_role[role])]   # crop in hardware
+        # Open the cam already at the user's live exposure/gain, so the very FIRST frame is correct --
+        # no default-brightness flash before the post-launch control re-apply catches up. (zwo sets
+        # these before start_video_capture in _open_zwo; the sim's re-apply is instant, so it's left
+        # to the {'controls'} write below.)
+        cv = cam_control_vals.get(role) or {}
+        init_args = []
+        if sources[role] == 'zwo':
+            if cv.get('exposure') is not None:
+                init_args += ['--exposure-us', str(max(1, int(round(float(cv['exposure']) * 1000))))]
+            if cv.get('gain') is not None:
+                init_args += ['--gain', str(int(round(float(cv['gain']))))]
         cam_sel = ['--camera-url', camera_url[role]] if (sources[role] == 'zwo' and camera_url[role]) else []
         pb = playback_by_role.get(role) or {}
         playback_args = (['--playback-ser', pb['ser'], '--playback-speed', str(args.playback_speed),
@@ -579,12 +594,13 @@ def main(argv=None):
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
             '--width', str(rx), '--height', str(ry), '--fps', str(fps_by_role.get(role, args.fps)),
+            '--bit-depth', str(depth_by_role.get(role, args.bit_depth)),
             '--state-shm', state_slot.name,        # sky follow-state pose (file-free)
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
             *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
             '--control-file', cf,
-            *cam_sel, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
+            *cam_sel, *init_args, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
         ])
         if cam_control_vals.get(role):                 # re-apply live control values across a relaunch
             control_writers[role].append({'controls': dict(cam_control_vals[role])})
@@ -842,6 +858,9 @@ def main(argv=None):
             caps.append({'name': 'fps', 'label': 'Max FPS', 'kind': 'number', 'unit': 'fps',
                          'scale': 'linear', 'min': 0.0, 'max': 1000.0,
                          'value': float(fps_by_role.get(role, args.fps)), 'live': True})
+        if src in ('sky', 'zwo'):                          # capture bit depth (8 = RAW8 fast; 16 = full)
+            caps.append({'name': 'depth', 'label': 'Bit Depth', 'kind': 'choice', 'choices': ['8', '16'],
+                         'value': str(depth_by_role.get(role, args.bit_depth)), 'live': False})
         if src in ('sky', 'zwo'):                          # sim crops the render; zwo crops in hardware
             caps.append({'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': _roi_choices(role),
                          'value': _roi_value(role), 'live': False})
@@ -1207,6 +1226,11 @@ def main(argv=None):
                 fps_by_role[role] = max(0.0, float(value))
                 control_write(role, {'fps': fps_by_role[role]})    # cam handles cmd['fps'] directly
                 print(f"[backend] {role} max fps = {fps_by_role[role] or 'unlimited'}", flush=True)
+            elif role in roles and name == 'depth':        # capture bit depth: changes the format -> relaunch
+                depth_by_role[role] = 8 if int(float(str(value))) == 8 else 16
+                if is_connected(role):
+                    restart_cam(role, stop_first=True)
+                print(f"[backend] {role} bit depth = {depth_by_role[role]}", flush=True)
             elif role in roles and name is not None:
                 cam_control_vals[role][name] = value
                 live = next((c.get('live', True) for c in (cam_caps.get(role) or {}).get('controls', [])

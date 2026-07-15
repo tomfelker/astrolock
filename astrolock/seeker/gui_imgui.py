@@ -214,8 +214,15 @@ uniform ivec2 off_g1;
 uniform ivec2 off_b;
 uniform vec2 wb;                        // display-only R,B gains
 uniform float inv_white;                // 1 / container max (255 or 65535)
-uniform float inv_gamma;
 out vec4 frag;
+// The ONLY nonlinearity in the whole pipeline: capture + histogram stay linear; here at the very
+// last step we encode linear light to sRGB for the display (IEC 61966-2-1: a linear toe below
+// 0.0031308, a ~2.4 gamma above). No adjustable gamma -- the data is neutral end to end.
+vec3 lin_to_srgb(vec3 c) {
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(lo, hi, step(vec3(0.0031308), c));
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec3 rgb;
@@ -230,7 +237,7 @@ void main() {
         rgb = vec3(r, g, b);
     }
     rgb = clamp(rgb * inv_white, 0.0, 1.0);
-    frag = vec4(pow(rgb, vec3(inv_gamma)), 1.0);
+    frag = vec4(lin_to_srgb(rgb), 1.0);
 }
 """
 
@@ -264,9 +271,9 @@ class _StreamGL:
         self.key = (w, h, dtype, int(color_id))
         self.out_size = (ow, oh)
 
-    def upload(self, frame, color_id, gamma, wb):
+    def upload(self, frame, color_id, wb):
         """Raw mosaic/mono frame (numpy u16/u8) -> the tonemapped RGBA8 target. Returns (w, h) of the
-        display texture (half-res for Bayer: the 4-plane stack)."""
+        display texture (half-res for Bayer: the 4-plane stack). Linear in, sRGB out (no gamma knob)."""
         h, w = frame.shape[0], frame.shape[1]
         if self.key != (w, h, frame.dtype, int(color_id)):
             self._rebuild(w, h, frame.dtype, color_id)
@@ -277,7 +284,6 @@ class _StreamGL:
         white = int(np.iinfo(frame.dtype).max)
         prog['mosaic'].value = 0
         prog['inv_white'].value = 1.0 / white
-        prog['inv_gamma'].value = (1.0 / gamma) if gamma and gamma != 1.0 else 1.0
         if bayer.is_bayer(color_id):
             ri, (g0, g1), bi = bayer.rgb_plane_indices(color_id)
             prog['mono'].value = 0
@@ -304,7 +310,6 @@ def main(argv=None):
     p.add_argument('--session', required=True, help="session directory to view")
     p.add_argument('--roles', default=None,
                    help="playback override: view a subset of an old session (default: guide,main)")
-    p.add_argument('--gamma', type=float, default=2.2, help="display gamma (1 = linear)")
     p.add_argument('--wb-r', type=float, default=1.24, help="display-only WB gain for red")
     p.add_argument('--wb-b', type=float, default=1.98, help="display-only WB gain for blue")
     p.add_argument('--slew-rate', type=float, default=3.0, help="(unused: the slew pad is log-scaled)")
@@ -594,15 +599,14 @@ def main(argv=None):
             with f.view(FrameRef(seg, show_idx)) as (_rec, disp):
                 fh, fw = disp.shape[0], disp.shape[1]
                 _t = time.perf_counter()
-                w, h = cam['gl'].upload(disp, f.header.color_id, args.gamma, wb)
+                w, h = cam['gl'].upload(disp, f.header.color_id, wb)
                 _prof('upload', (time.perf_counter() - _t) * 1e3)
-                # Histogram inset (off by default): raw-mosaic subsample through the display
-                # gamma (WB-less -- close enough to WYSIWYG).
+                # Histogram inset (off by default): counts of the RAW LINEAR pixel values -- no gamma,
+                # no stretch, so every ADC level lands in its own place (an 8-bit scene fills its bins
+                # evenly instead of combing). WB-less subsample -- close enough to WYSIWYG.
                 if view_settings.get(stream, {}).get('histogram'):
                     white = float(np.iinfo(disp.dtype).max)
                     samp = (disp[::8, ::8].astype(np.float32) / white).clip(0.0, 1.0)
-                    if args.gamma and args.gamma != 1.0:
-                        samp **= (1.0 / args.gamma)
                     counts, _ = np.histogram(samp, bins=64, range=(0.0, 1.0))
                     m = counts.max()
                     hist = np.sqrt(counts / m) if m > 0 else None
@@ -745,10 +749,10 @@ def main(argv=None):
         cam = cams.get(role)
         # A disconnected (not-capturing) real cam: show a placeholder instead of a stale texture.
         if role in roles and not bool((ctrl['state'] or {}).get('capturing', {}).get(role)):
-            st = ctrl['state'] or {}
-            src = (st.get('sources') or {}).get(role)
-            camsel = (st.get('camera') or {}).get(role)
-            who = camsel or ('the simulator' if src == 'sky' else (src or 'a camera'))
+            desired = ui['src'].get(role)                  # the dropdown pick (what Connect will use)
+            who = ('the simulator' if desired == 'sky'
+                   else 'playback' if desired == 'playback'
+                   else desired or 'a camera')
             _draw_placeholder(dl, A, SW, SH, [f"{role.capitalize()} Camera", "No Data",
                                               f"Click to connect to {who}"])
             return
@@ -981,8 +985,12 @@ def main(argv=None):
     # ---- pane clicks -------------------------------------------------------------------------
     def _toggle_connect(role):
         """Connect/Disconnect: fully start or stop this role's cam process, driven off the backend's
-        actual capture state (telemetry) so the button is a plain toggle."""
+        actual capture state (telemetry) so the button is a plain toggle. Connect first applies the
+        desired source (+ camera) chosen in the dropdown, then starts capture -- so the feed only
+        switches when you press Connect, never on a mere dropdown pick."""
         on = bool(((ctrl['state'] or {}).get('capturing') or {}).get(role))
+        if not on:
+            _apply_desired_source(role)                    # push desired source/camera, THEN capture on
         _send({'type': 'capture', 'role': role, 'on': not on})
 
     def _pane_click(name, X0, Y0, SW, SH):
@@ -1083,9 +1091,19 @@ def main(argv=None):
             ui['opt'][role]['sensor'] = model
             _send_optics(role)
 
-    def _on_camera_pick(role, url):
-        _send({'type': 'set_camera', 'role': role, 'url': None if url in (None, '', '(auto)') else url})
-        _automatch_optics(role, url)
+    def _apply_desired_source(role):
+        """Push the GUI's DESIRED source (+ camera, from ui['src']) to the backend. Called from
+        Connect ONLY -- so picking in the dropdown never disturbs a running cam; only Connect
+        switches the feed. The backend's set_source stops any running cam and waits, then the
+        following capture-on relaunches it on the chosen source."""
+        val = ui['src'].get(role)
+        if val == 'sky':
+            _send({'type': 'set_source', 'role': role, 'source': 'sky'})
+        elif val == 'playback':
+            _send({'type': 'set_source', 'role': role, 'source': 'playback'})
+        elif val:                                          # a ZWO camera URL -> source zwo + that camera
+            _send({'type': 'set_source', 'role': role, 'source': 'zwo'})
+            _send({'type': 'set_camera', 'role': role, 'url': None if val == '(auto)' else val})
 
     # Unified source dropdown: one list of "where this pane's frames come from" -- each detected ZWO
     # camera (by model), 'sky', or 'playback'. Picking a camera sets source=zwo + that camera at once.
@@ -1105,13 +1123,11 @@ def main(argv=None):
         return None
 
     def _on_source_pick(role, val):
-        if val == 'sky':
-            _send({'type': 'set_source', 'role': role, 'source': 'sky'})
-        elif val == 'playback':
-            _send({'type': 'set_source', 'role': role, 'source': 'playback'})
-        else:                                              # a ZWO camera URL -> source zwo + that camera
-            _send({'type': 'set_source', 'role': role, 'source': 'zwo'})
-            _on_camera_pick(role, val)
+        """A dropdown pick only chooses the DESIRED source (ui['src'], set by the caller). It does
+        NOT connect, disconnect, or switch anything -- press Connect to apply. Picking a camera
+        auto-matches its optics as a convenience (harmless while disconnected)."""
+        if val and val.startswith('zwo:'):
+            _automatch_optics(role, val)
 
     # ---- caps-driven camera controls (exposure/gain/...) ---------------------------------------
     # The cam publishes each control's kind/range/value; we render a "[<<][<] value [>][>>]" stepper

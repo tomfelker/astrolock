@@ -154,7 +154,7 @@ _ASI_BAYER_TO_COLOR_ID = {
 
 def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
               auto=False, auto_max_exp_ms=200, auto_max_gain=400, auto_target=100,
-              neutral_wb=True, bin=1, camera_url=None, roi=None):
+              neutral_wb=True, bin=1, camera_url=None, roi=None, capture_bits=16):
     """
     Open a ZWO camera for RAW16 full-frame video capture.
     Returns (capture, width, height, color_id, get_settings).
@@ -200,6 +200,10 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         if 'HardwareBin' in ctrls:
             _set(z.ASI_HARDWARE_BIN, 0)        # software bin: required for the cross-color merge
         _set(z.ASI_MONO_BIN, 1)                # merge the Bayer cell -> mono
+    # RAW8 halves the bytes/frame over USB (a big framerate win); RAW16 keeps the full ADC precision
+    # (12 bits left-justified into 16). Either way the value stays LINEAR -- gamma is pinned at 50.
+    img_t = z.ASI_IMG_RAW8 if int(capture_bits) == 8 else z.ASI_IMG_RAW16
+    cap_dtype = np.uint8 if int(capture_bits) == 8 else np.uint16
     roi_win = None
     if roi:
         try:
@@ -213,9 +217,9 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         out_w = max(8, (_w // bin) // 8 * 8)            # ASI ROI is in output px: width % 8, height % 2,
         out_h = max(2, (_h // bin) // 2 * 2)            # start even to keep the Bayer phase on color cams
         cam.set_roi(start_x=(_x0 // bin) & ~1, start_y=(_y0 // bin) & ~1,
-                    width=out_w, height=out_h, bins=bin, image_type=z.ASI_IMG_RAW16)
+                    width=out_w, height=out_h, bins=bin, image_type=img_t)
     else:
-        cam.set_roi(bins=bin, image_type=z.ASI_IMG_RAW16)   # full frame, 16-bit raw, NxN binned
+        cam.set_roi(bins=bin, image_type=img_t)         # full frame, NxN binned, RAW8 or RAW16
     width, height, bins, img_type = cam.get_roi_format()
 
     # This application always wants a fixed, user-specified exposure/gain -- never the camera's auto
@@ -243,10 +247,12 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         color_id = _ASI_BAYER_TO_COLOR_ID.get(int(info.get('BayerPattern', 0)), ser_mod.ColorId.BAYER_RGGB)
     else:
         color_id = ser_mod.ColorId.MONO                  # mono cam, force_mono, or MonoBin merged to gray
-    # Record the camera's true ADC precision in the SER; pixels are still stored in a
-    # 16-bit container (RAW16, 12-bit value left-shifted by 4; see ser.container_max).
-    bit_depth = int(info.get('BitDepth', 16))
-    print(f"[cam] ZWO '{info.get('Name', '?')}' {width}x{height} RAW16 {bit_depth}-bit "
+    # Recorded SER precision: RAW8 stores a true 8-bit container; RAW16 stores the camera's ADC
+    # precision left-justified in 16 bits (12-bit value << 4; see ser.container_max).
+    adc_bits = int(info.get('BitDepth', 16))
+    pixel_depth = 8 if int(capture_bits) == 8 else adc_bits
+    print(f"[cam] ZWO '{info.get('Name', '?')}' {width}x{height} "
+          f"{'RAW8' if int(capture_bits) == 8 else f'RAW16 {adc_bits}-bit'} "
           f"{'auto-exposure' if auto else f'exposure={exposure_us}us gain={gain}'} "
           f"WB={'neutral' if (neutral_wb and is_color) else 'camera'} "
           f"({color_id.name} mosaic)", flush=True)
@@ -258,7 +264,7 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
             f = cam.capture_video_frame(timeout=timeout_ms)
         except z.ZWO_IOError:
             return None  # timeout; caller skips this iteration
-        a = np.asarray(f, dtype=np.uint16)
+        a = np.asarray(f, dtype=cap_dtype)
         if a.ndim == 1:
             a = a.reshape((height, width))
         return a
@@ -326,11 +332,26 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
             _set(z.ASI_HIGH_SPEED_MODE, on)
             return bool(on)
         return None
+
+    # Full control snapshot to the log on connect -- the fastest way to diagnose exposure/gamma/
+    # bit-depth surprises (is gamma really 50? what does high-speed mode change? is anything on auto?).
+    print(f"[cam] ZWO '{info.get('Name', '?')}' controls @ connect "
+          f"(img_type={'RAW8' if int(capture_bits) == 8 else 'RAW16'}):", flush=True)
+    for nm in sorted(ctrls):
+        c = ctrls[nm]
+        try:
+            val, is_auto = cam.get_control_value(c['ControlType'])
+        except Exception:
+            val, is_auto = '?', False
+        span = (f"[{c.get('MinValue')}..{c.get('MaxValue')}]"
+                if c.get('IsWritable', True) else "(read-only)")
+        print(f"    {nm:22s} = {val}{'  (auto)' if is_auto else ''}   {span}", flush=True)
+
     controls = {'source': 'zwo', 'controls': caps, 'set': set_control}
     # Sensor->frame mapping for this capture (constant); the backend uses it to map detection
     # pixels back to sensor angles. We capture full-frame, so roi origin is (0,0).
     meta = {'bin': [bins, bins], 'roi': [0, 0, width, height]}
-    return capture, width, height, color_id, bit_depth, get_settings, meta, controls
+    return capture, width, height, color_id, pixel_depth, get_settings, meta, controls
 
 
 def _open_sky(args, state_path=None, mount_path=None):
@@ -346,19 +367,20 @@ def _open_sky(args, state_path=None, mount_path=None):
     from astrolock.seeker.skysim import SkySim, SkySimConfig
     from astrolock.seeker.almanac import SkyAlmanac
 
+    adc_bits = 8 if int(getattr(args, 'bit_depth', 16)) == 8 else 12   # 8-bit fast mode, else native 12-bit
     cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
                        focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
                        aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm,
                        central_obstruction=args.sky_central_obstruction, spider_vanes=args.sky_spider_vanes,
                        vane_width_frac=args.sky_vane_width_frac,
                        qe=args.sky_qe, full_well_e=args.sky_full_well_e, read_noise_e=args.sky_read_noise_e,
-                       sky_mag_arcsec2=args.sky_sky_mag,
+                       sky_mag_arcsec2=args.sky_sky_mag, adc_bits=adc_bits,
                        psf_sigma_px=args.sky_psf_sigma_px, seeing_r0_m=args.sky_seeing_r0_m)
 
     # Model of the camera's data link (USB3): frames can't be DELIVERED faster than the link
     # carries their bytes, whatever the exposure allows -- the real rig's effective fps ceiling
     # (a 16.6MB full-res frame over ~400MB/s = ~24fps, matching the observed hardware).
-    frame_bytes = cfg.width * cfg.height * 2               # 16-bit container, as written to .ser
+    frame_bytes = cfg.width * cfg.height * (1 if adc_bits <= 8 else 2)   # container bytes/frame (8- or 16-bit)
     bw_interval = (frame_bytes / (args.sim_cam_bandwidth_limit * 1e6)
                    if args.sim_cam_bandwidth_limit > 0 else 0.0)
     _bw = {'last': None}
@@ -379,8 +401,9 @@ def _open_sky(args, state_path=None, mount_path=None):
         # frame, delivered at full commanded speed. Reproduces the real rig's sustained-write
         # pressure on the disk without the sim's GPU cost throttling it.
         import numpy as _np
-        noop_frame = _np.random.default_rng(0).integers(150, 400, size=(cfg.height, cfg.width),
-                                                        dtype=_np.uint16)
+        _hi = 250 if adc_bits <= 8 else 400
+        noop_frame = _np.random.default_rng(0).integers(
+            150, _hi, size=(cfg.height, cfg.width), dtype=_np.uint8 if adc_bits <= 8 else _np.uint16)
         print(f"[cam] sky sim NOOP {cfg.width}x{cfg.height} ({frame_bytes / 1e6:.1f} MB/frame, "
               f"link {args.sim_cam_bandwidth_limit:g} MB/s -> <= "
               f"{(1.0 / bw_interval) if bw_interval else float('inf'):.1f} fps)", flush=True)
@@ -406,7 +429,7 @@ def _open_sky(args, state_path=None, mount_path=None):
             return None
         controls = {'source': 'sky', 'controls': caps, 'set': set_control_noop}
         meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
-        return capture_noop, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta, controls
+        return capture_noop, cfg.width, cfg.height, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
 
     device = resolve_device(getattr(args, 'device', 'auto'))
     sim = SkySim(cfg, device=device)                   # render-only; propagation lives in sky_sim.py
@@ -501,7 +524,7 @@ def _open_sky(args, state_path=None, mount_path=None):
         return None
     controls = {'source': 'sky', 'controls': caps, 'set': set_control}
     meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
-    return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, 12, None, meta, controls
+    return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
 
 
 def _open_playback(args):
@@ -667,6 +690,10 @@ def main(argv=None):
                    help="zwo camera by model: 'zwo:<model>[#k]' (see zwo_camera_urls); wins over --camera-index")
     p.add_argument('--camera-wb', action='store_true',
                    help="zwo: keep the camera's white balance (default: neutral WB for pristine raw)")
+    p.add_argument('--bit-depth', type=int, default=16, choices=[8, 16],
+                   help="capture container depth: 8 = RAW8 (half the USB bytes/frame -> higher fps; "
+                        "sim renders an 8-bit ADC), 16 = full precision (RAW16 = 12-bit for the ASI; "
+                        "sim renders its native 12-bit). Pixels stay LINEAR either way.")
     p.add_argument('--mono', action='store_true', help="store raw mosaic as MONO (no Bayer tag)")
     p.add_argument('--list-cameras', action='store_true', help="list ZWO cameras and exit")
     args = p.parse_args(argv)
@@ -699,7 +726,8 @@ def main(argv=None):
             args.camera_index, args.exposure_us, args.gain, force_mono=args.mono,
             auto=args.auto, auto_max_exp_ms=args.auto_max_exp_ms,
             auto_max_gain=args.auto_max_gain, auto_target=args.auto_target,
-            neutral_wb=not args.camera_wb, bin=args.bin, camera_url=args.camera_url, roi=args.roi)
+            neutral_wb=not args.camera_wb, bin=args.bin, camera_url=args.camera_url, roi=args.roi,
+            capture_bits=args.bit_depth)
     elif args.source == 'sky':
         capture, width, height, color_id, pixel_depth, get_settings, frame_meta, controls = _open_sky(
             args, state_path=os.path.join(out_dir, session_mod.state_name(ts)),
