@@ -65,14 +65,30 @@ def main(argv=None):
     out = None
     out_geom = None
     out_path = None
-    written = skipped = 0
+    written = skipped = thinned = 0
+    first_t_ns = last_t_ns = None                 # capture stamps of the first/last WRITTEN frame
+    phase = 0                                     # decimation phase for the watermark backoff
 
     def skipped_now():
         return skipped + max(0, fo.lost - base_lost)
 
+    def keep_stride(lag_frac):
+        """How aggressively to thin as the drain cursor falls behind the write head. Writing the
+        oldest available frame is the one MOST likely to be lapped mid-write, so as our backlog
+        fills the ring we deliberately drop evenly-spaced frames to hold a safety margin ahead of
+        the writer -- graceful degradation instead of hugging the trailing edge and losing whole
+        chunks to laps. (Disk steady-but-slower-than-USB is exactly this case.)"""
+        if lag_frac < 0.80:
+            return 1                              # plenty of runway: keep every frame
+        if lag_frac < 0.90:
+            return 2                              # keep every other
+        if lag_frac < 0.95:
+            return 4
+        return 8                                  # deep in the buffer: thin hard to escape the write head
+
     def archive_one(rd, i):
         """Write frame i straight from the ring; True if it landed, False if lapped."""
-        nonlocal out, out_geom, out_path, written, skipped
+        nonlocal out, out_geom, out_path, written, skipped, first_t_ns, last_t_ns
         wrote = False
         try:
             with rd.view(i) as (rec, frame):           # ZERO-COPY: write() reads the slot in place
@@ -90,24 +106,45 @@ def main(argv=None):
                                             color_id=rd.header.color_id,
                                             pixel_depth_per_plane=rd.header.pixel_depth_per_plane)
                 out.write_frame(frame, t_utc=_utc_of(rec))   # trailer gets CAPTURE time
+                t_ns = int(rec['t_mono_ns'])
                 wrote = True
         except framestream.Lapped:
             if wrote:
                 out.truncate_last_frame()              # the slot was reused mid-write: torn bytes
             skipped += 1
             return False
+        if first_t_ns is None:
+            first_t_ns = t_ns
+        last_t_ns = t_ns
         written += 1
         return True
+
+    def _archive_or_thin(rd, i):
+        """Apply the watermark backoff, then archive. Deliberately-thinned frames count separately
+        from lapped ones. `rd.cap` is the ring's slot count; committed()-i is how far behind we are."""
+        nonlocal phase, thinned
+        cap = getattr(rd, 'cap', 0) or 1
+        lag_frac = max(0, rd.committed() - i) / cap
+        stride = keep_stride(lag_frac)
+        phase += 1
+        if stride > 1 and phase % stride != 0:
+            thinned += 1
+            return False
+        return archive_one(rd, i)
+
+    def _fps(n):
+        dur = (last_t_ns - first_t_ns) / 1e9 if (first_t_ns and last_t_ns and last_t_ns > first_t_ns) else 0.0
+        return (n - 1) / dur if dur > 0 and n > 1 else 0.0
 
     try:
         while True:
             fo.poll()
             worked = False
             for rd, i in fo.drain(limit=256):
-                worked = archive_one(rd, i) or worked
+                worked = _archive_or_thin(rd, i) or worked
             if stop.is_set():
                 for rd, i in fo.drain():               # freeze: flush what's already committed
-                    archive_one(rd, i)
+                    _archive_or_thin(rd, i)
                 break
             if not worked and fo.ended():
                 break
@@ -119,7 +156,12 @@ def main(argv=None):
         if out is not None:
             out.close()
         fo.close()
-        print(f"[rec:{args.role}] done: {written} frames written, {skipped_now()} skipped"
+        dropped = skipped_now() + thinned
+        avg_fps = _fps(written)                                     # actual written frame rate
+        ideal_fps = _fps(written + dropped)                        # what it'd have been with zero drops
+        print(f"[rec:{args.role}] done: {written} frames written @ {avg_fps:.1f} fps"
+              f" ({dropped} dropped: {skipped_now()} lapped + {thinned} thinned; "
+              f"~{ideal_fps:.1f} fps if none dropped)"
               + (f" -> {out_path}" if out_path else " (nothing arrived)"), flush=True)
 
 

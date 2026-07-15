@@ -357,8 +357,14 @@ def main(argv=None):
                     last_det = (drd.ident, di)
                     import json as _json
                     d = _json.loads(bytes(drd.read(di)).decode('utf-8'))
-                    latest_blobs = d.get('blobs', [])
-                    latest_tracking = bool(d.get('tracking'))
+                    # Trust the blobs only when they index the CURRENT cam stream -- a leftover record
+                    # from the previous camera/geometry would otherwise stack an old star on the new one.
+                    if cur is not None and d.get('seg') == cur.ident:
+                        latest_blobs = d.get('blobs', [])
+                        latest_tracking = bool(d.get('tracking'))
+                    else:
+                        latest_blobs = []
+                        latest_tracking = False
             fo.poll()
             worked = False
             # SEQUENTIAL: exactly one EMA sample per frame, in order, in bounded bites (stay

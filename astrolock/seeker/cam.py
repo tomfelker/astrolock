@@ -232,6 +232,11 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
         _set(z.ASI_WB_R, 50)
         _set(z.ASI_WB_B, 50)
 
+    # Neutral gamma (50 = unity on ASI's [0,100] range): keep the pixels LINEAR. Everything downstream
+    # (detector, focus, tensorez) assumes linear counts; we apply display gamma only at the GUI tonemap.
+    if 'Gamma' in ctrls:
+        _set(z.ASI_GAMMA, 50)
+
     cam.start_video_capture()
 
     if is_color and not force_mono and not mono_ok:      # Bayer: full res, or half-res if binned w/o MonoBin
@@ -279,6 +284,30 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
          'min': float(gain_lo), 'max': float(gain_hi), 'value': float(gain), 'live': True},
     ]
 
+    def _cur(nm, ctrl_id):
+        """Current value of a control, or None if this camera doesn't have it."""
+        if nm not in ctrls:
+            return None
+        try:
+            return cam.get_control_value(ctrl_id)[0]
+        except Exception:
+            return None
+
+    # USB bandwidth throttle (BANDWIDTHOVERLOAD, %): raising it lets the camera push more over USB;
+    # the SDK's default is conservative. The main framerate lever for full-frame captures.
+    bw_cur = _cur('BandWidth', z.ASI_BANDWIDTHOVERLOAD)
+    if bw_cur is not None:
+        bw_lo, bw_hi = _rng('BandWidth', 40, 100)
+        caps.append({'name': 'bandwidth', 'label': 'USB Bandwidth', 'kind': 'number', 'unit': '%',
+                     'scale': 'linear', 'min': float(bw_lo), 'max': float(bw_hi),
+                     'value': float(bw_cur), 'live': True})
+    # High-speed readout mode: faster ADC/readout clock (on many models tied to reduced bit depth /
+    # a bit more read noise). Exposed to experiment with the speed/quality trade.
+    hs_cur = _cur('HighSpeedMode', z.ASI_HIGH_SPEED_MODE)
+    if hs_cur is not None:
+        caps.append({'name': 'highspeed', 'label': 'High Speed Mode', 'kind': 'bool',
+                     'value': bool(hs_cur), 'live': True})
+
     def set_control(name, value):
         if name == 'exposure':
             us = max(1, int(round(value * 1000)))
@@ -288,6 +317,14 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
             g = int(round(value))
             _set(z.ASI_GAIN, g)
             return float(g)
+        if name == 'bandwidth':
+            v = int(round(value))
+            _set(z.ASI_BANDWIDTHOVERLOAD, v)
+            return float(v)
+        if name == 'highspeed':
+            on = 1 if value else 0
+            _set(z.ASI_HIGH_SPEED_MODE, on)
+            return bool(on)
         return None
     controls = {'source': 'zwo', 'controls': caps, 'set': set_control}
     # Sensor->frame mapping for this capture (constant); the backend uses it to map detection

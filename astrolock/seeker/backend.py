@@ -147,7 +147,10 @@ def main(argv=None):
                         "or force 'cpu' / 'cuda' (passed through to both child processes)")
     p.add_argument('--width', type=int, default=1280)
     p.add_argument('--height', type=int, default=720)
-    p.add_argument('--fps', type=float, default=30.0)
+    p.add_argument('--fps', type=float, default=0.0,
+                   help="cam-loop max framerate cap (0 = unlimited, the default -- a real camera "
+                        "self-paces by exposure + readout + USB; this is just an optional throttle, "
+                        "settable live per role in the GUI). Sim/playback have their own pacing too.")
     p.add_argument('--sim-downscale', type=int, default=1,
                    help="DEPRECATED: folded into binning (a sim downscale is an NxN bin). "
                         "Prefer --<role>-bin; this multiplies into every role's bin.")
@@ -413,6 +416,7 @@ def main(argv=None):
     render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
     bin_by_role = {}           # role -> physical NxN bin (recorded in frame metadata; scales plate scale)
+    fps_by_role = {role: args.fps for role in roles}    # role -> cam-loop max-fps cap (0 = unlimited); live
     roi_by_role = {role: None for role in roles}        # role -> None (full) or (out_w, out_h) centered readout
                                                         # window in binned/output px (GUI picks square pow2)
     full_res_by_role = {}      # role -> (res_x, res_y) native px of the un-cropped sensor (for ROI sizing)
@@ -574,7 +578,7 @@ def main(argv=None):
                          if sources[role] == 'playback' and pb.get('ser') else [])
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
             '--role', role, '--out-dir', session_dir, '--source', sources[role],
-            '--width', str(rx), '--height', str(ry), '--fps', str(args.fps),
+            '--width', str(rx), '--height', str(ry), '--fps', str(fps_by_role.get(role, args.fps)),
             '--state-shm', state_slot.name,        # sky follow-state pose (file-free)
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
@@ -833,6 +837,11 @@ def main(argv=None):
         if src in ('sky', 'zwo', 'synthetic'):
             caps.append({'name': 'bin', 'label': 'Binning', 'kind': 'choice', 'choices': ['1', '2', '3', '4'],
                          'value': str(bin_by_role.get(role, 1)), 'live': False})
+            # Max-FPS cap: the cam loop's optional throttle (0 = unlimited). Live -- applied via the
+            # control stream's {'fps': ...} channel, no relaunch.
+            caps.append({'name': 'fps', 'label': 'Max FPS', 'kind': 'number', 'unit': 'fps',
+                         'scale': 'linear', 'min': 0.0, 'max': 1000.0,
+                         'value': float(fps_by_role.get(role, args.fps)), 'live': True})
         if src in ('sky', 'zwo'):                          # sim crops the render; zwo crops in hardware
             caps.append({'name': 'roi', 'label': 'ROI', 'kind': 'choice', 'choices': _roi_choices(role),
                          'value': _roi_value(role), 'live': False})
@@ -1194,6 +1203,10 @@ def main(argv=None):
                 if is_connected(role):
                     restart_cam(role, stop_first=True)
                 print(f"[backend] {role} defocus = {psf_sigma_by_role[role]} px", flush=True)
+            elif role in roles and name == 'fps':          # cam-loop max-fps cap: live, its own channel
+                fps_by_role[role] = max(0.0, float(value))
+                control_write(role, {'fps': fps_by_role[role]})    # cam handles cmd['fps'] directly
+                print(f"[backend] {role} max fps = {fps_by_role[role] or 'unlimited'}", flush=True)
             elif role in roles and name is not None:
                 cam_control_vals[role][name] = value
                 live = next((c.get('live', True) for c in (cam_caps.get(role) or {}).get('controls', [])

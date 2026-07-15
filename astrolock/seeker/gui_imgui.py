@@ -256,6 +256,10 @@ class _StreamGL:
         nb = 2 if bayer.is_bayer(color_id) else 1
         ow, oh = w // nb, h // nb
         self.color = [self.ctx.texture((ow, oh), 4, dtype='f1') for _ in range(2)]
+        for t in self.color:
+            # Smooth when zoomed OUT (minify), but crisp NEAREST pixels when zoomed IN (magnify) -- so a
+            # deep zoom shows the actual sensor pixels instead of a bilinear smear.
+            t.filter = (self.ctx.LINEAR, self.ctx.NEAREST)
         self.fbo = [self.ctx.framebuffer(color_attachments=[t]) for t in self.color]
         self.key = (w, h, dtype, int(color_id))
         self.out_size = (ow, oh)
@@ -561,12 +565,15 @@ def main(argv=None):
         if seg != cam['ser_path']:
             cam['ser_path'] = seg
             cam['last_idx'] = cam['det_idx'] = -1
+            cam['blobs'], cam['ext'], cam['status'] = [], None, None   # old stream's detections are stale
         for rec in (_det_records(stream) if stream in roles else ()):
-            cam['blobs'] = rec.get('blobs', [])
-            cam['ext'] = rec.get('ext')                         # extended-detector metrics (or None)
-            cam['status'] = rec.get('status')                   # detector's freeform status line (or None)
-            # Detection indices only apply against the SAME cam segment the record was made on.
+            # Detections index the cam stream they were made on; a record for a DIFFERENT stream (an
+            # in-flight leftover from the previous camera/geometry) must not paint boxes on this one.
             same_seg = (rec.get('seg', '') + '.ser') == cam['ser_path']
+            if same_seg:
+                cam['blobs'] = rec.get('blobs', [])
+                cam['ext'] = rec.get('ext')                     # extended/circmean metrics (or None)
+                cam['status'] = rec.get('status')               # detector's freeform status line (or None)
             new_idx = rec.get('index', cam['det_idx']) if same_seg else cam['det_idx']
             if stream in perf['det']:                    # a detection record = one frame the detector ran;
                 perf['det'][stream].hit()                # an index gap = frames it skipped to keep up
@@ -1175,7 +1182,13 @@ def main(argv=None):
                 if ch and 0 <= nidx < len(items):
                     cam_ctrl_val[(role, nm)] = items[nidx]
                     _send({'type': 'set_cam_control', 'role': role, 'name': nm, 'value': items[nidx]})
-            # (bool / file kinds -> later slices)
+            elif desc.get('kind') == 'bool':               # a plain on/off toggle (e.g. High Speed Mode)
+                cur = bool(cam_ctrl_val.get((role, nm), desc.get('value', False)))
+                ch, v = imgui.checkbox(f"{desc.get('label', nm)}##c_{role}_{nm}", cur)
+                if ch:
+                    cam_ctrl_val[(role, nm)] = v
+                    _send({'type': 'set_cam_control', 'role': role, 'name': nm, 'value': v})
+            # (file kind -> later slices)
 
     # ---- settings persistence -------------------------------------------------------------------
     def gather_settings():
