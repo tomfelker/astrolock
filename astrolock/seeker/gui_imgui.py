@@ -90,7 +90,7 @@ MAXPIP = 4                       # pool of PIP panes along the bottom; each show
 
 
 def _default_settings():
-    return {'zoom': 1, 'reticles': True, 'histogram': False}
+    return {'zoom': 1, 'reticles': True, 'histogram': False, 'wait_for_detector': True}
 
 
 def _floor_pow2(x):
@@ -587,9 +587,11 @@ def main(argv=None):
                 if rec.get('proc_ms') is not None:       # the detector's own whole-frame cost
                     _prof(f'det:{stream}', float(rec['proc_ms']))
             cam['det_idx'] = new_idx
-        # Pick the frame to show, as an index into `seg`. If a detector is running on this stream, show the
-        # frame it last processed (clamped, never ahead) so its boxes match the pixels. Else show newest.
-        show_idx = cam['det_idx'] if 0 <= cam['det_idx'] <= idx else idx
+        # Pick the frame to show, as an index into `seg`. With "wait for detector" on (default), show the
+        # frame the detector last processed (clamped, never ahead) so its boxes match the pixels; with it
+        # off, show the newest frame for minimum latency (the detection overlay then lags a frame or two).
+        wait_det = view_settings.get(stream, {}).get('wait_for_detector', True)
+        show_idx = cam['det_idx'] if (wait_det and 0 <= cam['det_idx'] <= idx) else idx
         if show_idx == cam['last_idx']:
             return False
         hist = None
@@ -982,7 +984,14 @@ def main(argv=None):
         st_now = ctrl['state'] or {}
         capturing = bool(st_now.get('capturing', {}).get(role))
         recording = bool((st_now.get('recording') or {}).get(role)) and capturing
-        status = (f"{role}  f{cam['last_idx']}  {_color_name(cam['color_id'])}  "
+        srclabel, fps_str = '', ''
+        if role in roles:                                # which source/camera + its production framerate
+            src = (st_now.get('sources') or {}).get(role)
+            camurl = (st_now.get('camera') or {}).get(role)
+            srclabel = (camurl.replace('zwo:', '') if (src == 'zwo' and camurl) else (src or '?')) + "  "
+            m = perf['cam'].get(role)
+            fps_str = f"{m.rate:.0f} fps  " if m else ''
+        status = (f"{role}  {srclabel}f{cam['last_idx']}  {fps_str}{_color_name(cam['color_id'])}  "
                   f"blobs {len(cam['blobs'])}  zoom {round(scale * 100)}%" + ("  REC" if recording else ""))
         _text(dl, A(S(8), SH - S(20)), status, S(13), (200, 205, 220, 230))
         if role in roles and st_now.get('tracking') and int(time.perf_counter() * 1.5) % 2 == 0:
@@ -1253,7 +1262,7 @@ def main(argv=None):
                 layout[k] = v
         for role, s in (data.get('display') or {}).items():
             vs = view_settings.setdefault(role, _default_settings())
-            for k in ('zoom', 'reticles', 'histogram'):
+            for k in ('zoom', 'reticles', 'histogram', 'wait_for_detector'):
                 if k in s:
                     vs[k] = s[k]
         opt = data.get('optics') or {}
@@ -1669,6 +1678,13 @@ def main(argv=None):
         if ch and 0 <= nidx < len(items):
             ui['src'][role] = items[nidx]
             _on_source_pick(role, items[nidx])
+        # Connect/Disconnect sits right under the dropdown it applies -- picking a source only sets the
+        # desired; Connect is what actually starts it on that source.
+        cap_on = bool(((st or {}).get('capturing') or {}).get(role))
+        if imgui.button(("Disconnect" if cap_on else "Connect") + f"##conn_{role}"):
+            _toggle_connect(role)
+        _tip("Start/stop this camera's capture on the source picked above. Nothing connects until you "
+             "press this -- so two roles don't both grab '(auto)' and wedge the USB bus.")
         # Playback source: a .ser to replay + a loop toggle; shown only when source == playback.
         if ui['src'].get(role) == 'playback':
             if imgui.button(f"File...##pb_{role}"):
@@ -1684,12 +1700,6 @@ def main(argv=None):
                 _send({'type': 'set_playback', 'role': role, 'loop': v})
             _tip("Loop the recording instead of stopping at the end.")
         _panel_cam_controls(role, ((st or {}).get('camera_caps') or {}).get(role))
-        cap_on = bool(((st or {}).get('capturing') or {}).get(role))
-        if imgui.button(("Disconnect" if cap_on else "Connect") + f"##conn_{role}"):
-            _toggle_connect(role)
-        _tip("Start/stop this camera's capture process. Nothing connects until you press this -- pick "
-             "the driver and (for zwo) the camera first, so two roles don't both grab '(auto)' and "
-             "wedge the USB bus.")
         ch, v = imgui.checkbox(f"Recording##rec_{role}", ui['rec'][role])
         if ch:
             ui['rec'][role] = v
@@ -1708,6 +1718,12 @@ def main(argv=None):
         if ch:
             sset['histogram'] = v
         _tip("Show a luminance histogram inset on this camera's pane (judge exposure/clipping).")
+        ch, v = imgui.checkbox(f"Wait for detector##waitdet_{role}", sset.get('wait_for_detector', True))
+        if ch:
+            sset['wait_for_detector'] = v
+        _tip("On (default): show each frame only once the detector has processed it, so the detection "
+             "boxes sit exactly on the pixels. Off: show the newest frame immediately (lower latency), "
+             "and let the boxes lag a frame or two behind.")
 
     def _panel():
         st = ctrl['state'] or {}
