@@ -41,6 +41,8 @@ class Sensor:
     qe: float = 0.0           # peak quantum efficiency (e-/photon), 0..1; 0 = unknown (sim uses a fixed flux)
     full_well_e: float = 0.0  # full-well capacity (electrons); sets ADC saturation. 0 = unknown
     read_noise_e: float = 0.0 # read noise (electrons RMS); 0 = unknown (sim uses its default)
+    hcg_gain: int = 0         # gain (camera units) where High Conversion Gain kicks in; 0 = none/unknown
+                              # -- the driver switches conversion gain here and read noise drops sharply.
 
     @property
     def is_color(self):
@@ -87,7 +89,8 @@ def load_db(path=None):
         raw = json.load(f)
     sensors = {s['name']: Sensor(s['name'], s['res_x'], s['res_y'], s['pixel_um'],
                                  s.get('bayer'), bool(s.get('mono')),
-                                 s.get('qe', 0.0), s.get('full_well_e', 0.0), s.get('read_noise_e', 0.0))
+                                 s.get('qe', 0.0), s.get('full_well_e', 0.0), s.get('read_noise_e', 0.0),
+                                 int(s.get('hcg_gain', 0)))
                for s in raw['sensors']}
     optics = {o['name']: Optic(o['name'], o['focal_length_mm'], o['aperture_mm'],
                                o.get('obstruction_mm', 0.0), int(o.get('spider_vanes', 0)),

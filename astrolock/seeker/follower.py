@@ -39,6 +39,12 @@ class SerFollower:
         self._fo.poll()
         return self._fo.committed()
 
+    def ended(self):
+        """True if the current run has finalized and no newer ring has appeared yet -- i.e. the
+        producer stopped (or is mid-relaunch) and there's no live feed right now."""
+        self._fo.poll()
+        return self._fo.ended()
+
     def latest_ref(self):
         """FrameRef of the newest committed frame (or None), without touching its pixels."""
         self._fo.poll()

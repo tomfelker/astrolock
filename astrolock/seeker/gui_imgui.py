@@ -747,8 +747,16 @@ def main(argv=None):
 
         role = _slot_stream(name)                        # display stream (may be the <role>_debug surface)
         cam = cams.get(role)
-        # A disconnected (not-capturing) real cam: show a placeholder instead of a stale texture.
-        if role in roles and not bool((ctrl['state'] or {}).get('capturing', {}).get(role)):
+        # Placeholder instead of a stale texture when there's no LIVE feed: either disconnected, or
+        # mid-(re)connect -- the old cam's ring has ended and the new one hasn't produced a frame yet
+        # (this is what caused "the previous camera flashes for a second when you connect a new one").
+        capturing = bool((ctrl['state'] or {}).get('capturing', {}).get(role))
+        fol = followers.get(role)
+        live = bool(fol is not None and fol.committed_count() > 0 and not fol.ended())
+        if role in roles and not (capturing and live):
+            if capturing:                                  # connected, but the feed hasn't started yet
+                _draw_placeholder(dl, A, SW, SH, [f"{role.capitalize()} Camera", "Connecting…", ""])
+                return
             desired = ui['src'].get(role)                  # the dropdown pick (what Connect will use)
             who = ('the simulator' if desired == 'sky'
                    else 'playback' if desired == 'playback'
@@ -1187,6 +1195,16 @@ def main(argv=None):
                 if desc.get('unit'):
                     imgui.same_line()
                     imgui.text_colored(C4(140, 145, 160), desc['unit'])
+                if nm == 'gain' and (caps or {}).get('source') == 'zwo':   # HCG threshold from the sensor DB
+                    sen = _SENS.get((ui['opt'].get(role) or {}).get('sensor', ''))
+                    hcg = sen.hcg_gain if sen else 0
+                    if hcg > 0:
+                        on = cam_ctrl_val.get((role, nm), desc.get('value', 0.0)) >= hcg
+                        imgui.same_line()
+                        imgui.text_colored(C4(120, 210, 130) if on else C4(150, 155, 170),
+                                           f"HCG@{hcg}{' on' if on else ''}")
+                        _tip(f"High Conversion Gain engages at gain {hcg} on this sensor; read noise "
+                             f"drops sharply there. Gain >= {hcg} runs in low-noise HCG mode.")
             elif desc.get('kind') == 'choice':         # relaunch-tier (binning/ROI): each pick relaunches
                 imgui.text(f"{desc.get('label', nm)}:")
                 imgui.same_line()

@@ -1095,8 +1095,11 @@ def main(argv=None):
                             pass                     # writer outran us mid-frame; take the next
                         next_index += 1
                         worked = True
-                if not worked and fo.ended():
-                    break                        # stream ended cleanly and we're caught up
+                # NOTE: --follow deliberately does NOT exit on `ended` (that's the documented contract:
+                # "never exit on finalize"). A cam disconnect/relaunch (Connect, source switch, bit-depth
+                # change) ends the old ring and starts a new one; the detector must ride across it, not
+                # die. Exiting here raced restart_cam's relaunch check and left a live-but-dead detector
+                # stuck at 0 fps. Only the stop-file (backend) or Ctrl-C ends a follow run.
             else:
                 for rd, i in fo.drain():         # offline: every frame, in order, across rings
                     if rd is not cur:
