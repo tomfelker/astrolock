@@ -696,6 +696,17 @@ def main(argv=None):
                         "sim renders its native 12-bit). Pixels stay LINEAR either way.")
     p.add_argument('--mono', action='store_true', help="store raw mosaic as MONO (no Bayer tag)")
     p.add_argument('--list-cameras', action='store_true', help="list ZWO cameras and exit")
+    p.add_argument('--benchmark', action='store_true',
+                   help="measure sustained framerate then exit: run the normal capture->framestream "
+                        "loop (frames still written -- nobody reads them) with the --fps cap forced "
+                        "off, for --benchmark-seconds after a warm-up, then print the delivered fps + "
+                        "throughput for the current geometry/bit-depth. Compare against the frame-rate "
+                        "table in the camera's manual. Add --shm-ser to take the disk out of the loop.")
+    p.add_argument('--benchmark-seconds', type=float, default=10.0,
+                   help="benchmark: timed window in seconds (default 10)")
+    p.add_argument('--benchmark-warmup', type=float, default=1.0,
+                   help="benchmark: warm-up seconds discarded before timing (the first frames after "
+                        "start_video_capture can straggle while the USB pipeline fills)")
     args = p.parse_args(argv)
 
     if args.list_cameras:
@@ -769,6 +780,19 @@ def main(argv=None):
     last_status = start
     last_status_n = 0
     stop = False
+    # Benchmark: run the real capture->write->commit loop (frames land in the ring/disk, unread)
+    # with the fps cap forced off, and time a fixed window after a warm-up. bench['n0']/['t0'] mark
+    # the window start; ['end'] the wall-clock to stop. The frame count over that window is the fps.
+    bench = None
+    if args.benchmark:
+        cfg['fps'] = 0.0                                  # uncapped: measure the source's own ceiling
+        bench = {'warm_until': start + max(0.0, args.benchmark_warmup),
+                 't0': None, 'n0': None, 'end': None}
+        print(f"[cam:{args.role}] BENCHMARK {args.source} {width}x{height} bin={args.bin} "
+              f"{'RAW8' if int(args.bit_depth) == 8 else 'RAW16'} {color_id.name} {pixel_depth}-bit"
+              + (f"  [{get_settings()}]" if get_settings else "")
+              + f"  (warmup {args.benchmark_warmup:g}s, window {args.benchmark_seconds:g}s, "
+              f"{'shm' if args.shm_ser else 'disk'})", flush=True)
     try:
         while True:
             if control is not None:
@@ -814,6 +838,22 @@ def main(argv=None):
                 t_utc_ns=time.time_ns(),
                 src_index=total)
             total += 1
+
+            if bench is not None:                          # warm up, then time a fixed window
+                now = time.perf_counter()
+                if bench['t0'] is None:
+                    if now >= bench['warm_until']:
+                        bench['t0'], bench['n0'] = now, total
+                        bench['end'] = now + max(0.1, args.benchmark_seconds)
+                elif now >= bench['end']:
+                    elapsed = now - bench['t0']
+                    frames = total - bench['n0']
+                    fps = frames / elapsed if elapsed > 0 else 0.0
+                    bpp = 1 if int(args.bit_depth) == 8 else 2
+                    print(f"[cam:{args.role}] BENCHMARK result: {frames} frames in {elapsed:.2f}s "
+                          f"= {fps:.1f} fps ({fps * width * height / 1e6:.1f} Mpx/s, "
+                          f"{fps * width * height * bpp / 1e6:.0f} MB/s over USB)", flush=True)
+                    break
 
             period = 1.0 / cfg['fps'] if cfg['fps'] > 0 else 0.0
             if period:

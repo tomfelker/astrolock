@@ -8,3 +8,4 @@ data/skyfield_cache/**
 data/alignments/autosave.json
 data/seeker_examples/**
 recordings/
+data/datasheets/
