@@ -38,11 +38,17 @@ class Sensor:
     pixel_um: float
     bayer: str = None        # Bayer mosaic pattern (e.g. 'RGGB') if a known color sensor
     mono: bool = False        # explicitly flagged a mono sensor
+    shutter: str = None       # 'rolling' or 'global' (Pregius); None = unknown. Rolling skews fast targets.
     qe: float = 0.0           # peak quantum efficiency (e-/photon), 0..1; 0 = unknown (sim uses a fixed flux)
     full_well_e: float = 0.0  # full-well capacity (electrons); sets ADC saturation. 0 = unknown
-    read_noise_e: float = 0.0 # read noise (electrons RMS); 0 = unknown (sim uses its default)
+    read_noise_e: float = 0.0 # read noise (electrons RMS) at the operating point (HCG if any, else min); 0 = unknown
+    read_noise_e_base: float = 0.0  # read noise at gain 0 (pre-HCG, the highest); 0 = unknown
+    read_noise_e_hcg: float = 0.0   # read noise at the HCG gain (the low-noise regime); 0 = none/unknown
     hcg_gain: int = 0         # gain (camera units) where High Conversion Gain kicks in; 0 = none/unknown
                               # -- the driver switches conversion gain here and read noise drops sharply.
+    unity_gain: int = 0       # gain (camera units) where 1 e- = 1 ADU, from the manual's EGAIN graph; 0 = unknown
+    adc_bits: int = 0         # ADC bit depth (12/14/16); 0 = unknown. Sim renders to 2^adc_bits-1.
+    max_fps: float = 0.0      # manufacturer max fps at full resolution (USB3, 8-bit); 0 = unknown
 
     @property
     def is_color(self):
@@ -88,9 +94,11 @@ def load_db(path=None):
     with open(path or _DEFAULT_DB) as f:
         raw = json.load(f)
     sensors = {s['name']: Sensor(s['name'], s['res_x'], s['res_y'], s['pixel_um'],
-                                 s.get('bayer'), bool(s.get('mono')),
+                                 s.get('bayer'), bool(s.get('mono')), s.get('shutter'),
                                  s.get('qe', 0.0), s.get('full_well_e', 0.0), s.get('read_noise_e', 0.0),
-                                 int(s.get('hcg_gain', 0)))
+                                 s.get('read_noise_e_base', 0.0), s.get('read_noise_e_hcg', 0.0),
+                                 int(s.get('hcg_gain', 0)), int(s.get('unity_gain', 0)),
+                                 int(s.get('adc_bits', 0)), float(s.get('max_fps', 0.0)))
                for s in raw['sensors']}
     optics = {o['name']: Optic(o['name'], o['focal_length_mm'], o['aperture_mm'],
                                o.get('obstruction_mm', 0.0), int(o.get('spider_vanes', 0)),
