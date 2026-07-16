@@ -38,6 +38,30 @@ def resolve_device(name):
     return torch.device(name)
 
 
+def set_priority(level):
+    """Raise this process's scheduling priority. The capture loop has a hard deadline: a real camera
+    free-runs, so if we're descheduled and call capture_video_frame() late, its buffer overflows and
+    the CAMERA drops frames at the source -- lost forever, and visible as a lower, jittery fps rather
+    than a clean stall. 'realtime' is deliberately not offered: it can starve the OS (input included).
+    A failure here is a warning, not fatal -- capture still works, just at normal priority."""
+    if level in (None, '', 'normal'):
+        return
+    if os.name == 'nt':
+        import ctypes
+        classes = {'above': 0x00008000, 'high': 0x00000080}     # ABOVE_NORMAL / HIGH_PRIORITY_CLASS
+        k32 = ctypes.windll.kernel32
+        if not k32.SetPriorityClass(k32.GetCurrentProcess(), classes[level]):
+            print(f"[cam] could not set priority {level!r}: {ctypes.WinError()}", flush=True)
+            return
+    else:
+        try:
+            os.nice({'above': -5, 'high': -10}[level])          # needs privileges; warn if denied
+        except PermissionError as e:
+            print(f"[cam] could not set priority {level!r}: {e}", flush=True)
+            return
+    print(f"[cam] process priority: {level}", flush=True)
+
+
 def make_synthetic_frame(width, height, t, max_val=65535):
     """A faint-noise background with one bright Gaussian blob moving in a Lissajous path (torch;
     uint16 numpy only at the SER-writer boundary)."""
@@ -696,6 +720,12 @@ def main(argv=None):
                         "sim renders its native 12-bit). Pixels stay LINEAR either way.")
     p.add_argument('--mono', action='store_true', help="store raw mosaic as MONO (no Bayer tag)")
     p.add_argument('--list-cameras', action='store_true', help="list ZWO cameras and exit")
+    p.add_argument('--priority', default='normal', choices=['normal', 'above', 'high'],
+                   help="scheduling priority for this capture process. A real camera free-runs: if we "
+                        "call capture late because we were descheduled, the camera's buffer overflows "
+                        "and IT drops frames. Raise this when the fps sits below the sensor's rated "
+                        "rate with jittery frame intervals. ('realtime' is not offered -- it can starve "
+                        "the OS.)")
     p.add_argument('--benchmark', action='store_true',
                    help="measure sustained framerate then exit: run the normal capture->framestream "
                         "loop (frames still written -- nobody reads them) with the --fps cap forced "
@@ -708,6 +738,8 @@ def main(argv=None):
                    help="benchmark: warm-up seconds discarded before timing (the first frames after "
                         "start_video_capture can straggle while the USB pipeline fills)")
     args = p.parse_args(argv)
+
+    set_priority(args.priority)          # before we open the camera and start free-running
 
     if args.list_cameras:
         cams = list_zwo_cameras()

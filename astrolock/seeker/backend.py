@@ -151,6 +151,10 @@ def main(argv=None):
                    help="cam-loop max framerate cap (0 = unlimited, the default -- a real camera "
                         "self-paces by exposure + readout + USB; this is just an optional throttle, "
                         "settable live per role in the GUI). Sim/playback have their own pacing too.")
+    p.add_argument('--cam-priority', default='normal', choices=['normal', 'above', 'high'],
+                   help="scheduling priority for the cam capture processes. A real camera free-runs, so "
+                        "a late capture call means IT drops frames; raise this if fps sits below the "
+                        "sensor's rated rate with jittery intervals.")
     p.add_argument('--bit-depth', type=int, default=16, choices=[8, 16],
                    help="capture container depth: 8 = RAW8 (half the USB bytes/frame -> higher fps), "
                         "16 = full precision (12-bit ASI / 12-bit sim). Per-role, relaunch on change.")
@@ -598,6 +602,7 @@ def main(argv=None):
             '--state-shm', state_slot.name,        # sky follow-state pose (file-free)
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
+            '--priority', args.cam_priority,       # capture has a deadline; the camera drops if we're late
             *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
             '--control-file', cf,
             *cam_sel, *init_args, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
