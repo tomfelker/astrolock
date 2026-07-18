@@ -83,7 +83,7 @@ ROLES = ('guide', 'main')      # the two fixed roles: a wide guide cam that poin
 
 PANEL_W = 320                    # default right-panel width (logical px, pre-DPI)
 PANEL_MIN_W = 220
-ZOOM_MULTS = (0.25, 0.5, 1, 2, 4, 8, 16)   # multiplier over the auto power-of-two fit (1 = fit-to-pane;
+ZOOM_MULTS = (0.25, 0.5, 1, 2, 4, 8, 16, 32, 64)   # multiplier over the auto power-of-two fit (1 = fit-to-pane;
                                             # <1 zooms OUT -- a tiny focus crop auto-fits at ~16x, where
                                             # '-' used to be pinned at the floor and felt dead)
 MAXPIP = 4                       # pool of PIP panes along the bottom; each shows a stream not in the big pane
@@ -242,6 +242,29 @@ void main() {
 """
 
 
+# Magnified-view blit: imgui 1.92's GL3 backend binds its OWN (bilinear) GL sampler object
+# while rendering, and a bound sampler OVERRIDES texture-level filters -- so the color
+# target's (LINEAR, NEAREST) filter no longer gives crisp pixels when a pane magnifies.
+# Instead we nearest-resample the pane's visible crop into a pane-sized target with our own
+# sampler and let imgui draw THAT at 1:1, where its bilinear sampler is a no-op.
+_VS_BLIT = """#version 330 core
+uniform vec4 src;            // visible crop of the source texture: (u0, v0, du, dv)
+out vec2 uv;
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    uv = src.xy + p * src.zw;
+}
+"""
+
+_FS_BLIT = """#version 330 core
+uniform sampler2D img;
+in vec2 uv;
+out vec4 frag;
+void main() { frag = texture(img, uv); }
+"""
+
+
 class _StreamGL:
     """GPU resources for one stream: a double-buffered raw integer texture (so a write never stalls
     on a frame the GPU is still reading) + a matching pair of RGBA8 render targets. upload() runs the
@@ -279,6 +302,7 @@ class _StreamGL:
             self._rebuild(w, h, frame.dtype, color_id)
         self.flip ^= 1
         i = self.flip
+        self.tex_obj = self.color[i]             # moderngl handle for the nearest-blit pass
         self.raw[i].write(np.ascontiguousarray(frame))
         prog = self.prog
         white = int(np.iinfo(frame.dtype).max)
@@ -317,8 +341,19 @@ def main(argv=None):
                    help="UI/DPI scale factor (0 = auto-detect from the OS; e.g. 1.5 for a 150%% display)")
     p.add_argument('--device', default='auto',
                    help="(accepted for CLI compatibility; this GUI tonemaps on the GPU via GL, no torch)")
+    p.add_argument('--priority', default='below', choices=['below', 'normal'],
+                   help="GUI process priority: 'below' yields to the capture/track pipeline under "
+                        "load (tier 4 of the backend's --sched ladder); 'normal' opts out")
     args = p.parse_args(argv)
     wb = (args.wb_r, args.wb_b)
+
+    if args.priority == 'below':                          # frames matter more than widgets
+        try:
+            import psutil
+            from astrolock.seeker.cam import prio_value
+            psutil.Process().nice(prio_value('below'))
+        except Exception as e:
+            print(f"[gui] could not lower priority: {e}", flush=True)
 
     import glfw
     import moderngl
@@ -350,6 +385,10 @@ def main(argv=None):
     ctx = moderngl.create_context()
     prog = ctx.program(vertex_shader=_VS, fragment_shader=_FS)
     vao = ctx.vertex_array(prog, [])             # fullscreen triangle from gl_VertexID; no buffers
+    prog_blit = ctx.program(vertex_shader=_VS_BLIT, fragment_shader=_FS_BLIT)
+    vao_blit = ctx.vertex_array(prog_blit, [])
+    samp_nearest = ctx.sampler(filter=(moderngl.NEAREST, moderngl.NEAREST))
+    blit_slots = {}          # slot name -> {'size', 'tex', 'fbo'}: per-pane magnified-view target
 
     imgui.create_context()
     io = imgui.get_io()
@@ -735,11 +774,38 @@ def main(argv=None):
             _text(dl, A(SW / 2.0 - S(4) * len(ln), cy + i * S(22)), ln, S(18), (150, 155, 170, 255))
 
     def _pane_geom(cam, stream, SW, SH):
-        """(scale, offx, offy) of the letterboxed image in a pane -- shared by draw + click mapping."""
+        """(scale, offx, offy) of the letterboxed image in a pane -- shared by draw + click mapping.
+
+        Zoomed IN on the wider cam (guide), the view centres on the boresight-shifted
+        main-cam FoV centre instead of the frame centre, so a deep guide zoom previews
+        what the main cam should be seeing."""
         w, h = cam['w'], cam['h']
         zoom = view_settings.setdefault(stream, _default_settings())['zoom']
         scale = _floor_pow2(min(SW / w, SH / h) * 0.95) * zoom
-        return scale, (SW - w * scale) / 2.0, (SH - h * scale) / 2.0
+        offx, offy = (SW - w * scale) / 2.0, (SH - h * scale) / 2.0
+        if zoom > 1:
+            base = stream
+            for suf in ('_focus', '_debug'):
+                if base.endswith(suf):
+                    base = base[:-len(suf)]
+            stt = ctrl['state'] or {}
+            optx = stt.get('optics') or {}
+            me = optx.get(base)
+            inner = None                       # a narrower co-aligned cam nested in this view
+            if me:
+                for r2, fv2 in optx.items():
+                    if r2 != base and fv2['fov_x_deg'] < me['fov_x_deg'] \
+                            and fv2['fov_y_deg'] < me['fov_y_deg']:
+                        inner = fv2
+                        break
+            if inner is not None:
+                bmr = stt.get('boresight_mrad') or (0.0, 0.0)
+                fpx = (w / 2.0) / math.tan(math.radians(me['fov_x_deg'] / 2.0))
+                fpy = (h / 2.0) / math.tan(math.radians(me['fov_y_deg'] / 2.0))
+                mcx = w / 2.0 + fpx * math.tan(bmr[0] * 1e-3)   # main-FoV centre, frame px
+                mcy = h / 2.0 + fpy * math.tan(bmr[1] * 1e-3)
+                offx, offy = SW / 2.0 - mcx * scale, SH / 2.0 - mcy * scale
+        return scale, offx, offy
 
     def draw_slot(name, X0, Y0, SW, SH, dl):
         """Draw the slot's assigned stream letterboxed + centred, with overlays, at the pane's size.
@@ -773,12 +839,39 @@ def main(argv=None):
         sset = view_settings.setdefault(role, _default_settings())
         scale, offx, offy = _pane_geom(cam, role, SW, SH)
         dw, dh = w * scale, h * scale
-        cx, cy = SW / 2.0, SH / 2.0
+        cx, cy = offx + dw / 2.0, offy + dh / 2.0   # FRAME centre (≠ pane centre when zoom
+                                                    # re-centres on the main-cam FoV)
 
         def T(fx, fy):                          # frame (detect) px -> pane-local px
             return offx + fx * cam['ox'] * scale, offy + fy * cam['oy'] * scale
 
-        dl.add_image(imgui.ImTextureRef(cam['gl'].tex_id), A(offx, offy), A(offx + dw, offy + dh))
+        img_ref = imgui.ImTextureRef(cam['gl'].tex_id)
+        ip0, ip1 = A(offx, offy), A(offx + dw, offy + dh)
+        if scale > 1.0:
+            # Magnifying: route the visible crop through our NEAREST resample pass (see
+            # _VS_BLIT) -- drawing the texture magnified through imgui is always bilinear.
+            x0, y0 = int(round(max(0.0, offx))), int(round(max(0.0, offy)))
+            x1 = int(round(min(float(SW), offx + dw)))
+            y1 = int(round(min(float(SH), offy + dh)))
+            bw, bh = max(1, x1 - x0), max(1, y1 - y0)
+            bs = blit_slots.setdefault(name, {'size': None, 'tex': None, 'fbo': None})
+            if bs['size'] != (bw, bh):
+                if bs['fbo'] is not None:
+                    bs['fbo'].release()
+                    bs['tex'].release()
+                bs['tex'] = ctx.texture((bw, bh), 4, dtype='f1')
+                bs['fbo'] = ctx.framebuffer(color_attachments=[bs['tex']])
+                bs['size'] = (bw, bh)
+            prog_blit['src'].value = ((x0 - offx) / dw, (y0 - offy) / dh,
+                                      (x1 - x0) / dw, (y1 - y0) / dh)
+            bs['fbo'].use()
+            samp_nearest.use(0)
+            cam['gl'].tex_obj.use(0)
+            vao_blit.render(mode=ctx.TRIANGLES, vertices=3)
+            samp_nearest.clear(0)
+            img_ref = imgui.ImTextureRef(bs['tex'].glo)
+            ip0, ip1 = A(x0, y0), A(x1, y1)
+        dl.add_image(img_ref, ip0, ip1)
 
         # Tracking state shared by the overlays below.
         stt = ctrl['state'] or {}
