@@ -739,15 +739,11 @@ def circmean_target(work, *, down=4, bg_radius=64, k_sigma=5.0, z_thresh=15.0):
     n = float(mask.sum())
     present = bool(z >= z_thresh and n > 0)
 
-    def half_px(R, length):                                 # ~2 circular stdevs, for a cosmetic bbox
-        R = min(max(R, 1e-6), 1.0 - 1e-9)
-        return min(2.0 * math.sqrt(-2.0 * math.log(R)) * length / (2.0 * math.pi), length / 2.0)
-
-    hx, hy = half_px(rx, W) * down, half_px(ry, H) * down
     com_w = [cx * down, cy * down]
     peak = float((ds * mask).max()) if n > 0 else 0.0        # brightest surviving (downscaled) pixel
+    # No bbox: circmean's answer is the CoM, not an extent -- a box derived from the circular
+    # stdevs was pure threshold jitter on screen. Consumers draw whatever fields exist.
     return {'present': present, 'com': com_w,
-            'bbox': [com_w[0] - hx, com_w[1] - hy, 2.0 * hx, 2.0 * hy],
             'z': z, 'zx': zx, 'zy': zy, 'n': int(n), 'peak': peak,
             'resid': torch.abs(resid)}                       # residual magnitude for the debug movie
 
@@ -976,10 +972,9 @@ def main(argv=None):
                                  k_sigma=args.circ_nsigma, z_thresh=args.circ_z)
             cs = coord_scale
             com_f = [cm['com'][0] * cs, cm['com'][1] * cs]
-            bbox_f = [v * cs for v in cm['bbox']]
-            bl = ([{'px': com_f, 'bbox': bbox_f, 'moving': True,
+            bl = ([{'px': com_f, 'moving': True,
                     'score': round(cm['peak'] / (scale or 1.0), 4)}] if cm['present'] else [])
-            ex = {'ext': {'present': cm['present'], 'com': com_f, 'bbox': bbox_f,
+            ex = {'ext': {'present': cm['present'], 'com': com_f,
                           'z': round(cm['z'], 1), 'n': cm['n']}}
             st = f"{'Target' if cm['present'] else 'No Target'} (Z={cm['z']:.0f}, n={cm['n']})"
             return bl, ex, st, cm['resid']                         # debug-ser shows the band-pass residual

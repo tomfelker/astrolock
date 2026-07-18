@@ -81,11 +81,14 @@ def _color_name(cid):
 ROLES = ('guide', 'main')      # the two fixed roles: a wide guide cam that points a narrow main cam.
                                # Either may be absent/unconfigured; we don't add roles dynamically.
 
-PANEL_W = 320                    # default right-panel width (logical px, pre-DPI)
+PANEL_W = 380                    # default right-panel width (logical px, pre-DPI)
 PANEL_MIN_W = 220
 ZOOM_MULTS = (0.25, 0.5, 1, 2, 4, 8, 16, 32, 64)   # multiplier over the auto power-of-two fit (1 = fit-to-pane;
                                             # <1 zooms OUT -- a tiny focus crop auto-fits at ~16x, where
                                             # '-' used to be pinned at the floor and felt dead)
+# Detector choices for the Detection tab (must match backend/detect.py argparse choices).
+_DETECTORS = ['bandpass', 'doh', 'surprise', 'extended', 'circmean']
+_TRACK_DETECTORS = ['peak', 'matched']
 MAXPIP = 4                       # pool of PIP panes along the bottom; each shows a stream not in the big pane
 
 
@@ -367,6 +370,7 @@ def main(argv=None):
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
     glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)          # harmless on Windows, needed on mac
     glfw.window_hint(glfw.SCALE_TO_MONITOR, glfw.TRUE)               # size the window by the monitor DPI
+    glfw.window_hint(glfw.MAXIMIZED, glfw.TRUE)                      # field use: all the pixels, always
     window = glfw.create_window(1400, 900, "AstroLock Seeker", None, None)
     if not window:
         glfw.terminate()
@@ -891,7 +895,8 @@ def main(argv=None):
             col = _green(this_active, a) if b.get('moving') else (*COL_STATIC[:3], a)
             dl.add_rect(A(X - half, Y - half), A(X + half, Y + half), C(col), 0.0, 1.0)
 
-        # Extended-detector overlay: green AABB + a circle at the CoM when present, plus the density readout.
+        # Single-target-detector overlay: draw whatever the record reports -- an AABB when the
+        # detector publishes a meaningful extent, a circle at the CoM -- plus the readout.
         ext = cam.get('ext')
         if ext is not None:
             present = bool(ext.get('present'))
@@ -901,9 +906,9 @@ def main(argv=None):
                 bx0, by0 = T(bb[0], bb[1])
                 bx1, by1 = T(bb[0] + bb[2], bb[1] + bb[3])
                 dl.add_rect(A(bx0, by0), A(bx1, by1), C(gcol), 0.0, 1.5)
-                if com:
-                    mx_, my_ = T(com[0], com[1])
-                    dl.add_circle(A(mx_, my_), S(6), C(gcol), 0, 1.5)
+            if present and com:
+                mx_, my_ = T(com[0], com[1])
+                dl.add_circle(A(mx_, my_), S(6), C(gcol), 0, 1.5)
             if ext.get('z') is not None:                        # circmean: Rayleigh Z + surviving-pixel count
                 readout = f"Z {ext['z']:.0f}  n {ext.get('n', 0)}"
             else:                                               # extended: per-axis compactness
@@ -1135,17 +1140,20 @@ def main(argv=None):
         _send({'type': 'track', 'role': role, 'px': [float(px[0]), float(px[1])]})
 
     def _toolbar_defs(name):
-        """(label, action) for a pane's top-left buttons. Actions resolve the slot's stream at call
-        time, so they follow a promote/swap."""
+        """(label, action, checked) for a pane's top-left controls: checked=None renders a
+        button, a bool renders a checkbox showing that state. Actions resolve the slot's
+        stream at call time, so they follow a promote/swap."""
         if name == 'big':
-            return [('Panel', lambda: layout.__setitem__('panel_open', not layout['panel_open'])),
-                    ('PIP',   lambda: layout.__setitem__('pip_open', not layout['pip_open'])),
-                    ('Dbg',   _toggle_dbg),               # pip shows this pane's detector surface
-                    ('  -  ', lambda: _zoom_step(_slot_stream('big'), -1)),
-                    ('  +  ', lambda: _zoom_step(_slot_stream('big'), +1))]
-        return [('  ^  ', lambda n=name: _promote(_slot_stream(n))),
-                ('  -  ', lambda n=name: _zoom_step(_slot_stream(n), -1)),
-                ('  +  ', lambda n=name: _zoom_step(_slot_stream(n), +1))]
+            return [('Show Settings', lambda: layout.__setitem__('panel_open', not layout['panel_open']),
+                     layout['panel_open']),
+                    ('Show PIPs', lambda: layout.__setitem__('pip_open', not layout['pip_open']),
+                     layout['pip_open']),
+                    ('Request Debug', _toggle_dbg, layout['pip_debug']),   # detector surface pip
+                    ('  -  ', lambda: _zoom_step(_slot_stream('big'), -1), None),
+                    ('  +  ', lambda: _zoom_step(_slot_stream('big'), +1), None)]
+        return [('  ^  ', lambda n=name: _promote(_slot_stream(n)), None),
+                ('  -  ', lambda n=name: _zoom_step(_slot_stream(n), -1), None),
+                ('  +  ', lambda n=name: _zoom_step(_slot_stream(n), +1), None)]
 
     def _pane(name, x, y, w, h):
         """One camera pane: a child window with a full-size click catcher, the stream + overlays
@@ -1165,9 +1173,14 @@ def main(argv=None):
         rclicked = imgui.is_item_clicked(1)
         draw_slot(name, X0, Y0, w, h, dl)
         imgui.set_cursor_pos((S(6), S(6)))                # toolbar: real buttons, over the image
-        for label, action in _toolbar_defs(name):
-            if imgui.button(f"{label}##tb_{name}"):
-                action()
+        for label, action, checked in _toolbar_defs(name):
+            if checked is None:
+                if imgui.button(f"{label}##tb_{name}"):
+                    action()
+            else:
+                ch, _v = imgui.checkbox(f"{label}##tb_{name}", checked)
+                if ch:
+                    action()
             imgui.same_line()
         imgui.end_child()
         imgui.pop_style_color()
@@ -1803,16 +1816,17 @@ def main(argv=None):
                 _send({'type': 'set_playback', 'role': role, 'loop': v})
             _tip("Loop the recording instead of stopping at the end.")
         _panel_cam_controls(role, ((st or {}).get('camera_caps') or {}).get(role))
-        ch, v = imgui.checkbox(f"Recording##rec_{role}", ui['rec'][role])
+        ch, v = imgui.checkbox(f"Record now##rec_{role}", ui['rec'][role])
         if ch:
             ui['rec'][role] = v
-        _tip("Keep this camera's frames (mark them important so they aren't auto-deleted).")
+        _tip("Archive this camera's frames: a recorder process tails the shared-memory ring and "
+             "writes every frame to a .ser in the recordings dir at drive pace (the camera never "
+             "touches the disk). Uncheck to finalize the file.")
         ch, v = imgui.checkbox(f"Auto record##autorec_{role}", ui['autorec'][role])
         if ch:
             ui['autorec'][role] = v
-        _tip("Automatically record this camera whenever tracking is engaged.")
-        imgui.separator()
-        imgui.text_colored(C4(160, 170, 190), "Display")
+        _tip("Record this camera automatically whenever tracking is engaged (same recorder as "
+             "Record now; the file finalizes when the lock drops).")
         ch, v = imgui.checkbox(f"Reticles##ret_{role}", sset['reticles'])
         if ch:
             sset['reticles'] = v
@@ -1835,21 +1849,21 @@ def main(argv=None):
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Mount", OPEN):
+            if imgui.button("Rescan Mounts"):
+                _send({'type': 'rescan_mounts'})
+            _tip("Re-enumerate mounts (detected Celestron COM ports) after plugging one in.")
             imgui.text("Mount:")
-            _tip("Which mount to drive: 'sim', or a detected Celestron on a COM port. Rescan after "
-                 "plugging one in.")
+            _tip("Which mount to drive: 'sim', or a detected Celestron on a COM port.")
             imgui.same_line()
             mount_items = ['sim'] + [u for u in (st.get('mounts_available') or []) if u != 'sim']
             midx = mount_items.index(ui['mount_sel']) if ui['mount_sel'] in mount_items else 0
-            imgui.set_next_item_width(-S(66))
+            imgui.set_next_item_width(-1)
             ch, nidx = imgui.combo("##mount_combo", midx, mount_items)
             if ch and 0 <= nidx < len(mount_items):
                 ui['mount_sel'] = mount_items[nidx]
                 _send({'type': 'set_mount', 'url': mount_items[nidx]})
-            imgui.same_line()
-            if imgui.button("Rescan##mounts"):
-                _send({'type': 'rescan_mounts'})
-            if imgui.button("Disconnect##mount" if st.get('mount_connected') else "Connect##mount"):
+            if imgui.button("Disconnect from Mount" if st.get('mount_connected')
+                            else "Connect to Mount"):
                 _send({'type': 'mount_connect', 'on': not bool(st.get('mount_connected'))})
             _tip("Connect to / disconnect from the selected mount. Disconnected = the backend holds the "
                  "last pose and nothing moves.")
@@ -1942,17 +1956,16 @@ def main(argv=None):
             if ch:
                 sim_ui['bortle'] = int(max(1, min(9, v)))
                 _send({'type': 'set_sky_render', 'bortle': sim_ui['bortle']})
-            _grey("planned: sim time & location; target overlays")
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Cameras", OPEN):
-            if imgui.button("Rescan##cams"):
+            if imgui.button("Rescan Cameras"):
                 _send({'type': 'rescan_cameras'})
             _tip("Re-enumerate attached ZWO cameras (after plugging one in).")
             for role in roles:
                 if role != roles[0]:
                     imgui.separator()              # keep the two cameras' settings visually apart
-                if imgui.tree_node_ex(role.capitalize(), OPEN):
+                if imgui.tree_node_ex(f"{role.capitalize()} Camera", OPEN):
                     _panel_camera(role)
                     imgui.tree_pop()
             imgui.tree_pop()
@@ -1960,12 +1973,10 @@ def main(argv=None):
         if imgui.tree_node_ex("Optics"):
             opt_fov = st.get('optics') or {}
             for role in roles:
-                imgui.separator()
-                imgui.text_colored(C4(160, 170, 190), role.capitalize())
-                fv = opt_fov.get(role)
-                if fv:
-                    imgui.same_line()
-                    imgui.text_colored(C4(150, 155, 170), f"{fv['fov_x_deg']:.2f}×{fv['fov_y_deg']:.2f}° FoV")
+                if role != roles[0]:
+                    imgui.separator()              # same rhythm as the Cameras section
+                if not imgui.tree_node_ex(f"{role.capitalize()} Optics", OPEN):
+                    continue
                 for kind, has_owned in (('sensor', True), ('optic', True), ('reducer', False)):
                     imgui.text(f"{kind}:")
                     _tip(f"{role.capitalize()} {kind}. Owned gear is pinned to the top of the list.")
@@ -1985,6 +1996,22 @@ def main(argv=None):
                         if ch and cur and cur != _DIV:
                             (owned[kind].add if v else owned[kind].discard)(cur)
                         _tip("I own this — pin it to the top of the list (in every dropdown).")
+                # Derived numbers, below the pickers: FoV from the backend (it knows the live
+                # render geometry) + plate scale computed from the picked gear.
+                fv = opt_fov.get(role)
+                if fv:
+                    imgui.text_colored(C4(150, 155, 170),
+                                       f"FoV {fv['fov_x_deg']:.2f} × {fv['fov_y_deg']:.2f}°")
+                sel = ui['opt'][role]
+                if sel.get('sensor') in _SENS and sel.get('optic') in _OPT:
+                    cfg = optics_db.configuration(_SENS[sel['sensor']], _OPT[sel['optic']],
+                                                  _RED.get(sel.get('reducer'), 1.0))
+                    imgui.text_colored(C4(150, 155, 170),
+                                       f"{cfg['arcsec_per_px']:.2f} arcsec/px @ "
+                                       f"f = {cfg['effective_focal_mm']:.0f} mm")
+                    _tip("Plate scale at 1×1 binning (sensor pixel pitch / effective focal length); "
+                         "hardware binning multiplies arcsec/px by the bin factor.")
+                imgui.tree_pop()
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Boresight"):
@@ -2043,7 +2070,7 @@ def main(argv=None):
                 if imgui.button(('* ' if sel else '  ') + r.capitalize() + f"##focus_role_{r}", (S(56), 0)):
                     _set_focus_role(r)
                 imgui.end_disabled()
-            if imgui.button('Stop Focus' if focus_ui['want'] else 'Start Focus', (S(200), 0)):
+            if imgui.button('Stop Focus' if focus_ui['want'] else 'Start Focus'):
                 _focus_stop() if focus_ui['want'] else _focus_start(focus_ui['role'])
             _tip("Start/stop the focus helper. It locks the brightest star, averages it (EMA), and shows "
                  "that lucky star in the main pane; the collimation trail is drawn on it and the graph "
@@ -2104,7 +2131,6 @@ def main(argv=None):
             ch, v = imgui.checkbox("Y##focus_inv_y", focus_ui['invert_y'])
             if ch:
                 focus_ui['invert_y'] = v
-            _grey("The focus graph, collimation trail, and screw dial draw on the star (main pane).")
             imgui.separator()
             # --- Focus sweep: walk a focuser range, fit the HFD V-curve, report best focus.
             imgui.text("Sweep:")
@@ -2165,6 +2191,46 @@ def main(argv=None):
                 _grey("The sweep curve draws on the star (main pane), under the focus graph.")
             imgui.tree_pop()
         imgui.separator()
+        if imgui.tree_node_ex("Detection"):
+            det_st = st.get('detectors') or {}
+            for role in roles:
+                if role != roles[0]:
+                    imgui.separator()
+                if not imgui.tree_node_ex(f"{role.capitalize()} Detection", OPEN):
+                    continue
+                cur = det_st.get(role) or {}
+                imgui.text("detector:")
+                _tip("Acquisition detector for this camera -- the surface that finds candidate "
+                     "targets full-frame before a lock. Switching relaunches the detector "
+                     "process (a couple of seconds; avoid mid-track).")
+                imgui.same_line()
+                idx = _DETECTORS.index(cur.get('detector')) if cur.get('detector') in _DETECTORS else -1
+                imgui.set_next_item_width(-1)
+                ch, nidx = imgui.combo(f"##det_{role}", idx, _DETECTORS)
+                if ch and 0 <= nidx < len(_DETECTORS):
+                    _send({'type': 'set_detector', 'role': role, 'detector': _DETECTORS[nidx]})
+                # The single-target detectors (extended/circmean) always run full-frame and
+                # never receive a tracking ROI -- the ROI-phase choice below is inert for them.
+                single = cur.get('detector') in ('extended', 'circmean')
+                imgui.begin_disabled(single)
+                imgui.text("tracking:")
+                _tip("Tracking-phase detector: the single-answer search inside the predicted ROI "
+                     "once locked. 'peak' = surface peak with a found/lost gate; 'matched' = "
+                     "stateless matched filter + centre pull, no gate. (Greyed out for the "
+                     "single-target detectors -- extended/circmean run full-frame and never "
+                     "use a tracking ROI.)")
+                imgui.same_line()
+                idx = (_TRACK_DETECTORS.index(cur.get('track'))
+                       if cur.get('track') in _TRACK_DETECTORS else -1)
+                imgui.set_next_item_width(-1)
+                ch, nidx = imgui.combo(f"##tdet_{role}", idx, _TRACK_DETECTORS)
+                if ch and 0 <= nidx < len(_TRACK_DETECTORS):
+                    _send({'type': 'set_detector', 'role': role,
+                           'track_detector': _TRACK_DETECTORS[nidx]})
+                imgui.end_disabled()
+                imgui.tree_pop()
+            imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Tracking"):
             cap = st.get('capturing') or {}
             det = set(st.get('detect_roles') or [])
@@ -2183,18 +2249,20 @@ def main(argv=None):
             cur_model = st.get('track_model') or track_ui['model']
             imgui.text("Model:")
             _tip("Target motion model (applies at the NEXT lock). Sky: constant angular velocity "
-                 "across the sky -- right for anything far (stars, planes at range). Orbit: a "
-                 "constant-altitude great circle about the Earth's centre -- right for LEO "
-                 "passes, where the zenith speed-up and horizon slow-down are perspective the "
-                 "Sky model has to chase but the orbit geometry produces for free.")
-            for val, lbl in (('ema', 'Sky'), ('greatcircle', 'Orbit')):
+                 "across the sky -- right for anything far (stars, planes at range). Great "
+                 "Circle: a constant-altitude great circle about the Earth's centre -- right "
+                 "for LEO passes, where the zenith speed-up and horizon slow-down are "
+                 "perspective the Sky model has to chase but the orbit geometry produces for "
+                 "free.")
+            for val, lbl in (('ema', 'Sky'), ('greatcircle', 'Great Circle')):
                 imgui.same_line()
-                if imgui.button(('* ' if cur_model == val else '  ') + lbl + f"##trk_model_{val}",
-                                (S(56), 0)):
+                if imgui.button(('* ' if cur_model == val else '  ') + lbl + f"##trk_model_{val}"):
                     track_ui['model'] = val
                     _send({'type': 'set_track_model', 'model': val, 'alt_km': track_ui['alt_km']})
-            imgui.same_line()
             imgui.begin_disabled(cur_model != 'greatcircle')
+            imgui.text("Height:")
+            _tip("Assumed target altitude for the Great Circle model.")
+            imgui.same_line()
 
             def _commit_alt(txt):
                 track_ui['alt_km'] = max(1.0, _flt(txt, track_ui['alt_km']))
@@ -2205,7 +2273,6 @@ def main(argv=None):
             imgui.same_line()
             imgui.text_colored(C4(140, 145, 160), "km")
             imgui.end_disabled()
-            _tip("Assumed target altitude for the Orbit model.")
             ch, v = imgui.checkbox("Auto switch to main pane##auto_switch", track_ui['auto_switch'])
             if ch:
                 track_ui['auto_switch'] = v

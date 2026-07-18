@@ -678,10 +678,16 @@ def main(argv=None):
 
     detect_procs = {}
     debug_ser = {'on': bool(args.debug_detect_ser)}    # live-toggled by the GUI's Dbg button
+    # Per-role detector selection, seeded from the CLI and live-switchable from the GUI's
+    # Detection tab (a switch relaunches that role's detector).
+    detector_sel = {role: (getattr(args, f'{role}_detector', None) or args.detector)
+                    for role in roles}
+    track_det_sel = {role: (getattr(args, f'{role}_track_detector', None) or args.track_detector)
+                     for role in roles}
 
     def launch_detect(role):
-        det = getattr(args, f'{role}_detector', None) or args.detector   # per-role override
-        tdet = getattr(args, f'{role}_track_detector', None) or args.track_detector
+        det = detector_sel[role]
+        tdet = track_det_sel[role]
         detect_procs[role] = _spawn('astrolock.seeker.detect',
                                     ['--session', session_dir, '--role', role, '--follow',
                                      '--stop-file', stop_file,
@@ -864,7 +870,7 @@ def main(argv=None):
         return float(b[0]) if b else 1.0
 
     def _detector_for(role):
-        return getattr(args, f'{role}_detector', None) or args.detector
+        return detector_sel[role]
 
     # The full-frame single-target detectors: present/absent + one COM, no per-target ROI. Both drive
     # the guide->main handoff and never take a tracking ROI (the backend runs them full-frame always).
@@ -1328,6 +1334,26 @@ def main(argv=None):
                     sources[role] = 'sky'
                     restart_cam(role, stop_first=False)
             print("[backend] simulation started (sim time reset to the epoch)", flush=True)
+        elif t == 'set_detector':
+            role = cmd.get('role')
+            if role in roles:
+                det = cmd.get('detector')
+                tdet = cmd.get('track_detector')
+                changed = False
+                if det and det != detector_sel[role]:
+                    detector_sel[role] = det
+                    changed = True
+                if tdet and tdet != track_det_sel[role]:
+                    track_det_sel[role] = tdet
+                    changed = True
+                if changed and role in detect_procs:
+                    pr = detect_procs[role]
+                    if pr.poll() is None:          # relaunch on the new selection (see set_debug_ser)
+                        _reap([pr], graceful_s=0.5)
+                    launch_detect(role)
+                if changed:
+                    print(f"[backend] {role} detector -> {detector_sel[role]} "
+                          f"(track: {track_det_sel[role]})", flush=True)
         elif t == 'set_debug_ser':
             on = bool(cmd.get('on', True))
             if on != debug_ser['on']:
@@ -1580,6 +1606,8 @@ def main(argv=None):
                 'optics': {r: {'fov_x_deg': round(fv[0], 4), 'fov_y_deg': round(fv[1], 4)}
                            for r, fv in fov_by_role.items()},
                 'optics_sel': {r: list(sel) for r, sel in optics_sel.items()},   # for the GUI Optics tab
+                'detectors': {r: {'detector': detector_sel[r], 'track': track_det_sel[r]}
+                              for r in roles},               # for the GUI Detection tab
                 'boresight_mrad': [round(boresight['x'] * 1e3, 4), round(boresight['y'] * 1e3, 4)],
             })
 
@@ -1611,8 +1639,9 @@ def main(argv=None):
         clean = True
     finally:
         for role in roles:                         # tell cams to finalize + exit
-            control_write(role, {'stop': True})
-            control_writers[role].close()
+            if role in control_writers:            # (an idle-startup role never launched one)
+                control_write(role, {'stop': True})
+                control_writers[role].close()
         open(stop_file, 'w').close()               # tell detectors to exit
         open(focus_stop, 'w').close()              # and the focus process, if one is running
         if sweep_proc is not None and sweep_proc.poll() is None:
