@@ -11,4 +11,5 @@ imgui-bundle    # seeker GUI (astrolock.seeker.gui_imgui): Dear ImGui + ImPlot p
 moderngl        # seeker GUI: GPU debayer/WB/gamma of raw camera frames
 glfw            # seeker GUI: window + event loop (post_empty_event wake on new frames)
 zwoasi
+psutil          # seeker scheduling: cross-platform process priority + CPU affinity (backend --sched)
 

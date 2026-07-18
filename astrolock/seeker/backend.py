@@ -152,9 +152,19 @@ def main(argv=None):
                         "self-paces by exposure + readout + USB; this is just an optional throttle, "
                         "settable live per role in the GUI). Sim/playback have their own pacing too.")
     p.add_argument('--cam-priority', default='normal', choices=['normal', 'above', 'high'],
-                   help="scheduling priority for the cam capture processes. A real camera free-runs, so "
-                        "a late capture call means IT drops frames; raise this if fps sits below the "
-                        "sensor's rated rate with jittery intervals.")
+                   help="scheduling priority for the cam capture processes when --sched off. A real "
+                        "camera free-runs, so a late capture call means IT drops frames; raise this if "
+                        "fps sits below the sensor's rated rate with jittery intervals.")
+    p.add_argument('--sched', default='auto', choices=['auto', 'off'],
+                   help="'auto' (Windows): live priority ladder -- hero real cam (tracking role, else a "
+                        "recording one) HIGH; other real cams + backend ABOVE_NORMAL; the active "
+                        "tracker NORMAL; idle detectors/focus BELOW_NORMAL; sim/playback cams IDLE -- "
+                        "plus reserved cores per real cam (see --reserve-cores).")
+    p.add_argument('--reserve-cores', default='auto',
+                   help="dedicated CPU cores per real cam: 'auto' (top physical core pair per role, if "
+                        "enough cores), 'off', or explicit 'main=14,15;guide=12,13' (use explicit ids "
+                        "on hybrid P/E-core CPUs). The backend keeps itself and all other children off "
+                        "these cores; the cam process pins onto them.")
     p.add_argument('--bit-depth', type=int, default=16, choices=[8, 16],
                    help="capture container depth: 8 = RAW8 (half the USB bytes/frame -> higher fps), "
                         "16 = full precision (12-bit ASI / 12-bit sim). Per-role, relaunch on change.")
@@ -534,6 +544,44 @@ def main(argv=None):
             qe_by_role[role] = full_well_by_role[role] = read_noise_by_role[role] = 0.0
 
     sources = {role: args.source for role in roles}      # switchable live (sim <-> real)
+
+    # --- Scheduling: reserved cores + a live priority ladder (see --sched) --------------------
+    # Core reservation: narrow the backend's OWN affinity to the non-reserved cores -- every
+    # child it spawns (detectors, recorders, focus, sim cams) inherits that mask, so only a
+    # real cam (which pins itself onto its reserved pair via cam --affinity) ever runs there.
+    reserve = {}                                          # role -> core ids (real cams only)
+    if args.sched == 'auto' and args.reserve_cores != 'off':
+        ncpu = os.cpu_count() or 0
+        if args.reserve_cores == 'auto':
+            per = 2                                       # one physical core = both SMT siblings
+            if ncpu >= 4 + per * len(roles):              # keep >= 4 cores for everything else
+                for i, role in enumerate(roles):
+                    top = ncpu - i * per
+                    reserve[role] = list(range(top - per, top))
+        else:
+            try:
+                for part in args.reserve_cores.split(';'):
+                    role, _, csv = part.partition('=')
+                    if role.strip() in roles and csv:
+                        reserve[role.strip()] = sorted({int(c) for c in csv.split(',')})
+            except ValueError:
+                print(f"[backend] bad --reserve-cores {args.reserve_cores!r}; ignoring", flush=True)
+                reserve = {}
+        if reserve:
+            keep = sorted(set(range(ncpu)) - {c for cs in reserve.values() for c in cs})
+            try:
+                import psutil
+                psutil.Process().cpu_affinity(keep)      # children inherit this mask
+                print(f"[backend] reserved cores {reserve}; backend+children on {keep}", flush=True)
+            except Exception as e:
+                print(f"[backend] core reservation failed ({e}); scheduling without it", flush=True)
+                reserve = {}
+    if args.sched == 'auto':                              # tier 2: backend (mount runs in-process);
+        try:                                              # POSIX: needs CAP_SYS_NICE, warn+continue
+            import psutil
+            psutil.Process().nice(cam_mod.prio_value('above'))
+        except Exception as e:
+            print(f"[backend] could not raise own priority: {e}", flush=True)
     # Per-role sim residual-blur sigma (px): lens softness/defocus atop the physical Airy PSF -- a
     # per-camera optical property (each sim cam is a different lens), so it lives here, not globally.
     # None = auto (sharp physical PSF); the GUI exposes it as the sky cam's 'Defocus' control.
@@ -602,7 +650,13 @@ def main(argv=None):
             '--state-shm', state_slot.name,        # sky follow-state pose (file-free)
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
             '--bin', str(bin_by_role[role]),       # physical NxN bin (sim: metadata; zwo: hardware)
-            '--priority', args.cam_priority,       # capture has a deadline; the camera drops if we're late
+            # Capture has a deadline (the camera drops if we're late): under --sched auto a real
+            # cam starts ABOVE_NORMAL (the ladder promotes the hero to HIGH right after) and pins
+            # onto its reserved cores; sim/playback start normal and get demoted by the ladder.
+            '--priority', ('above' if (args.sched == 'auto' and sources[role] == 'zwo')
+                           else args.cam_priority),
+            *(['--affinity', ','.join(str(c) for c in reserve[role])]
+              if (sources[role] == 'zwo' and role in reserve) else []),
             *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
             '--control-file', cf,
             *cam_sel, *init_args, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
@@ -889,6 +943,51 @@ def main(argv=None):
     def is_connected(role):
         """True if this role's cam process is currently running (its capture is live)."""
         return role in cam_procs and cam_procs[role].poll() is None
+
+    def _reclass(proc, cls):
+        """Best-effort live priority change of a child. Windows: fully dynamic. POSIX:
+        demotions always apply; promotions need CAP_SYS_NICE and silently stand still
+        without it (psutil raises AccessDenied) -- grant it on the Jetson via
+        `setcap cap_sys_nice+ep` on the venv python for the full ladder."""
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            import psutil
+            psutil.Process(proc.pid).nice(cam_mod.prio_value(cls))
+        except Exception as e:                    # racing exit / AccessDenied: warn once, not at 20 Hz
+            if not sched_warned:
+                sched_warned.append(True)
+                print(f"[backend] priority ladder degraded ({e})", flush=True)
+
+    sched_last = [None]
+    sched_warned = []
+
+    def update_sched():
+        """Re-apply the priority ladder when the situation changes: the hero real cam (the
+        tracking role's, else a recording one) runs HIGH and the other real cams ABOVE_NORMAL
+        (tier 1); the backend already sits at ABOVE_NORMAL (tier 2); the actively tracking
+        detector runs NORMAL alongside recorders (tier 3); idle detectors + focus/sweep drop
+        to BELOW_NORMAL (tier 4, with the GUI); sim/playback cams run IDLE (tier 5). Keyed on
+        child pids too, so a relaunch gets re-classed on the next tick."""
+        if args.sched != 'auto':
+            return
+        real = {r for r in roles if sources[r] == 'zwo'}
+        trk = track_role if (tracking and track_role in detect_roles) else None
+        hero = trk if trk in real else next((r for r in roles if recording.get(r) and r in real),
+                                            None)
+        key = (hero, trk, tuple(sorted(real)),
+               tuple(sorted((r, p.pid) for r, p in cam_procs.items() if p.poll() is None)),
+               tuple(sorted((r, p.pid) for r, p in detect_procs.items() if p.poll() is None)))
+        if key == sched_last[0]:
+            return
+        sched_last[0] = key
+        for r, pr in cam_procs.items():
+            _reclass(pr, ('high' if r == hero else 'above') if r in real else 'idle')
+        for r, pr in detect_procs.items():
+            _reclass(pr, 'normal' if r == trk else 'below')
+        _reclass(focus_proc, 'below')
+        _reclass(sweep_proc, 'below')
+        print(f"[backend] sched: hero cam={hero or '-'} active tracker={trk or '-'}", flush=True)
 
     def restart_cam(role, stop_first):
         if stop_first:
@@ -1254,6 +1353,7 @@ def main(argv=None):
     try:
         while True:
             time.sleep(0.05)                      # ~20 Hz control loop
+            update_sched()                        # re-rank child priorities if the situation moved
             now = session_mod.mono_s()            # SAME timeline as every t_mono_ns stamp: this
                                                   # 'now' meets frame times in the tracker/servo
 

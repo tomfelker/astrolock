@@ -38,6 +38,18 @@ def resolve_device(name):
     return torch.device(name)
 
 
+def prio_value(level):
+    """Map a tier name to what psutil's Process.nice() wants: a Windows priority-class
+    constant, or a POSIX nice value. (POSIX can only LOWER priority unprivileged; raising
+    needs root/CAP_SYS_NICE -- callers treat AccessDenied as a warning, not an error.)"""
+    import psutil
+    if os.name == 'nt':
+        return {'high': psutil.HIGH_PRIORITY_CLASS, 'above': psutil.ABOVE_NORMAL_PRIORITY_CLASS,
+                'normal': psutil.NORMAL_PRIORITY_CLASS, 'below': psutil.BELOW_NORMAL_PRIORITY_CLASS,
+                'idle': psutil.IDLE_PRIORITY_CLASS}[level]
+    return {'high': -10, 'above': -5, 'normal': 0, 'below': 5, 'idle': 10}[level]
+
+
 def set_priority(level):
     """Raise this process's scheduling priority. The capture loop has a hard deadline: a real camera
     free-runs, so if we're descheduled and call capture_video_frame() late, its buffer overflows and
@@ -46,20 +58,28 @@ def set_priority(level):
     A failure here is a warning, not fatal -- capture still works, just at normal priority."""
     if level in (None, '', 'normal'):
         return
-    if os.name == 'nt':
-        import ctypes
-        classes = {'above': 0x00008000, 'high': 0x00000080}     # ABOVE_NORMAL / HIGH_PRIORITY_CLASS
-        k32 = ctypes.windll.kernel32
-        if not k32.SetPriorityClass(k32.GetCurrentProcess(), classes[level]):
-            print(f"[cam] could not set priority {level!r}: {ctypes.WinError()}", flush=True)
-            return
-    else:
-        try:
-            os.nice({'above': -5, 'high': -10}[level])          # needs privileges; warn if denied
-        except PermissionError as e:
-            print(f"[cam] could not set priority {level!r}: {e}", flush=True)
-            return
+    try:
+        import psutil
+        psutil.Process().nice(prio_value(level))
+    except Exception as e:                                  # AccessDenied, missing psutil, ...
+        print(f"[cam] could not set priority {level!r}: {e}", flush=True)
+        return
     print(f"[cam] process priority: {level}", flush=True)
+
+
+def set_affinity(cores):
+    """Pin this process to specific CPU cores ('6,7'). Complement scheme: the backend narrows
+    ITSELF to the other cores (children inherit that), so a real cam pinned here has these
+    cores to itself and capture never waits in a busy scheduler queue. Best-effort."""
+    if not cores:
+        return
+    try:
+        import psutil
+        ids = sorted({int(c) for c in cores.split(',')})
+        psutil.Process().cpu_affinity(ids)
+        print(f"[cam] pinned to cores {ids}", flush=True)
+    except Exception as e:                                  # bad list, unsupported platform, ...
+        print(f"[cam] could not set affinity {cores!r}: {e}", flush=True)
 
 
 def make_synthetic_frame(width, height, t, max_val=65535):
@@ -732,6 +752,9 @@ def main(argv=None):
                         "and IT drops frames. Raise this when the fps sits below the sensor's rated "
                         "rate with jittery frame intervals. ('realtime' is not offered -- it can starve "
                         "the OS.)")
+    p.add_argument('--affinity', default='',
+                   help="pin this process to these CPU cores ('14,15'); the backend reserves them by "
+                        "keeping itself and every other child off them")
     p.add_argument('--benchmark', action='store_true',
                    help="measure sustained framerate then exit: run the normal capture->framestream "
                         "loop (frames still written -- nobody reads them) with the --fps cap forced "
@@ -746,6 +769,7 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     set_priority(args.priority)          # before we open the camera and start free-running
+    set_affinity(args.affinity)
 
     if args.list_cameras:
         cams = list_zwo_cameras()
