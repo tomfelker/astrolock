@@ -265,6 +265,12 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
     if 'Gamma' in ctrls:
         _set(z.ASI_GAMMA, 50)
 
+    # High-speed readout OFF by default -- a deterministic starting point rather than whatever the
+    # camera powered up in. On the 678/USB3 it doesn't raise RAW8 fps anyway (already bandwidth-bound)
+    # and trades a little read noise / bit depth for the faster clock. Toggle it live in the GUI.
+    if 'HighSpeedMode' in ctrls:
+        _set(z.ASI_HIGH_SPEED_MODE, 0)
+
     cam.start_video_capture()
 
     if is_color and not force_mono and not mono_ok:      # Bayer: full res, or half-res if binned w/o MonoBin
