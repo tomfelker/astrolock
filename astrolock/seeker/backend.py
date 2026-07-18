@@ -209,7 +209,7 @@ def main(argv=None):
     p.add_argument('--guide-detector', default=None,
                    choices=['bandpass', 'doh', 'surprise', 'extended', 'circmean'],
                    help="override --detector for the guide role (default: --detector)")
-    p.add_argument('--main-detector', default='extended',
+    p.add_argument('--main-detector', default='circmean',
                    choices=['bandpass', 'doh', 'surprise', 'extended', 'circmean'],
                    help="detector for the main role (default 'extended': the narrow-field single-target "
                         "detector that drives the guide->main handoff; 'circmean' is the newer, more "
@@ -665,6 +665,7 @@ def main(argv=None):
             control_writers[role].append({'controls': dict(cam_control_vals[role])})
 
     detect_procs = {}
+    debug_ser = {'on': bool(args.debug_detect_ser)}    # live-toggled by the GUI's Dbg button
 
     def launch_detect(role):
         det = getattr(args, f'{role}_detector', None) or args.detector   # per-role override
@@ -695,7 +696,7 @@ def main(argv=None):
                                      '--min-blob-px', str(args.min_blob_px),
                                      '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile),
                                      '--device', args.device]
-                                    + (['--debug-ser'] if args.debug_detect_ser else []))
+                                    + (['--debug-ser'] if debug_ser['on'] else []))
 
     # Focus/collimation: one optional focus process, toggled from the GUI Focus tab (Guide or Main).
     # It follows a role's cam .ser + detections and writes <seg>_<role>_focus.ser (the EMA star image,
@@ -992,6 +993,13 @@ def main(argv=None):
     def restart_cam(role, stop_first):
         if stop_first:
             control_write(role, {'stop': True})    # old cam finalizes its file + exits
+            old = cam_procs.get(role)
+            if old is not None and old.poll() is None:
+                # Wait for the old process to actually EXIT before launching the new one: a
+                # ZWO camera is exclusive-open, so a replacement spawned while the old process
+                # still holds the USB handle dies on open -- which is why switching cameras
+                # sometimes "didn't take" until a manual disconnect+reconnect added the delay.
+                _reap([old])
         launch_seq[role] += 1
         launch_cam(role)                           # new cam (new source / fresh segment)
         if role in detect_roles and (role not in detect_procs or detect_procs[role].poll() is not None):
@@ -1284,6 +1292,16 @@ def main(argv=None):
                 print(f"[backend] {role} playback -> {pb['ser']} loop={pb['loop']}", flush=True)
                 if sources[role] == 'playback' and is_connected(role):
                     restart_cam(role, stop_first=True)
+        elif t == 'set_debug_ser':
+            on = bool(cmd.get('on', True))
+            if on != debug_ser['on']:
+                debug_ser['on'] = on
+                for role in list(detect_procs):    # relaunch with/without --debug-ser; no per-role
+                    pr = detect_procs[role]        # stop flag, so terminate (streams are crash-safe)
+                    if pr.poll() is None:
+                        _reap([pr], graceful_s=0.5)
+                    launch_detect(role)
+                print(f"[backend] detector debug streams -> {'on' if on else 'off'}", flush=True)
         elif t == 'rescan_cameras':
             cams_available[:] = cam_mod.zwo_camera_urls()
             print(f"[backend] cameras: {cams_available}", flush=True)
@@ -1519,7 +1537,7 @@ def main(argv=None):
                 'mount_connected': mount_connected,           # is a real/sim mount driving (vs disconnected)
                 'camera': dict(camera_url),                   # per-role selected camera URL (or null)
                 'camera_caps': {r: published_caps(r) for r in roles},   # live camera controls for the GUI
-                'debug_ser': bool(args.debug_detect_ser),      # detectors are writing <role>_debug.ser streams
+                'debug_ser': debug_ser['on'],                  # detectors are writing <role>_debug streams
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},
                 'cameras': {role: {'frames': followers[role].committed_count()} for role in roles},

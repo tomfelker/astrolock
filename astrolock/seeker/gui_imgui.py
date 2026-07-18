@@ -537,6 +537,10 @@ def main(argv=None):
 
     def _toggle_dbg():
         layout['pip_debug'] = not layout['pip_debug']
+        # The detectors only WRITE the <role>_debug stream when launched with --debug-ser --
+        # ask the backend to relaunch them with it (this used to silently show an empty pane
+        # unless the backend happened to start with --debug-detect-ser).
+        _send({'type': 'set_debug_ser', 'on': layout['pip_debug']})
         if layout['pip_debug']:
             layout['pip_open'] = True                    # no point showing the debug surface with the pip hidden
 
@@ -1702,6 +1706,12 @@ def main(argv=None):
             bx, by = (list(st['boresight_mrad']) + [0.0, 0.0])[:2]
             _bore_set(bx, by, send=False)              # reflect the backend's value; don't echo it back
             ctrl['bore_init'] = True
+
+        # Restored layout had Dbg on but the detectors aren't writing debug streams: sync once.
+        if 'dbg_init' not in ctrl and st is not None:
+            ctrl['dbg_init'] = True
+            if layout.get('pip_debug') and not st.get('debug_ser'):
+                _send({'type': 'set_debug_ser', 'on': True})
 
         # Caps-driven camera controls: re-seed values whenever the *set* of controls changes.
         caps_st = (st or {}).get('camera_caps') or {}
