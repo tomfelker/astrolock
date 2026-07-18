@@ -1141,11 +1141,11 @@ def main(argv=None):
             return [('Panel', lambda: layout.__setitem__('panel_open', not layout['panel_open'])),
                     ('PIP',   lambda: layout.__setitem__('pip_open', not layout['pip_open'])),
                     ('Dbg',   _toggle_dbg),               # pip shows this pane's detector surface
-                    ('-',     lambda: _zoom_step(_slot_stream('big'), -1)),
-                    ('+',     lambda: _zoom_step(_slot_stream('big'), +1))]
-        return [('^', lambda n=name: _promote(_slot_stream(n))),
-                ('-',    lambda n=name: _zoom_step(_slot_stream(n), -1)),
-                ('+',    lambda n=name: _zoom_step(_slot_stream(n), +1))]
+                    ('  -  ', lambda: _zoom_step(_slot_stream('big'), -1)),
+                    ('  +  ', lambda: _zoom_step(_slot_stream('big'), +1))]
+        return [('  ^  ', lambda n=name: _promote(_slot_stream(n))),
+                ('  -  ', lambda n=name: _zoom_step(_slot_stream(n), -1)),
+                ('  +  ', lambda n=name: _zoom_step(_slot_stream(n), +1))]
 
     def _pane(name, x, y, w, h):
         """One camera pane: a child window with a full-size click catcher, the stream + overlays
@@ -1833,6 +1833,7 @@ def main(argv=None):
         if imgui.tree_node_ex("Status", OPEN):
             _mono_text(_perf_text())
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Mount", OPEN):
             imgui.text("Mount:")
             _tip("Which mount to drive: 'sim', or a detected Celestron on a COM port. Rescan after "
@@ -1912,7 +1913,12 @@ def main(argv=None):
                 _send({'type': 'follow', 'on': True})
             _tip("Resume slewing the mount to hold the locked target (undo Stop Moving).")
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Simulation", OPEN):         # sim-truth render knobs
+            if imgui.button("  Start Simulation  "):
+                _send({'type': 'start_sim'})
+            _tip("Connect the sim mount and sim cameras -- only where nothing else is already "
+                 "connected -- and reset sim time to the example epoch.")
             imgui.text("Seeing r0:")
             _tip("Atmospheric seeing as the Fried parameter r0 (m): bigger = steadier air. 0 = off; "
                  "~0.05 poor, ~0.2 excellent. One sky, so it blurs all sim cameras (FWHM ~ 0.98*lambda/r0). "
@@ -1938,15 +1944,19 @@ def main(argv=None):
                 _send({'type': 'set_sky_render', 'bortle': sim_ui['bortle']})
             _grey("planned: sim time & location; target overlays")
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Cameras", OPEN):
             if imgui.button("Rescan##cams"):
                 _send({'type': 'rescan_cameras'})
             _tip("Re-enumerate attached ZWO cameras (after plugging one in).")
             for role in roles:
+                if role != roles[0]:
+                    imgui.separator()              # keep the two cameras' settings visually apart
                 if imgui.tree_node_ex(role.capitalize(), OPEN):
                     _panel_camera(role)
                     imgui.tree_pop()
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Optics"):
             opt_fov = st.get('optics') or {}
             for role in roles:
@@ -1976,6 +1986,7 @@ def main(argv=None):
                             (owned[kind].add if v else owned[kind].discard)(cur)
                         _tip("I own this — pin it to the top of the list (in every dropdown).")
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Boresight"):
             imgui.text("X:")
             imgui.same_line()
@@ -2019,6 +2030,7 @@ def main(argv=None):
                             s_ = boresight_ui['step']
                             _bore_set(boresight_ui['x'] + dx * s_, boresight_ui['y'] + dy * s_)
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Focus"):          # focus + collimation assist (see astrolock.seeker.focus)
             cap = st.get('capturing') or {}
             imgui.text("Camera:")
@@ -2152,6 +2164,7 @@ def main(argv=None):
             if stt.get('points'):
                 _grey("The sweep curve draws on the star (main pane), under the focus graph.")
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Tracking"):
             cap = st.get('capturing') or {}
             det = set(st.get('detect_roles') or [])
@@ -2237,6 +2250,7 @@ def main(argv=None):
             imgui.same_line()
             imgui.text_colored(C4(140, 145, 160), "s")
             imgui.tree_pop()
+        imgui.separator()
         if imgui.tree_node_ex("Settings"):
             items = ui['settings_items']
             sidx = items.index(ui['settings_sel']) if ui['settings_sel'] in items else -1

@@ -182,6 +182,9 @@ def main(argv=None):
     p.add_argument('--start-alt-deg', type=float, default=19.5, help="sim mount initial alt")
     p.add_argument('--max-rate-deg-s', type=float, default=3.0,
                    help="max slew rate -- matches the real CPC (~3 deg/s, battery-dependent)")
+    p.add_argument('--autoconnect', action='store_true',
+                   help="launch all cams/detectors and connect the mount at startup (the old "
+                        "behavior; default is to start idle and connect from the GUI)")
     p.add_argument('--mount', default='sim', choices=['sim', 'celestron'],
                    help="sim integrates commanded rates; celestron drives the real NexStar mount")
     p.add_argument('--mount-url', default=None, help="celestron: e.g. celestron_nexstar_hc:COM3")
@@ -206,7 +209,7 @@ def main(argv=None):
     p.add_argument('--main-optic', default='Celestron CPC 1100', help="main optic name in the optics DB")
     p.add_argument('--main-reducer', default=None, help="main reducer/barlow name (optional)")
     # Per-role detector override (default: --detector). Typical: main-cam extended-target tracking.
-    p.add_argument('--guide-detector', default=None,
+    p.add_argument('--guide-detector', default='surprise',
                    choices=['bandpass', 'doh', 'surprise', 'extended', 'circmean'],
                    help="override --detector for the guide role (default: --detector)")
     p.add_argument('--main-detector', default='circmean',
@@ -351,29 +354,36 @@ def main(argv=None):
     # The sim mount writes its ground-truth trajectory here for the sim camera to follow (truth, not
     # the backend's estimate). Harmless/ignored for the real mount.
     sim_mount_path = os.path.join(session_dir, session_mod.sim_mount_name(ts))
-    mount = mount_mod.make_mount(
-        args.mount, az0_rad=math.radians(args.start_az_deg), alt0_rad=math.radians(args.start_alt_deg),
-        site=site, max_rate_rad_s=max_rate, accel_rad_s2=math.radians(args.mount_accel_deg_s2),
-        update_hz=args.mount_update_hz, url=args.mount_url, sidecar_path=sim_mount_path)
+    # Nothing connects at startup by default: no mount, no cams, no CPU spent simulating a
+    # sky nobody asked for. Connect from the GUI (per pane / Mount panel), press the
+    # Simulation tab's Start Simulation, or launch with --autoconnect for the old behavior.
+    if args.autoconnect:
+        mount = mount_mod.make_mount(
+            args.mount, az0_rad=math.radians(args.start_az_deg), alt0_rad=math.radians(args.start_alt_deg),
+            site=site, max_rate_rad_s=max_rate, accel_rad_s2=math.radians(args.mount_accel_deg_s2),
+            update_hz=args.mount_update_hz, url=args.mount_url, sidecar_path=sim_mount_path)
+        mount_connected = True
+    else:
+        mount = mount_mod.NullMount(math.radians(args.start_az_deg),
+                                    math.radians(args.start_alt_deg), site=site)
+        mount_connected = False
     msite = mount.get_site()        # GPS/site comes from the mount; it drives the sky-sim camera
     # Mount lifecycle (GUI connect/disconnect). The site is captured here from the startup mount and
     # feeds the sky-sim once; switching mounts later doesn't re-derive it (fine -- the sky sim is the
     # sim workflow, and a real mount's site is a TODO fallback anyway).
     mount_desired_url = 'sim' if args.mount == 'sim' else (args.mount_url or 'sim')
-    mount_connected = True                                  # the CLI-selected mount is live at startup
     mounts_available = mount_mod.available_mount_urls()     # detected Celestron COM ports (GUI chooser)
 
-    sky_args = []
     almanac_path = os.path.join(session_dir, f"{ts}_almanac.jsonl")       # sky_sim publishes here
-    if args.source == 'sky':
-        # Sky *positions* come from the shared sky_sim almanac (one propagator, one system clock) -- not
-        # from each cam, which used to drift apart. The follow flag (which mount trajectory to render
-        # from) is added per-launch by sky_follow_flag(), so switching mounts in the GUI re-points them.
-        sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
-                    '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
-                    '--sky-almanac', almanac_path,
-                    '--sim-cam-bandwidth-limit', str(args.sim_cam_bandwidth_limit)] \
-            + (['--sim-cam-noop'] if args.sim_cam_noop else [])
+    # Sky *positions* come from the shared sky_sim almanac (one propagator, one system clock) -- not
+    # from each cam, which used to drift apart. The follow flag (which mount trajectory to render
+    # from) is added per-launch by sky_follow_flag(), so switching mounts in the GUI re-points them.
+    # Always built: any role can switch to 'sky' live (harmless extra args for other sources).
+    sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
+                '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
+                '--sky-almanac', almanac_path,
+                '--sim-cam-bandwidth-limit', str(args.sim_cam_bandwidth_limit)] \
+        + (['--sim-cam-noop'] if args.sim_cam_noop else [])
 
     def sky_follow_flag():
         """Which mount trajectory a sky-sim cam renders from, chosen per-launch from the CURRENT mount:
@@ -599,6 +609,8 @@ def main(argv=None):
         return os.path.join(session_dir, f"control_{role}_{launch_seq[role]}.jsonl")
 
     def launch_cam(role):
+        if sources[role] == 'sky':
+            ensure_sky_sim()                       # the shared propagator, spawned on demand
         cf = control_path(role)                    # unique per launch -> no clobber/replay
         if role in control_writers:
             control_writers[role].close()
@@ -772,19 +784,27 @@ def main(argv=None):
         print(f"[backend] focus sweep started on {role}: "
               f"{cmd['start']} .. {cmd['end']} x{cmd.get('steps', 9)}", flush=True)
 
-    # Pre-warm the skyfield ephemeris/star cache once, serially. Two sky cams starting together
-    # otherwise race to download de421.bsp / hipparcos into the shared cache and one loses the
-    # rename (WinError 5) -- which is what crashed both sim cams in a fresh worktree. Best-effort:
-    # if it fails, the cams fall back to their own (racy) download exactly as before.
     sky_sim_proc = None
-    if any(s == 'sky' for s in sources.values()):
+
+    def ensure_sky_sim(restart=False):
+        """Spawn (or with restart=True, respawn) the one sky_sim propagator: it publishes
+        stars + satellite directions on the shared system clock so every camera reads
+        identical positions. sky_sim maps its --epoch to its own process start, so a
+        restart re-anchors sim time to the example epoch. Also pre-warms the skyfield
+        ephemeris/star cache once, serially -- two sky cams starting together otherwise
+        race the de421/hipparcos download and one loses the rename (WinError 5)."""
+        nonlocal sky_sim_proc
+        alive = sky_sim_proc is not None and sky_sim_proc.poll() is None
+        if alive and not restart:
+            return
+        if alive:
+            sky_sim_proc.terminate()               # stateless writer: safe to just replace
+            _reap([sky_sim_proc], graceful_s=0.5)
         try:
             from astrolock.seeker import skysim
             skysim.ensure_cache()
         except Exception as e:
             print(f"[backend] ephemeris pre-warm skipped: {e}", flush=True)
-        # One sky_sim process propagates stars + satellite and publishes their directions on the
-        # shared system clock, so every camera reads identical positions (fixes the two-cam drift).
         ss_args = ['--out', almanac_path, '--lat', str(msite['lat_deg']),
                    '--lon', str(msite['lon_deg']), '--elev', str(msite['elev_m']),
                    '--epoch', str(msite['epoch_utc']), '--stop-file', stop_file]
@@ -794,10 +814,14 @@ def main(argv=None):
         print(f"[backend] sky_sim -> {almanac_path}", flush=True)
 
     print(f"[backend] detect roles: {sorted(detect_roles) or 'none'}", flush=True)
-    for role in roles:
-        launch_cam(role)
-        if role in detect_roles:
-            launch_detect(role)
+    if args.autoconnect:
+        for role in roles:
+            launch_cam(role)
+            if role in detect_roles:
+                launch_detect(role)
+    else:
+        print("[backend] idle at startup: connect cams/mount in the GUI, or press "
+              "Simulation -> Start Simulation", flush=True)
     gui_proc = _spawn('astrolock.seeker.gui_imgui',
                       ['--session', session_dir, '--wb-r', str(args.wb_r), '--wb-b', str(args.wb_b),
                        '--device', args.device]) \
@@ -1047,8 +1071,8 @@ def main(argv=None):
             old.close()
         except Exception:
             pass
-        for r in roles:                                    # re-point sky-sim cams at the new mount
-            if sources.get(r) == 'sky':
+        for r in roles:                                    # re-point RUNNING sky-sim cams at the new
+            if sources.get(r) == 'sky' and is_connected(r):     # mount (never launch idle ones)
                 restart_cam(r, stop_first=True)
         print(f"[backend] mount connected: {url}", flush=True)
 
@@ -1292,6 +1316,18 @@ def main(argv=None):
                 print(f"[backend] {role} playback -> {pb['ser']} loop={pb['loop']}", flush=True)
                 if sources[role] == 'playback' and is_connected(role):
                     restart_cam(role, stop_first=True)
+        elif t == 'start_sim':
+            # Simulation tab's Start Simulation: bring the sim up wherever nothing else is
+            # already connected, and reset sim time to the example epoch (a fresh sky_sim +
+            # sim mount re-anchor --epoch to their own start).
+            if not mount_connected or isinstance(mount, mount_mod.SimMount):
+                connect_mount('sim')
+            ensure_sky_sim(restart=True)
+            for role in roles:
+                if not is_connected(role):
+                    sources[role] = 'sky'
+                    restart_cam(role, stop_first=False)
+            print("[backend] simulation started (sim time reset to the epoch)", flush=True)
         elif t == 'set_debug_ser':
             on = bool(cmd.get('on', True))
             if on != debug_ser['on']:
