@@ -93,12 +93,12 @@ def load_db(path=None):
     """-> (sensors, optics, reducers): name-keyed dicts of Sensor, Optic, and float multipliers."""
     with open(path or _DEFAULT_DB) as f:
         raw = json.load(f)
-    sensors = {s['name']: Sensor(s['name'], s['res_x'], s['res_y'], s['pixel_um'],
-                                 s.get('bayer'), bool(s.get('mono')), s.get('shutter'),
-                                 s.get('qe', 0.0), s.get('full_well_e', 0.0), s.get('read_noise_e', 0.0),
-                                 s.get('read_noise_e_base', 0.0), s.get('read_noise_e_hcg', 0.0),
-                                 int(s.get('hcg_gain', 0)), int(s.get('unity_gain', 0)),
-                                 int(s.get('adc_bits', 0)), float(s.get('max_fps', 0.0)))
+    # Keyword construction: the dataclass defaults are the single source of truth for missing
+    # fields, and a new Sensor field can't silently shift nine positional arguments.
+    sensor_fields = ('name', 'res_x', 'res_y', 'pixel_um', 'bayer', 'mono', 'shutter', 'qe',
+                     'full_well_e', 'read_noise_e', 'read_noise_e_base', 'read_noise_e_hcg',
+                     'hcg_gain', 'unity_gain', 'adc_bits', 'max_fps')
+    sensors = {s['name']: Sensor(**{k: s[k] for k in sensor_fields if k in s})
                for s in raw['sensors']}
     optics = {o['name']: Optic(o['name'], o['focal_length_mm'], o['aperture_mm'],
                                o.get('obstruction_mm', 0.0), int(o.get('spider_vanes', 0)),

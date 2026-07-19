@@ -151,10 +151,6 @@ def main(argv=None):
                    help="cam-loop max framerate cap (0 = unlimited, the default -- a real camera "
                         "self-paces by exposure + readout + USB; this is just an optional throttle, "
                         "settable live per role in the GUI). Sim/playback have their own pacing too.")
-    p.add_argument('--cam-priority', default='normal', choices=['normal', 'above', 'high'],
-                   help="scheduling priority for the cam capture processes when --sched off. A real "
-                        "camera free-runs, so a late capture call means IT drops frames; raise this if "
-                        "fps sits below the sensor's rated rate with jittery intervals.")
     p.add_argument('--sched', default='auto', choices=['auto', 'off'],
                    help="'auto' (Windows): live priority ladder -- hero real cam (tracking role, else a "
                         "recording one) HIGH; other real cams + backend ABOVE_NORMAL; the active "
@@ -169,8 +165,9 @@ def main(argv=None):
                    help="capture container depth: 8 = RAW8 (half the USB bytes/frame -> higher fps), "
                         "16 = full precision (12-bit ASI / 12-bit sim). Per-role, relaunch on change.")
     p.add_argument('--sim-downscale', type=int, default=1,
-                   help="DEPRECATED: folded into binning (a sim downscale is an NxN bin). "
-                        "Prefer --<role>-bin; this multiplies into every role's bin.")
+                   help="sky cams: render on a 1/N-per-axis buffer internally, publish upscaled at "
+                        "full size -- a pure sim performance knob. NOT binning: --<role>-bin changes "
+                        "the published geometry like a real binned camera.")
     p.add_argument('--segment-frames', type=int, default=300,
                    help="roll cams to a new file every N frames (old non-important ones are deleted)")
     p.add_argument('--auto', dest='auto', action='store_true', default=True,
@@ -435,10 +432,6 @@ def main(argv=None):
     # Per-role plate scale from the optics DB if a sensor+optic is named for that role; else the
     # sky-derived/override rad_per_px above. Print the resolved FoV so it's easy to sanity-check.
     _sensors, _optics, _reducers = optics.load_db()
-    ds = max(1, args.sim_downscale)            # DEPRECATED: folded into binning (a sim downscale *is* a bin)
-    if ds > 1:
-        print(f"[backend] note: --sim-downscale {ds} is deprecated; folding it into binning. A sim "
-              f"downscale and NxN binning render identically -- prefer --<role>-bin.", flush=True)
     rad_per_px_by_role = {}
     render_by_role = {}        # role -> (res_x, res_y, pixel_um, focal_mm) for the sim sky cam
     fov_by_role = {}           # role -> (fov_x_deg, fov_y_deg) -> GUI nesting overlays
@@ -492,7 +485,7 @@ def main(argv=None):
         return rx, ry
 
     for role in roles:
-        b = max(1, getattr(args, f'{role}_bin', 1)) * ds        # deprecated downscale folds straight in
+        b = max(1, getattr(args, f'{role}_bin', 1))
         bin_by_role[role] = b
         rad_per_px_by_role[role] = rad_per_px
         render_by_role[role] = (max(1, args.width // b), max(1, args.height // b),
@@ -618,7 +611,8 @@ def main(argv=None):
         rx, ry, pum, fmm = render_by_role[role]       # per-role render size + sky optics (from the DB)
         per_role_sky = []
         if sources[role] == 'sky':
-            per_role_sky = ['--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum),
+            per_role_sky = ['--sim-downscale', str(max(1, args.sim_downscale)),
+                            '--sky-focal-mm', str(fmm), '--sky-pixel-um', str(pum),
                             '--sky-aperture-mm', str(aperture_by_role.get(role, 0.0)),
                             '--sky-central-obstruction', str(obstruction_by_role.get(role, 0.0)),
                             '--sky-spider-vanes', str(vanes_by_role.get(role, 0)),
@@ -655,9 +649,10 @@ def main(argv=None):
                           '--playback-fps', str(args.playback_fps)]
                          + (['--playback-loop'] if pb.get('loop') else [])
                          if sources[role] == 'playback' and pb.get('ser') else [])
+        src = sources[role]
         cam_procs[role] = _spawn('astrolock.seeker.cam', [
-            '--role', role, '--out-dir', session_dir, '--source', sources[role],
-            '--width', str(rx), '--height', str(ry), '--fps', str(fps_by_role.get(role, args.fps)),
+            '--role', role, '--out-dir', session_dir, '--source', src,
+            '--fps', str(fps_by_role.get(role, args.fps)),
             '--bit-depth', str(depth_by_role.get(role, args.bit_depth)),
             '--state-shm', state_slot.name,        # sky follow-state pose (file-free)
             '--device', args.device,               # sky-sim render device (zwo/synthetic ignore it)
@@ -665,13 +660,16 @@ def main(argv=None):
             # Capture has a deadline (the camera drops if we're late): under --sched auto a real
             # cam starts ABOVE_NORMAL (the ladder promotes the hero to HIGH right after) and pins
             # onto its reserved cores; sim/playback start normal and get demoted by the ladder.
-            '--priority', ('above' if (args.sched == 'auto' and sources[role] == 'zwo')
-                           else args.cam_priority),
+            '--priority', ('above' if (args.sched == 'auto' and src == 'zwo') else 'normal'),
             *(['--affinity', ','.join(str(c) for c in reserve[role])]
-              if (sources[role] == 'zwo' and role in reserve) else []),
+              if (src == 'zwo' and role in reserve) else []),
             *(['--shm-ser', '--shm-frames', str(args.shm_frames)] if args.shm_ser else []),
             '--control-file', cf,
-            *cam_sel, *init_args, *(['--auto'] if args.auto else []), *sky_args, *per_role_sky, *playback_args,
+            # Per-source args only where they mean something (zwo geometry comes from the
+            # camera + --roi; playback's from the file; sky's from --sky-width/height):
+            *(['--width', str(rx), '--height', str(ry)] if src == 'synthetic' else []),
+            *cam_sel, *init_args, *(['--auto'] if args.auto else []),
+            *(sky_args if src == 'sky' else []), *per_role_sky, *playback_args,
         ])
         if cam_control_vals.get(role):                 # re-apply live control values across a relaunch
             control_writers[role].append({'controls': dict(cam_control_vals[role])})
@@ -685,35 +683,26 @@ def main(argv=None):
     track_det_sel = {role: (getattr(args, f'{role}_track_detector', None) or args.track_detector)
                      for role in roles}
 
+    # Detector tunables forwarded 1:1 to detect.py (backend flag name == detect flag name).
+    # Adding a knob = the two argparse entries + one name here; no hand-plumbed pair list.
+    DETECT_TUNABLES = ('track_blur_px', 'track_pull', 'doh_sigma', 'surprise_decay',
+                       'surprise_blur_px', 'tile_size', 'tile_fixed_nsigma',
+                       'tile_moving_nsigma', 'tile_mask_px', 'ext_nsigma', 'ext_density',
+                       'circ_down', 'circ_bg_radius', 'circ_nsigma', 'circ_z', 'snr',
+                       'max_candidates', 'min_blob_px', 'tile_grid', 'per_tile')
+
     def launch_detect(role):
-        det = detector_sel[role]
-        tdet = track_det_sel[role]
+        tunables = [s for name in DETECT_TUNABLES
+                    for s in (f"--{name.replace('_', '-')}", str(getattr(args, name)))]
         detect_procs[role] = _spawn('astrolock.seeker.detect',
                                     ['--session', session_dir, '--role', role, '--follow',
                                      '--stop-file', stop_file,
-                                     '--detector', det, '--track-detector', tdet,
+                                     '--detector', detector_sel[role],
+                                     '--track-detector', track_det_sel[role],
                                      '--state-shm', state_slot.name,
                                      *(['--shm-ser', '--shm-frames', str(min(64, args.shm_frames))]
                                        if args.shm_ser else []),
-                                     '--track-blur-px', str(args.track_blur_px),
-                                     '--track-pull', str(args.track_pull),
-                                     '--doh-sigma', str(args.doh_sigma),
-                                     '--surprise-decay', str(args.surprise_decay),
-                                     '--surprise-blur-px', str(args.surprise_blur_px),
-                                     '--tile-size', str(args.tile_size),
-                                     '--tile-fixed-nsigma', str(args.tile_fixed_nsigma),
-                                     '--tile-moving-nsigma', str(args.tile_moving_nsigma),
-                                     '--tile-mask-px', str(args.tile_mask_px),
-                                     '--ext-nsigma', str(args.ext_nsigma),
-                                     '--ext-density', str(args.ext_density),
-                                     '--circ-down', str(args.circ_down),
-                                     '--circ-bg-radius', str(args.circ_bg_radius),
-                                     '--circ-nsigma', str(args.circ_nsigma),
-                                     '--circ-z', str(args.circ_z),
-                                     '--snr', str(args.snr), '--max-candidates', str(args.max_candidates),
-                                     '--min-blob-px', str(args.min_blob_px),
-                                     '--tile-grid', str(args.tile_grid), '--per-tile', str(args.per_tile),
-                                     '--device', args.device]
+                                     *tunables, '--device', args.device]
                                     + (['--debug-ser'] if debug_ser['on'] else []))
 
     # Focus/collimation: one optional focus process, toggled from the GUI Focus tab (Guide or Main).
@@ -1075,8 +1064,8 @@ def main(argv=None):
         tracking = coasting = False                        # a fresh mount -> drop any active track
         try:
             old.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[backend] old mount close failed (continuing): {e}", flush=True)
         for r in roles:                                    # re-point RUNNING sky-sim cams at the new
             if sources.get(r) == 'sky' and is_connected(r):     # mount (never launch idle ones)
                 restart_cam(r, stop_first=True)
@@ -1110,7 +1099,7 @@ def main(argv=None):
             tracking = coasting = False               # manual slew overrides auto-track (and coast)
             mount.set_rates(math.radians(cmd.get('az', 0.0)), math.radians(cmd.get('alt', 0.0)))
             estop = False
-        elif t == 'stop':                             # legacy: halt mount + tracking (kept for compat)
+        elif t == 'stop':                             # halt mount motion + drop tracking (slew-pad release)
             tracking = coasting = False
             mount.set_rates(0.0, 0.0)
         elif t == 'follow':                           # Follow on/off: PERSISTENT -- drive the mount to hold
@@ -1602,7 +1591,6 @@ def main(argv=None):
                 'debug_ser': debug_ser['on'],                  # detectors are writing <role>_debug streams
                 'capturing': {role: (role in cam_procs and cam_procs[role].poll() is None)
                               for role in roles},
-                'cameras': {role: {'frames': followers[role].committed_count()} for role in roles},
                 'optics': {r: {'fov_x_deg': round(fv[0], 4), 'fov_y_deg': round(fv[1], 4)}
                            for r, fv in fov_by_role.items()},
                 'optics_sel': {r: list(sel) for r, sel in optics_sel.items()},   # for the GUI Optics tab

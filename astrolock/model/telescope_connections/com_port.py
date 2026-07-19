@@ -11,7 +11,6 @@ class ComPortConnection(threaded.ThreadedConnection):
 
     @classmethod
     def get_urls(cls):
-        print(f'get_urls for {cls}')
         url_scheme = cls.get_url_scheme()
         urls = []
         comports = serial.tools.list_ports.comports()

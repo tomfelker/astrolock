@@ -418,8 +418,13 @@ def _open_sky(args, state_path=None, mount_path=None):
     from astrolock.seeker.almanac import SkyAlmanac
 
     adc_bits = 8 if int(getattr(args, 'bit_depth', 16)) == 8 else 12   # 8-bit fast mode, else native 12-bit
-    cfg = SkySimConfig(width=args.sky_width, height=args.sky_height,
-                       focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um,
+    # --sim-downscale N: render the sky on a 1/N-per-axis buffer (at N x the pixel pitch, so the
+    # optics/FoV stay physical) and publish upscaled to full size -- a pure performance knob.
+    # NOT binning: binning (--bin) changes the published geometry like a real binned camera.
+    ds = max(1, int(getattr(args, 'sim_downscale', 1)))
+    pub_w, pub_h = args.sky_width, args.sky_height
+    cfg = SkySimConfig(width=max(1, pub_w // ds), height=max(1, pub_h // ds),
+                       focal_length_mm=args.sky_focal_mm, pixel_pitch_um=args.sky_pixel_um * ds,
                        aperture_mm=args.sky_aperture_mm, psf_wavelength_nm=args.sky_psf_wavelength_nm,
                        central_obstruction=args.sky_central_obstruction, spider_vanes=args.sky_spider_vanes,
                        vane_width_frac=args.sky_vane_width_frac,
@@ -430,7 +435,8 @@ def _open_sky(args, state_path=None, mount_path=None):
     # Model of the camera's data link (USB3): frames can't be DELIVERED faster than the link
     # carries their bytes, whatever the exposure allows -- the real rig's effective fps ceiling
     # (a 16.6MB full-res frame over ~400MB/s = ~24fps, matching the observed hardware).
-    frame_bytes = cfg.width * cfg.height * (1 if adc_bits <= 8 else 2)   # container bytes/frame (8- or 16-bit)
+    # Sized on the PUBLISHED frame: downscale shrinks the render, not the simulated link.
+    frame_bytes = pub_w * pub_h * (1 if adc_bits <= 8 else 2)   # container bytes/frame (8- or 16-bit)
     bw_interval = (frame_bytes / (args.sim_cam_bandwidth_limit * 1e6)
                    if args.sim_cam_bandwidth_limit > 0 else 0.0)
     _bw = {'last': None}
@@ -453,8 +459,8 @@ def _open_sky(args, state_path=None, mount_path=None):
         import numpy as _np
         _hi = 250 if adc_bits <= 8 else 400
         noop_frame = _np.random.default_rng(0).integers(
-            150, _hi, size=(cfg.height, cfg.width), dtype=_np.uint8 if adc_bits <= 8 else _np.uint16)
-        print(f"[cam] sky sim NOOP {cfg.width}x{cfg.height} ({frame_bytes / 1e6:.1f} MB/frame, "
+            150, _hi, size=(pub_h, pub_w), dtype=_np.uint8 if adc_bits <= 8 else _np.uint16)
+        print(f"[cam] sky sim NOOP {pub_w}x{pub_h} ({frame_bytes / 1e6:.1f} MB/frame, "
               f"link {args.sim_cam_bandwidth_limit:g} MB/s -> <= "
               f"{(1.0 / bw_interval) if bw_interval else float('inf'):.1f} fps)", flush=True)
 
@@ -478,8 +484,8 @@ def _open_sky(args, state_path=None, mount_path=None):
                 return _live['gain_cb']
             return None
         controls = {'source': 'sky', 'controls': caps, 'set': set_control_noop}
-        meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
-        return capture_noop, cfg.width, cfg.height, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
+        meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, pub_w, pub_h]}
+        return capture_noop, pub_w, pub_h, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
 
     device = resolve_device(getattr(args, 'device', 'auto'))
     sim = SkySim(cfg, device=device)                   # render-only; propagation lives in sky_sim.py
@@ -490,7 +496,9 @@ def _open_sky(args, state_path=None, mount_path=None):
     az0 = _math.radians(args.sky_az_deg) if args.sky_az_deg is not None else 0.0
     alt0 = _math.radians(args.sky_alt_deg) if args.sky_alt_deg is not None else _math.radians(45.0)
     rate_az, rate_alt = _math.radians(args.sky_rate_az), _math.radians(args.sky_rate_alt)
-    print(f"[cam] sky sim {cfg.width}x{cfg.height} FoV {fov_x:.1f}deg almanac={args.sky_almanac} "
+    print(f"[cam] sky sim {pub_w}x{pub_h}"
+          + (f" (render {cfg.width}x{cfg.height}, downscale {ds})" if ds > 1 else "")
+          + f" FoV {fov_x:.1f}deg almanac={args.sky_almanac} "
           f"exp={args.sky_exposure_s}s substeps={args.sky_substeps} device={device}", flush=True)
 
     # Prefer the sim mount's ground-truth trajectory (piecewise-linear, exact) over the backend's
@@ -551,6 +559,10 @@ def _open_sky(args, state_path=None, mount_path=None):
         almanac.update()
         dirs, mags = almanac.dirs_at(sub_t)
         frame = sim.render(az, alt, pose['raz'], pose['ralt'], dirs, mags, exposure_s=exp, substeps=S)
+        if ds > 1:                              # publish at full size (nearest keeps ADU values exact)
+            dt0 = frame.dtype
+            frame = torch.nn.functional.interpolate(
+                frame[None, None].to(torch.float32), size=(pub_h, pub_w), mode='nearest')[0, 0].to(dt0)
         _bw_wait()                              # the data link caps delivery rate, whatever the exposure
         # (frame, stamp, available-at): the sim renders in ~zero wall-clock, but a real camera can't
         # deliver a frame until the exposure ends. Stamp at the exposure midpoint (best time to
@@ -573,8 +585,8 @@ def _open_sky(args, state_path=None, mount_path=None):
             return _live['gain_cb']
         return None
     controls = {'source': 'sky', 'controls': caps, 'set': set_control}
-    meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, cfg.width, cfg.height]}
-    return capture, cfg.width, cfg.height, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
+    meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, pub_w, pub_h]}
+    return capture, pub_w, pub_h, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
 
 
 def _open_playback(args):
@@ -681,6 +693,10 @@ def main(argv=None):
     # sky simulator (--source sky): the camera only renders point sources it reads from the shared
     # sky_sim almanac. It has no notion of stars vs satellites, nor of epoch/site/TLE -- sky_sim
     # owns all propagation. These args are just this camera's optics + pose + exposure.
+    p.add_argument('--sim-downscale', type=int, default=1,
+                   help="sky: render on a 1/N-per-axis buffer (N x pixel pitch, same FoV) and "
+                        "publish upscaled at full size -- a pure perf knob, distinct from --bin "
+                        "(which changes the published geometry like a real binned camera)")
     p.add_argument('--sky-width', type=int, default=1920, help="sky: sensor width (px)")
     p.add_argument('--sky-height', type=int, default=1080, help="sky: sensor height (px)")
     p.add_argument('--sky-focal-mm', type=float, default=8.0, help="sky: lens focal length (mm); FoV = w*pitch/focal")
