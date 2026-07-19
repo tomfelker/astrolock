@@ -1144,13 +1144,11 @@ def main(argv=None):
         button, a bool renders a checkbox showing that state. Actions resolve the slot's
         stream at call time, so they follow a promote/swap."""
         if name == 'big':
-            # Checkboxes suspected of eating pane clicks (field 2026-07-18) -- disabled while
-            # we chase it; zoom buttons stay.
-            return [  # ('Show Settings', lambda: layout.__setitem__('panel_open', not layout['panel_open']),
-                      #  layout['panel_open']),
-                      # ('Show PIPs', lambda: layout.__setitem__('pip_open', not layout['pip_open']),
-                      #  layout['pip_open']),
-                      # ('Request Debug', _toggle_dbg, layout['pip_debug']),   # detector surface pip
+            return [('Show Settings', lambda: layout.__setitem__('panel_open', not layout['panel_open']),
+                     layout['panel_open']),
+                    ('Show PIPs', lambda: layout.__setitem__('pip_open', not layout['pip_open']),
+                     layout['pip_open']),
+                    ('Request Debug', _toggle_dbg, layout['pip_debug']),   # detector surface pip
                     ('  -  ', lambda: _zoom_step(_slot_stream('big'), -1), None),
                     ('  +  ', lambda: _zoom_step(_slot_stream('big'), +1), None)]
         return [('  ^  ', lambda n=name: _promote(_slot_stream(n)), None),

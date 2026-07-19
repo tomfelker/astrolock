@@ -1422,6 +1422,12 @@ def main(argv=None):
     try:
         while True:
             time.sleep(0.05)                      # ~20 Hz control loop
+            for fo_ in followers.values():
+                fo_.poll()                        # keeps each follower's header/meta loaded -- the
+                                                  # 'track' path NEEDS them (plate scale, binning) and
+                                                  # reads them without polling. (This poll used to hide
+                                                  # inside a dead state field's committed_count(); its
+                                                  # removal silently killed click-to-track. Explicit now.)
             update_sched()                        # re-rank child priorities if the situation moved
             now = session_mod.mono_s()            # SAME timeline as every t_mono_ns stamp: this
                                                   # 'now' meets frame times in the tracker/servo
