@@ -159,6 +159,7 @@ class FocusEma:
             self.peak_meter = torch.maximum(self.peak_meter * self.peak_decay, star)
         ema = self.ema
         dx, dy = _com_offset(ema)                                      # collimation: CoM offset (px)
+        idx_, idy_ = _com_offset(star)                 # same math on the instantaneous crop
         # peak = brightest pixel of the EMA (0..1 full-scale): the focus-quality proxy, which rises as
         # focus tightens. (Per-axis x/y sharpness was dropped -- astigmatism can lie on a diagonal, so it
         # wants the full second-moment matrix Mxx/Myy/Mxy, not marginals; not worth it unless collimating.)
@@ -167,6 +168,7 @@ class FocusEma:
             'peak_frame': round(float(star.max()) / self.scale, 6),   # per-frame; blinds when saturated
             'hfd': round(_hfd(star), 3),                              # per-frame; saturation-immune
             'com': [round(dx, 3), round(dy, 3)],
+            'com_inst': [round(idx_, 3), round(idy_, 3)],
         }
         sat = self.peak_meter > (0.9 * self.scale)                    # near full well -> peak unreliable
         return ema, star, metrics, sat
@@ -242,8 +244,9 @@ def main(argv=None):
     # Star stream: per-frame focus metrics ride as binary record extras (strehl None -> NaN;
     # 'present' is record flags bit 0). The GUI reads them straight from the section.
     out = framestream.FrameStream(args.session, f'{args.role}_focus',
-                                  extras=('<8f', ['peak', 'peak_frame', 'hfd', 'strehl',
-                                                  'dx', 'dy', 'com_rad_x', 'com_rad_y']))
+                                  extras=('<10f', ['peak', 'peak_frame', 'hfd', 'strehl',
+                                                   'dx', 'dy', 'com_rad_x', 'com_rad_y',
+                                                   'inst_dx', 'inst_dy']))
     cur = None                                              # current input RingReader
     ema = None
 
@@ -266,6 +269,7 @@ def main(argv=None):
     latest_blobs = []
     latest_tracking = False        # blobs are only trusted when they answer a tracker lock
     last_det = None                # (det ring ident, index) of the last-applied detection
+    last_done = None               # (cam ring ident, index) of the last frame processed
     scale = None
     total = 0
     strehl_ref = None            # ideal (diffraction-limited) normalized peak; computed once, kept across segments
@@ -321,7 +325,7 @@ def main(argv=None):
             pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))   # hot pixels can't win
             target = (pk % work.shape[1], pk // work.shape[1])
         star_ema, star_now, metrics, sat = ema.update(work, target)
-        # Extras schema ('<6f'): strehl NaN when the aperture is unknown; com_rad NaN when the
+        # Extras schema ('<10f'): strehl NaN when the aperture is unknown; com_rad NaN when the
         # plate scale is (consumers turn NaN back into None/absent).
         strehl = (_normalized_peak(star_ema) / strehl_ref) if strehl_ref else float('nan')
         crx = metrics['com'][0] * rad_per_px if rad_per_px is not None else float('nan')
@@ -342,7 +346,8 @@ def main(argv=None):
         out.write(pair,
                   t_mono_ns=src_t, src_index=i, flags=1 if present else 0,
                   extras=(metrics['peak'], metrics['peak_frame'], metrics['hfd'], strehl,
-                          metrics['com'][0], metrics['com'][1], crx, cry))
+                          metrics['com'][0], metrics['com'][1], crx, cry,
+                          metrics['com_inst'][0], metrics['com_inst'][1]))
         total += 1
 
     try:
@@ -367,18 +372,24 @@ def main(argv=None):
                         latest_tracking = False
             fo.poll()
             worked = False
-            # SEQUENTIAL: exactly one EMA sample per frame, in order, in bounded bites (stay
-            # live); frames the producer lapped are skipped and counted by the follower.
-            for rd, i in fo.drain(limit=8):
+            # LATEST-ONLY (like the detectors): always process the newest committed frame and
+            # skip whatever piled up behind it -- a focus readout is only useful live, so
+            # latency beats completeness. (Skipping stretches the EMA's effective time
+            # constant when we're slow; that's the right trade for a focusing aid.)
+            got = fo.latest()
+            if got is not None:
+                rd, i = got
                 if rd is not cur:
                     switch_to(rd)
                     latest_blobs = []
                     latest_tracking = False
-                try:
-                    process(i)
-                except framestream.Lapped:
-                    continue
-                worked = True
+                if last_done != (rd.ident, i):
+                    last_done = (rd.ident, i)
+                    try:
+                        process(i)
+                        worked = True
+                    except framestream.Lapped:
+                        pass
             if not worked:
                 if fo.ended():
                     break                              # cam stream ended cleanly; we're done

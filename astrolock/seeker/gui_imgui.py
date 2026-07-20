@@ -470,7 +470,9 @@ def main(argv=None):
                 'invert_x': False, 'invert_y': False,     # flip screw-turn direction per axis (image parity)
                 'alpha': 0.05,                            # star-crop EMA smoothing (relaunch-tier)
                 'com_rad': (0.0, 0.0),                    # latest CoM offset (radians) for the screw dial
-                'series': {k: [] for k in ('t', 'peak', 'peakf', 'hfd', 'strehl', 'dx', 'dy')}}
+                'com_px': None,                           # latest EMA CoM offset (px) -> red circle, left half
+                'com_inst_px': None,                      # latest instantaneous CoM offset -> right half
+                'series': {k: [] for k in ('t', 'peak', 'peakf', 'hfd', 'strehl')}}
     sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0, 'frames': 40,  # focus sweep (human actuator)
                 'role': None, 'fo': None, 'state': None,              # prompt/result stream tail
                 'confirmed': None,                                    # last position we OK'd
@@ -668,7 +670,8 @@ def main(argv=None):
         return True
 
     # ---- pane drawing (letterboxed image + overlays into the pane child's draw list) ---------
-    PIP_R = S(15)      # pipper circle radius; a view's centre crosshairs stop here so a centred pipper joins them
+    PIPPER_R = S(15)      # pipper (HUD aiming pip) circle radius -- NOT picture-in-picture; a view's
+                          # centre crosshairs stop here so a centred pipper joins them
 
     # Overlay colour scheme: RED = tracker inputs / info; GREEN = tracker products; BLUE = model output.
     # Amber flags a coasting model (no fresh detection).
@@ -689,17 +692,17 @@ def main(argv=None):
         """Circle at the target, clamped to stay inside the visible camera view `box` (x0,y0,x1,y1 local),
         + 4 short lines from the circle pointing toward the *true* target centre."""
         x0, y0, x1, y1 = box
-        m = PIP_R + S(2)
+        m = PIPPER_R + S(2)
         ccx = min(max(tx, x0 + m), max(x0 + m, x1 - m))   # inner max guards a view narrower than 2m
         ccy = min(max(ty, y0 + m), max(y0 + m, y1 - m))
-        dl.add_circle(A(ccx, ccy), PIP_R, C(col), 0, 1.0)
+        dl.add_circle(A(ccx, ccy), PIPPER_R, C(col), 0, 1.0)
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            sx, sy = ccx + dx * PIP_R, ccy + dy * PIP_R      # a point on the circle
+            sx, sy = ccx + dx * PIPPER_R, ccy + dy * PIPPER_R      # a point on the circle
             vx, vy = tx - sx, ty - sy                         # toward the true target centre
             n = math.hypot(vx, vy)
             if n < 1e-6:
                 continue
-            dl.add_line(A(sx, sy), A(sx + vx / n * PIP_R * 0.5, sy + vy / n * PIP_R * 0.5), C(col), 1.0)
+            dl.add_line(A(sx, sy), A(sx + vx / n * PIPPER_R * 0.5, sy + vy / n * PIPPER_R * 0.5), C(col), 1.0)
 
     def _draw_turn_arc(dl, A, cx, cy, r, turns):
         """A curved arrow around a screw: sweep ∝ turns (clamped to ±1 turn for the arc), arrowhead at the
@@ -922,7 +925,16 @@ def main(argv=None):
         il, ir, it, ib = offx, offx + dw, offy, offy + dh   # image edges (not the letterbox bars)
         bmr = stt.get('boresight_mrad') or (0.0, 0.0)       # main-vs-guide offset (mrad)
         bore_x_rad, bore_y_rad = bmr[0] * 1e-3, bmr[1] * 1e-3
-        if sset['reticles']:
+        if sset['reticles'] and role.endswith('_focus'):
+            # Focus view is [EMA | instantaneous] side by side: one full crosshair PER HALF
+            # (the plain single reticle would sit uselessly on the seam between them).
+            for k in (0.25, 0.75):
+                hx = offx + dw * k
+                dl.add_line(A(offx + dw * (k - 0.25), cy), A(hx - PIPPER_R, cy), C(RED), 1.0)
+                dl.add_line(A(offx + dw * (k + 0.25), cy), A(hx + PIPPER_R, cy), C(RED), 1.0)
+                dl.add_line(A(hx, it), A(hx, cy - PIPPER_R), C(RED), 1.0)
+                dl.add_line(A(hx, ib), A(hx, cy + PIPPER_R), C(RED), 1.0)
+        elif sset['reticles']:
             optx = stt.get('optics', {})
             me = optx.get(role)
             inner = None                          # a narrower co-aligned cam nested in this view (main in guide)
@@ -956,10 +968,10 @@ def main(argv=None):
             else:
                 # Narrowest cam (main): crosshairs from each image edge to the pipper radius, so a
                 # centred target's pipper circle connects them.
-                dl.add_line(A(il, cy), A(cx - PIP_R, cy), C(RED), 1.0)
-                dl.add_line(A(ir, cy), A(cx + PIP_R, cy), C(RED), 1.0)
-                dl.add_line(A(cx, it), A(cx, cy - PIP_R), C(RED), 1.0)
-                dl.add_line(A(cx, ib), A(cx, cy + PIP_R), C(RED), 1.0)
+                dl.add_line(A(il, cy), A(cx - PIPPER_R, cy), C(RED), 1.0)
+                dl.add_line(A(ir, cy), A(cx + PIPPER_R, cy), C(RED), 1.0)
+                dl.add_line(A(cx, it), A(cx, cy - PIPPER_R), C(RED), 1.0)
+                dl.add_line(A(cx, ib), A(cx, cy + PIPPER_R), C(RED), 1.0)
 
         # Clamp box = the visible camera view (image ∩ pane): letterboxed image zoomed out, the pane zoomed in.
         box = (max(0.0, il), max(0.0, it), min(float(SW), ir), min(float(SH), ib))
@@ -993,9 +1005,9 @@ def main(argv=None):
         # actually put the locked target -- only in that source cam.
         if tracking and active_src == role and stt.get('detect_px'):
             dcx, dcy = T(stt['detect_px'][0], stt['detect_px'][1])
-            dcx = min(max(dcx, box[0] + PIP_R), max(box[0] + PIP_R, box[2] - PIP_R))
-            dcy = min(max(dcy, box[1] + PIP_R), max(box[1] + PIP_R, box[3] - PIP_R))
-            dl.add_circle(A(dcx, dcy), PIP_R * 0.72, C(_green(True)), 0, 1.6)
+            dcx = min(max(dcx, box[0] + PIPPER_R), max(box[0] + PIPPER_R, box[2] - PIPPER_R))
+            dcy = min(max(dcy, box[1] + PIPPER_R), max(box[1] + PIPPER_R, box[3] - PIPPER_R))
+            dl.add_circle(A(dcx, dcy), PIPPER_R * 0.72, C(_green(True)), 0, 1.6)
 
         # Tracker ROI = an input we hand the detector: red; solid for the active source, dim for a fallback.
         roi = (stt.get('track_roi') or {}).get(role)
@@ -1039,20 +1051,16 @@ def main(argv=None):
             dcy2 = max(Rd + S(14), gy0 - Rd - S(42))       # above the graph, clear of its top label
             _draw_screw_dial(dl, A, (gx0 + gx1) / 2.0, dcy2, Rd,
                              off, focus_ui['screw_phase'], focus_ui['rad_per_turn'])
-            npts = len(sc['dx'])
-            if npts:
-                mult = focus_ui['com_mult']
-                # EMA crop centre: the focus frame is [EMA | instantaneous] side by side, so the
-                # EMA's centre is at a quarter of the width (mono crop, ox == 1).
-                ctrx, ctry = cam['fw'] / 4.0, cam['fh'] / 2.0
-                cgx, cgy = T(ctrx, ctry)
-                dl.add_line(A(cgx - S(6), cgy), A(cgx + S(6), cgy), C((120, 128, 138, 150)), 1.0)
-                dl.add_line(A(cgx, cgy - S(6)), A(cgx, cgy + S(6)), C((120, 128, 138, 150)), 1.0)
-                k = min(10, npts)
-                for j in range(npts - k, npts):
-                    aa = 0.5 + 0.5 * (j - (npts - k)) / max(1, k - 1)    # 0.5 (oldest) -> 1.0 (newest)
-                    X, Y = T(ctrx + sc['dx'][j] * mult, ctry + sc['dy'][j] * mult)
-                    dl.add_circle_filled(A(X, Y), S(3), C((90, 230, 220, int(255 * aa))))
+            # Centering circles: one per half ([EMA | instantaneous], mono crop so ox == 1),
+            # radius = the reticle crosshair gap, at that half's CoM offset -- same math on
+            # both, just different target images. (The crosshairs themselves are the per-half
+            # red reticles, drawn in the reticle block above.)
+            mult = focus_ui['com_mult']
+            for half_cx, off_px in ((cam['fw'] / 4.0, focus_ui['com_px']),
+                                    (cam['fw'] * 3.0 / 4.0, focus_ui['com_inst_px'])):
+                if off_px is not None:
+                    X, Y = T(half_cx + off_px[0] * mult, cam['fh'] / 2.0 + off_px[1] * mult)
+                    dl.add_circle(A(X, Y), PIPPER_R, C(COL_INPUT), 0, 1.6)
 
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
         if dw > SW + 1:
@@ -1568,8 +1576,9 @@ def main(argv=None):
             h = rec.get('hfd')
             s['hfd'].append(None if h is None or math.isnan(h) else h)
             s['strehl'].append(None if math.isnan(rec['strehl']) else rec['strehl'])
-            s['dx'].append(rec['dx'])
-            s['dy'].append(rec['dy'])
+            focus_ui['com_px'] = (rec['dx'], rec['dy'])    # latest offsets -> centering circles
+            ix, iy = rec.get('inst_dx'), rec.get('inst_dy')   # absent on pre-inst recordings
+            focus_ui['com_inst_px'] = (ix, iy) if ix is not None else None
             if not math.isnan(rec['com_rad_x']):           # pixel-scale-free CoM -> screw dial (latest)
                 focus_ui['com_rad'] = (rec['com_rad_x'], rec['com_rad_y'])
             perf['focus'].hit()                            # one record = one focus frame produced
