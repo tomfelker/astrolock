@@ -464,14 +464,15 @@ def main(argv=None):
                 'model': 'ema', 'alt_km': 250.0}                         # target model (next lock)
     sim_ui = {'r0': 0.0, 'bortle': 4}                     # Simulation panel: seeing r0 (m) + Bortle sky class
     focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'fo': None,
-                't0': None, 'com_mult': 10.0,             # collimation-trail exaggeration on the star view
+                't0': None, 'com_mult': 10.0,             # skew-arrow exaggeration on the star view
+                'shape_gain': 5.0,                        # astigmatism-ellipse ellipticity exaggeration
                 'screw_phase': 0.0,                       # deg: rotation of the 3 collimation screws in the image
-                'rad_per_turn': 100e-6,                   # empirical: CoM-offset radians removed per screw turn
+                'rad_per_turn': 100e-6,                   # empirical: skew radians removed per screw turn
                 'invert_x': False, 'invert_y': False,     # flip screw-turn direction per axis (image parity)
                 'alpha': 0.05,                            # star-crop EMA smoothing (relaunch-tier)
-                'com_rad': (0.0, 0.0),                    # latest CoM offset (radians) for the screw dial
-                'com_px': None,                           # latest EMA CoM offset (px) -> red circle, left half
-                'com_inst_px': None,                      # latest instantaneous CoM offset -> right half
+                'skew_rad': (0.0, 0.0),                   # latest skew (radians) for the screw dial
+                'shape_ema': None,                        # latest (e1, e2, skew_x, skew_y) of the EMA image
+                'shape_instant': None,                    # same for the instantaneous crop
                 'series': {k: [] for k in ('t', 'peak', 'peakf', 'hfd', 'strehl')}}
     sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0, 'frames': 40,  # focus sweep (human actuator)
                 'role': None, 'fo': None, 'state': None,              # prompt/result stream tail
@@ -484,6 +485,7 @@ def main(argv=None):
                   'sim_r0': f"{sim_ui['r0']:g}", 'track_smooth': f"{track_ui['smoothing']:g}",
                   'track_alt': f"{track_ui['alt_km']:g}",
                   'focus_alpha': f"{focus_ui['alpha']:g}", 'focus_com_mult': f"{focus_ui['com_mult']:g}",
+                  'focus_shape_gain': f"{focus_ui['shape_gain']:g}",
                   'sweep_start': f"{sweep_ui['start']:g}", 'sweep_end': f"{sweep_ui['end']:g}",
                   'sweep_step': f"{sweep_ui['step']:g}",
                   'settings_name': ''},
@@ -1046,21 +1048,43 @@ def main(argv=None):
                 dl.add_rect(A(gx0, gy0), A(gx1, gy1), C((150, 155, 172, 170)), 0.0, 1.0)
                 _text(dl, A(gx0, gy0 - S(16)), label, S(12), (120, 220, 255, 235))
             Rd = S(38)
-            ox_, oy_ = focus_ui['com_rad']
+            ox_, oy_ = focus_ui['skew_rad']
             off = (-ox_ if focus_ui['invert_x'] else ox_, -oy_ if focus_ui['invert_y'] else oy_)
             dcy2 = max(Rd + S(14), gy0 - Rd - S(42))       # above the graph, clear of its top label
             _draw_screw_dial(dl, A, (gx0 + gx1) / 2.0, dcy2, Rd,
                              off, focus_ui['screw_phase'], focus_ui['rad_per_turn'])
-            # Centering circles: one per half ([EMA | instantaneous], mono crop so ox == 1),
-            # radius = the reticle crosshair gap, at that half's CoM offset -- same math on
-            # both, just different target images. (The crosshairs themselves are the per-half
-            # red reticles, drawn in the reticle block above.)
+            # Shape glyphs, one per half ([EMA | instantaneous], mono crop so ox == 1), same
+            # math on both, just different target images:
+            #  - astigmatism ELLIPSE: centred on the crosshair, mean radius = the crosshair
+            #    gap, orientation exact, ellipticity exaggerated by Shape x; a circle = round.
+            #  - coma SKEW ARROW: from the crosshair to the halo's centroid offset, in image
+            #    px exaggerated by Skew x -- collimation drives this to zero.
             mult = focus_ui['com_mult']
-            for half_cx, off_px in ((cam['fw'] / 4.0, focus_ui['com_px']),
-                                    (cam['fw'] * 3.0 / 4.0, focus_ui['com_inst_px'])):
-                if off_px is not None:
-                    X, Y = T(half_cx + off_px[0] * mult, cam['fh'] / 2.0 + off_px[1] * mult)
-                    dl.add_circle(A(X, Y), PIPPER_R, C(COL_INPUT), 0, 1.6)
+            gain = focus_ui['shape_gain']
+            for half_cx, shape in ((cam['fw'] / 4.0, focus_ui['shape_ema']),
+                                   (cam['fw'] * 3.0 / 4.0, focus_ui['shape_instant'])):
+                if shape is None:
+                    continue
+                e1_, e2_, skx_, sky_ = shape
+                ctr_fx, ctr_fy = half_cx, cam['fh'] / 2.0
+                emag = math.hypot(e1_, e2_)
+                theta = 0.5 * math.atan2(e2_, e1_) if emag > 1e-9 else 0.0
+                ex = min(0.95, gain * emag)
+                a_ax = PIPPER_R * math.sqrt(1.0 + ex)
+                b_ax = PIPPER_R * math.sqrt(1.0 - ex)
+                ct, st_ = math.cos(theta), math.sin(theta)
+                cgx, cgy = T(ctr_fx, ctr_fy)
+                pts = []
+                for k in range(32):
+                    ang = 2.0 * math.pi * k / 32
+                    px_ = a_ax * math.cos(ang)
+                    py_ = b_ax * math.sin(ang)
+                    pts.append(imgui.ImVec2(*A(cgx + px_ * ct - py_ * st_,
+                                               cgy + px_ * st_ + py_ * ct)))
+                dl.add_polyline(pts, C(COL_INPUT), 1.6, int(imgui.ImDrawFlags_.closed))
+                tipx, tipy = T(ctr_fx + skx_ * mult, ctr_fy + sky_ * mult)
+                dl.add_line(A(cgx, cgy), A(tipx, tipy), C(COL_INPUT), 1.6)
+                dl.add_circle_filled(A(tipx, tipy), S(3), C(COL_INPUT))
 
         # Cut-off indicators: when zoomed past fit the image overflows -> arrows on the cropped edges.
         if dw > SW + 1:
@@ -1369,7 +1393,8 @@ def main(argv=None):
                          'model': track_ui['model'], 'alt_km': track_ui['alt_km'],
                          'follow': bool((ctrl['state'] or {}).get('follow_enabled', True))},
             'sim': {'r0': sim_ui['r0'], 'bortle': sim_ui['bortle']},   # per-cam defocus rides with the cam caps
-            'focus': {'com_mult': focus_ui['com_mult'], 'screw_phase': focus_ui['screw_phase'],
+            'focus': {'com_mult': focus_ui['com_mult'], 'shape_gain': focus_ui['shape_gain'],
+                      'screw_phase': focus_ui['screw_phase'],
                       'rad_per_turn': focus_ui['rad_per_turn'], 'alpha': focus_ui['alpha'],
                       'invert_x': focus_ui['invert_x'], 'invert_y': focus_ui['invert_y']},  # collimation calib
         }
@@ -1437,6 +1462,9 @@ def main(argv=None):
         if 'com_mult' in foc:
             focus_ui['com_mult'] = float(foc['com_mult'])
             ui['txt']['focus_com_mult'] = f"{focus_ui['com_mult']:g}"
+        if 'shape_gain' in foc:
+            focus_ui['shape_gain'] = float(foc['shape_gain'])
+            ui['txt']['focus_shape_gain'] = f"{focus_ui['shape_gain']:g}"
         if 'screw_phase' in foc:
             focus_ui['screw_phase'] = float(foc['screw_phase'])
         if 'rad_per_turn' in foc:
@@ -1576,11 +1604,15 @@ def main(argv=None):
             h = rec.get('hfd')
             s['hfd'].append(None if h is None or math.isnan(h) else h)
             s['strehl'].append(None if math.isnan(rec['strehl']) else rec['strehl'])
-            focus_ui['com_px'] = (rec['dx'], rec['dy'])    # latest offsets -> centering circles
-            ix, iy = rec.get('inst_dx'), rec.get('inst_dy')   # absent on pre-inst recordings
-            focus_ui['com_inst_px'] = (ix, iy) if ix is not None else None
-            if not math.isnan(rec['com_rad_x']):           # pixel-scale-free CoM -> screw dial (latest)
-                focus_ui['com_rad'] = (rec['com_rad_x'], rec['com_rad_y'])
+            # Latest shape per half image: (e1, e2, skew_x, skew_y); absent on old recordings.
+            if rec.get('ellipse_1') is not None:
+                focus_ui['shape_ema'] = (rec['ellipse_1'], rec['ellipse_2'],
+                                         rec['skew_x'], rec['skew_y'])
+                focus_ui['shape_instant'] = (rec['instant_ellipse_1'], rec['instant_ellipse_2'],
+                                             rec['instant_skew_x'], rec['instant_skew_y'])
+            srx = rec.get('skew_rad_x')                    # pixel-scale-free skew -> screw dial
+            if srx is not None and not math.isnan(srx):
+                focus_ui['skew_rad'] = (srx, rec['skew_rad_y'])
             perf['focus'].hit()                            # one record = one focus frame produced
         for k in s:                                       # keep only the last FOCUS_MAX points
             if len(s[k]) > FOCUS_MAX:
@@ -2097,15 +2129,26 @@ def main(argv=None):
                     _send({'type': 'focus', 'on': True, 'role': focus_ui['role'], 'alpha': focus_ui['alpha']})
                 return f"{focus_ui['alpha']:g}"
             _input_commit('focus_alpha', S(48), _commit_alpha)
-            imgui.text("Collimation ×:")
-            _tip("Exaggeration for the collimation (CoM-offset) trail drawn on the star view -- higher "
-                 "magnifies smaller miscollimation. The last ~10 measurements are drawn, faint→bright.")
+            imgui.text("Skew ×:")
+            _tip("Exaggeration for the skew (coma) arrows drawn on the star view -- higher magnifies "
+                 "smaller miscollimation. The arrow points from each crosshair to where the halo's "
+                 "light sits relative to the star's centroid.")
             imgui.same_line()
 
             def _commit_cm(txt):
                 focus_ui['com_mult'] = max(1.0, _flt(txt, focus_ui['com_mult']))
                 return f"{focus_ui['com_mult']:g}"
             _input_commit('focus_com_mult', S(48), _commit_cm)
+            imgui.text("Shape ×:")
+            _tip("Exaggeration for the astigmatism ellipses drawn on the star view: the drawn "
+                 "ellipticity is this many times the measured one (orientation exact, mean radius "
+                 "pinned to the crosshair gap). 1 = true shape.")
+            imgui.same_line()
+
+            def _commit_shape_gain(txt):
+                focus_ui['shape_gain'] = max(1.0, _flt(txt, focus_ui['shape_gain']))
+                return f"{focus_ui['shape_gain']:g}"
+            _input_commit('focus_shape_gain', S(48), _commit_shape_gain)
             imgui.text("Screw phase:")               # SCT collimation-screw guide (dial on the star pane)
             _tip("Rotational orientation of the 3 secondary collimation screws in the camera image -- dial "
                  "it so the numbered screws on the star pane match how you physically see them on the "
@@ -2118,9 +2161,9 @@ def main(argv=None):
             imgui.same_line()
             imgui.text_colored(C4(140, 145, 160), "deg")
             imgui.text("Turn sensitivity:")
-            _tip("Empirical: collimation error (CoM offset, in microradians -- pixel-scale-free, so it's the "
+            _tip("Empirical: collimation error (skew, in microradians -- pixel-scale-free, so it's the "
                  "same across cameras) removed by one full screw turn. Calibrate once: note how far a screw "
-                 "turn moves the offset. Make it negative if the turn arrows point the wrong way.")
+                 "turn moves the skew. Make it negative if the turn arrows point the wrong way.")
             imgui.same_line()
             imgui.set_next_item_width(S(56))
             ch, v = imgui.input_float("##focus_screw_sens", focus_ui['rad_per_turn'] * 1e6, 0.0, 0.0, "%.0f", ENTER)

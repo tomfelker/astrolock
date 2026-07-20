@@ -13,12 +13,13 @@ It writes two files per segment (both discovered by SerFollower / the sidecar he
 GUI can PIP the star image and graph the metrics -- same naming convention as the _debug streams):
   - <seg>_<role>_focus.ser          : the EMA star image (mono 16-bit; auto-normalized so the
                                       shape is always visible -- the quantitative peak is a metric)
-  - <seg>_<role>_focus.frames.jsonl : the commit spine AND the per-frame metrics --
-                                      peak      (focus quality: brightness of the EMA's peak, 0..1),
-                                      focus_x/y (per-axis sharpness: peak of the col/row-sum profile),
-                                      com       ([dx, dy] px: CoM offset of the EMA = collimation),
-                                      present   (True = locked a real detection this frame, not the
-                                                 global-max fallback).
+  - <seg>_<role>_focus.frames.jsonl : the commit spine; per-frame metrics ride as binary record
+                                      extras (see the FrameStream extras schema below): peak,
+                                      peak_frame, hfd, strehl, per-image ellipse (astigmatism)
+                                      and skew (coma -> collimation screws), and skew in radians
+                                      for the screw dial. 'present' is record flags bit 0
+                                      (True = locked a real detection, not the global-max
+                                      fallback).
 
 No mount, no sky model, no sockets -- files in, files out, so it runs identically on a live capture
 or a recording (where you'd tune it offline).
@@ -63,19 +64,84 @@ def _crop(work, cx, cy, size):
     return work[y0:y0 + size, x0:x0 + size], x0, y0
 
 
-def _com_offset(img):
-    """CoM of a 2-D non-negative image relative to its geometric centre, px (dx right, dy down).
-    The window is centred + odd, so a symmetric background pedestal cancels (as in focus.py)."""
-    H, W = img.shape
-    dev = img.device
-    tot = float(img.sum())
-    if tot <= 0:
-        return 0.0, 0.0
-    ys = torch.arange(H, dtype=torch.float32, device=dev) - (H - 1) / 2.0
-    xs = torch.arange(W, dtype=torch.float32, device=dev) - (W - 1) / 2.0
-    dy = float((img.sum(dim=1) * ys).sum()) / tot
-    dx = float((img.sum(dim=0) * xs).sum()) / tot
-    return dx, dy
+def _toroidal_com(window):
+    """Sub-pixel star position within ``window``: per-axis CIRCULAR mean of the raw pixel
+    values, treating the window as a torus (the circmean detector's trick). A uniform
+    background contributes zero net circular mean -- background immunity with no background
+    estimate and no thresholding -- and a star near the window edge wraps instead of
+    truncating into a bias. Returns (x, y) in window px."""
+    height, width = window.shape
+    device = window.device
+
+    def axis_pos(marginal, n):
+        theta = torch.arange(n, dtype=torch.float32, device=device) * (2.0 * math.pi / n)
+        c = float((marginal * torch.cos(theta)).sum())
+        s = float((marginal * torch.sin(theta)).sum())
+        return (math.atan2(s, c) % (2.0 * math.pi)) * n / (2.0 * math.pi)
+
+    return axis_pos(window.sum(dim=0), width), axis_pos(window.sum(dim=1), height)
+
+
+def _weighted_shape(img, sigma_seed, passes=2):
+    """
+    Closed-form Gaussian-weighted shape fit of the star in ``img`` (the moment-matching /
+    'adaptive moments' estimator -- the one-shot solution GD would converge to for this
+    model family). Per pass, about the current centroid with window sigma_w:
+
+      background = median of the ring the window ignores (r > 3 sigma_w) -- "measure sky
+                   where the model says there's no star"; residuals KEEP their sign (no
+                   clamp, no k-sigma threshold: far pixels are weightless, not zeroed);
+      centroid   = weighted first moment (updated each pass);
+      ellipse    = central second moments -> (e1, e2) = ((Mxx-Myy)/T, 2Mxy/T), T = Mxx+Myy;
+      skew       = r^2-weighted displacement, s = sum(w j d |d|^2) / sum(w j |d|^2), px --
+                   "where the halo sits relative to the centroid"; zero iff symmetric,
+                   under ANY symmetric window (the collimation null is window-independent);
+      sigma_w    = adapted to the measured size, clamped to [1 px, min(H, W)/4].
+
+    Weighted sizes are NOT corrected for the window (only ratios and nulls are consumed).
+    Starts from the image centre; ``sigma_seed`` seeds the window width.
+    Returns dict with cx, cy (px), e1, e2, sx, sy, sigma_w.
+    """
+    height, width = img.shape
+    device = img.device
+    ys = torch.arange(height, dtype=torch.float32, device=device)[:, None]
+    xs = torch.arange(width, dtype=torch.float32, device=device)[None, :]
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    sigma_w = min(max(1.0, float(sigma_seed)), min(height, width) / 4.0)
+    e1 = e2 = sx = sy = 0.0
+    for _ in range(max(1, passes)):
+        r2 = (xs - cx) ** 2 + (ys - cy) ** 2
+        w = torch.exp(-r2 / (2.0 * sigma_w * sigma_w))
+        ring = img[r2 > (3.0 * sigma_w) ** 2]
+        background = float(ring.median()) if ring.numel() else float(img.median())
+        j = (img - background) * w
+        total = float(j.sum())
+        if total <= 0:
+            break                                # no net weighted flux: keep the last shape
+        cx = float((j * xs).sum()) / total
+        cy = float((j * ys).sum()) / total
+        dx = xs - cx
+        dy = ys - cy
+        mxx = float((j * dx * dx).sum()) / total
+        myy = float((j * dy * dy).sum()) / total
+        mxy = float((j * dx * dy).sum()) / total
+        t = mxx + myy
+        if t <= 0:
+            break
+        e1, e2 = (mxx - myy) / t, 2.0 * mxy / t
+        d2 = dx * dx + dy * dy
+        halo = float((j * d2).sum())
+        if halo > 0:
+            sx = float((j * dx * d2).sum()) / halo
+            sy = float((j * dy * d2).sum()) / halo
+        # Adapt the window to the star's TRUE size by deconvolving the window from the
+        # measured (attenuated) size: 1/true^2 = 1/measured^2 - 1/window^2. Feeding the
+        # attenuated size straight back shrinks the window every pass (fixed point zero).
+        cap = min(height, width) / 4.0
+        inverse = 1.0 / max(t / 2.0, 1e-9) - 1.0 / (sigma_w * sigma_w)
+        true_sq = (1.0 / inverse) if inverse > 1e-9 else cap * cap
+        sigma_w = min(max(math.sqrt(true_sq), 1.0), cap)
+    return {'cx': cx, 'cy': cy, 'e1': e1, 'e2': e2, 'sx': sx, 'sy': sy, 'sigma_w': sigma_w}
 
 
 def _find_blur(img, sigma):
@@ -138,15 +204,23 @@ class FocusEma:
         self.find_sigma = find_sigma   # PSF-matched blur for LOCALIZATION only (hot-pixel immunity)
         self.ema = None
         self.peak_meter = None      # per-pixel decaying peak-hold of the RAW star crop, for saturation
+        self.peak_norm_ema = None   # scalar EMA of per-frame normalized peaks -> Strehl numerator
+                                    # (registration-free: measures typical FRAME quality, which a
+                                    # peak-registered lucky stack could preserve)
 
     def update(self, work, target):
-        # 1) search ROI around the target; 2) the MATCHED-FILTERED region's brightest pixel (a
-        # hot pixel can't win); 3) star crop centred there, from the RAW pixels.
+        # Phases: 1) search ROI around the target; 2) COARSE find: matched-filtered argmax (a
+        # hot pixel can't win); 3) sub-pixel refine: toroidal CoM of a crop-sized window there
+        # (background-immune; a donut's centre, not a rim point); 4) star crop REGISTERED on
+        # the refined CoM -- well-defined across the whole focus range, where the peak is a
+        # noise-picked rim point on a defocused SCT; 5) weighted-moment shape fit per image.
         tx, ty = target
         region, rx0, ry0 = _crop(work, tx, ty, self.search)
         pk = int(torch.argmax(_find_blur(region, self.find_sigma)))
         py, px = pk // region.shape[1], pk % region.shape[1]
-        star, _, _ = _crop(work, rx0 + px, ry0 + py, self.crop)
+        refine, fx0, fy0 = _crop(work, rx0 + px, ry0 + py, self.crop)
+        rcx, rcy = _toroidal_com(refine)
+        star, _, _ = _crop(work, fx0 + rcx, fy0 + rcy, self.crop)
         # NEVER clear a live EMA (user 2026-07-13): a finder hiccup blending through the average
         # beats restarting it -- the crop is target-locked, so a wrong frame fades in ~1/alpha.
         if self.ema is None or self.ema.shape != star.shape:
@@ -158,17 +232,20 @@ class FocusEma:
             # EMA's slow settle, and holds the warning a moment after it stops clipping.
             self.peak_meter = torch.maximum(self.peak_meter * self.peak_decay, star)
         ema = self.ema
-        dx, dy = _com_offset(ema)                                      # collimation: CoM offset (px)
-        idx_, idy_ = _com_offset(star)                 # same math on the instantaneous crop
-        # peak = brightest pixel of the EMA (0..1 full-scale): the focus-quality proxy, which rises as
-        # focus tightens. (Per-axis x/y sharpness was dropped -- astigmatism can lie on a diagonal, so it
-        # wants the full second-moment matrix Mxx/Myy/Mxy, not marginals; not worth it unless collimating.)
+        shape = _weighted_shape(ema, self.find_sigma)                  # EMA image shape
+        shape_instant = _weighted_shape(star, self.find_sigma)         # same fit, this frame
+        peak_norm = _normalized_peak(star)                             # per-frame quality scalar
+        self.peak_norm_ema = (peak_norm if self.peak_norm_ema is None
+                              else self.peak_norm_ema + self.alpha * (peak_norm - self.peak_norm_ema))
         metrics = {
-            'peak': round(float(ema.max()) / self.scale, 6),
+            'peak': round(float(ema.max()) / self.scale, 6),          # EMA-stack brightness proxy
             'peak_frame': round(float(star.max()) / self.scale, 6),   # per-frame; blinds when saturated
-            'hfd': round(_hfd(star), 3),                              # per-frame; saturation-immune
-            'com': [round(dx, 3), round(dy, 3)],
-            'com_inst': [round(idx_, 3), round(idy_, 3)],
+            'hfd': round(_hfd(star), 3),                              # per-frame; coarse-approach aid
+            'peak_norm_ema': self.peak_norm_ema,                      # Strehl numerator (scalar EMA)
+            'ellipse': [round(shape['e1'], 4), round(shape['e2'], 4)],           # astigmatism
+            'skew': [round(shape['sx'], 3), round(shape['sy'], 3)],              # coma -> screws
+            'instant_ellipse': [round(shape_instant['e1'], 4), round(shape_instant['e2'], 4)],
+            'instant_skew': [round(shape_instant['sx'], 3), round(shape_instant['sy'], 3)],
         }
         sat = self.peak_meter > (0.9 * self.scale)                    # near full well -> peak unreliable
         return ema, star, metrics, sat
@@ -244,9 +321,11 @@ def main(argv=None):
     # Star stream: per-frame focus metrics ride as binary record extras (strehl None -> NaN;
     # 'present' is record flags bit 0). The GUI reads them straight from the section.
     out = framestream.FrameStream(args.session, f'{args.role}_focus',
-                                  extras=('<10f', ['peak', 'peak_frame', 'hfd', 'strehl',
-                                                   'dx', 'dy', 'com_rad_x', 'com_rad_y',
-                                                   'inst_dx', 'inst_dy']))
+                                  extras=('<14f', ['peak', 'peak_frame', 'hfd', 'strehl',
+                                                   'ellipse_1', 'ellipse_2', 'skew_x', 'skew_y',
+                                                   'instant_ellipse_1', 'instant_ellipse_2',
+                                                   'instant_skew_x', 'instant_skew_y',
+                                                   'skew_rad_x', 'skew_rad_y']))
     cur = None                                              # current input RingReader
     ema = None
 
@@ -325,11 +404,13 @@ def main(argv=None):
             pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))   # hot pixels can't win
             target = (pk % work.shape[1], pk // work.shape[1])
         star_ema, star_now, metrics, sat = ema.update(work, target)
-        # Extras schema ('<10f'): strehl NaN when the aperture is unknown; com_rad NaN when the
-        # plate scale is (consumers turn NaN back into None/absent).
-        strehl = (_normalized_peak(star_ema) / strehl_ref) if strehl_ref else float('nan')
-        crx = metrics['com'][0] * rad_per_px if rad_per_px is not None else float('nan')
-        cry = metrics['com'][1] * rad_per_px if rad_per_px is not None else float('nan')
+        # Extras schema ('<14f'): strehl NaN when the aperture is unknown; skew_rad NaN when the
+        # plate scale is (consumers turn NaN back into None/absent). Strehl compares the scalar
+        # EMA of per-frame normalized peaks to the ideal -- registration-free, and it measures
+        # the typical frame (what a lucky stack could keep), not our stacking convention.
+        strehl = (metrics['peak_norm_ema'] / strehl_ref) if strehl_ref else float('nan')
+        skew_rad_x = metrics['skew'][0] * rad_per_px if rad_per_px is not None else float('nan')
+        skew_rad_y = metrics['skew'][1] * rad_per_px if rad_per_px is not None else float('nan')
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
         # Side-by-side: the EMA (left) next to the RAW star crop this instant (right) -- the
         # right half is the direct check that the finder is on the star at all.
@@ -346,8 +427,11 @@ def main(argv=None):
         out.write(pair,
                   t_mono_ns=src_t, src_index=i, flags=1 if present else 0,
                   extras=(metrics['peak'], metrics['peak_frame'], metrics['hfd'], strehl,
-                          metrics['com'][0], metrics['com'][1], crx, cry,
-                          metrics['com_inst'][0], metrics['com_inst'][1]))
+                          metrics['ellipse'][0], metrics['ellipse'][1],
+                          metrics['skew'][0], metrics['skew'][1],
+                          metrics['instant_ellipse'][0], metrics['instant_ellipse'][1],
+                          metrics['instant_skew'][0], metrics['instant_skew'][1],
+                          skew_rad_x, skew_rad_y))
         total += 1
 
     try:
@@ -445,7 +529,7 @@ def analyze_ser(args, device):
         row = {'i': i, 'tx': target[0], 'ty': target[1],
                'peak': metrics['peak'], 'peak_frame': metrics['peak_frame'],
                'hfd': metrics['hfd'],
-               'strehl': round(_normalized_peak(star_ema) / strehl_ref, 4) if strehl_ref else None,
+               'strehl': round(metrics['peak_norm_ema'] / strehl_ref, 4) if strehl_ref else None,
                'sat_px': int(sat.sum())}
         rows.append(row)
         if outf:
