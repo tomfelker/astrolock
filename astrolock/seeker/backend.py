@@ -43,8 +43,11 @@ from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
 
 
 def _spawn(module, args):
-    """Launch `python -m <module> <args>` using the same interpreter, in the repo cwd."""
-    return subprocess.Popen([sys.executable, '-m', module, *args])
+    """Launch `python -m <module> <args>` using the same interpreter, in the repo cwd.
+    stdin is a pipe we hold and never write: children watch it for EOF (session.
+    parent_lifeline), so they exit even if this backend dies without running its
+    shutdown -- crash, hard kill, or a cleanup step throwing. No orphans."""
+    return subprocess.Popen([sys.executable, '-m', module, *args], stdin=subprocess.PIPE)
 
 
 # Bortle dark-sky class -> approximate zenith sky surface brightness (V mag/arcsec^2). Higher = darker.
@@ -1632,35 +1635,45 @@ def main(argv=None):
         print("[backend] interrupted; stopping", flush=True)
         clean = True
     finally:
-        for role in roles:                         # tell cams to finalize + exit
-            if role in control_writers:            # (an idle-startup role never launched one)
-                control_write(role, {'stop': True})
-                control_writers[role].close()
-        open(stop_file, 'w').close()               # tell detectors to exit
-        open(focus_stop, 'w').close()              # and the focus process, if one is running
-        if sweep_proc is not None and sweep_proc.poll() is None:
+        # Every shutdown step runs even if an earlier one throws: an exception mid-cleanup
+        # used to abandon the rest and orphan children (the idle-startup KeyError did
+        # exactly that). The stdin lifeline is the backstop; this keeps shutdowns ORDERLY.
+        def _step(what, fn):
             try:
+                fn()
+            except Exception as e:
+                print(f"[backend] shutdown step '{what}' failed (continuing): {e}", flush=True)
+
+        def _stop_cams():
+            for role in roles:                     # tell cams to finalize + exit
+                if role in control_writers:        # (an idle-startup role never launched one)
+                    control_write(role, {'stop': True})
+                    control_writers[role].close()
+
+        def _abort_sweep():
+            if sweep_proc is not None and sweep_proc.poll() is None:
                 sweep_proc.stdin.close()           # abort a running sweep (it exits promptly)
-            except OSError:
-                pass
+
+        _step('stop cams', _stop_cams)
+        _step('stop file', lambda: open(stop_file, 'w').close())     # tell detectors to exit
+        _step('focus stop', lambda: open(focus_stop, 'w').close())   # and the focus process
+        _step('abort sweep', _abort_sweep)
         # Recorders need no signal: the cams' 'ended' records end their streams and they drain
         # + finalize + exit on their own (reaped below, patiently -- drain time is legitimate).
-        if gui_proc is not None and gui_proc.poll() is None:
-            gui_proc.terminate()
-        cmd_server.close()
-        state_slot.close()
-        mount.close()
-        for fo in followers.values():
-            fo.close()
-        for fo_ in det_fos.values():
-            fo_.close()
+        _step('close gui', lambda: gui_proc.terminate()
+              if gui_proc is not None and gui_proc.poll() is None else None)
+        _step('command server', cmd_server.close)
+        _step('state slot', state_slot.close)
+        _step('mount', lambda: mount.close())
+        _step('followers', lambda: [fo.close() for fo in followers.values()])
+        _step('detection followers', lambda: [fo_.close() for fo_ in det_fos.values()])
 
         # Make sure every child is fully dead before cleanup: a still-terminating cam/detect holds
         # its .ser / sidecars open, and on Windows os.remove/rmtree fail on open files -- so a slow
         # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
-        _reap(list(cam_procs.values()) + list(detect_procs.values())
-              + [focus_proc, sweep_proc, gui_proc, sky_sim_proc])
-        _reap(list(rec_procs.values()), graceful_s=300.0)   # a draining recorder is NOT hung
+        _step('reap children', lambda: _reap(list(cam_procs.values()) + list(detect_procs.values())
+                                             + [focus_proc, sweep_proc, gui_proc, sky_sim_proc]))
+        _step('reap recorders', lambda: _reap(list(rec_procs.values()), graceful_s=300.0))
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
         print("[backend] done", flush=True)

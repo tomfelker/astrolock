@@ -10,6 +10,7 @@ File naming: ``<ts>_<role>.<kind>`` where kind is ``ser`` (pixels), ``frames.jso
 
 import datetime
 import os
+import threading
 import time
 
 
@@ -19,6 +20,32 @@ import time
 # reads ~95 years in the past, and a UTC time_ns mixup (~1.8e18 until 2065) is off by decades.
 # Still comfortably inside int64 (9.2e18) for the '<q' record fields.
 _EPOCH_OFFSET_NS = 3_000_000_000 * 1_000_000_000
+
+
+def parent_lifeline():
+    """
+    Orphan prevention (the recorder's 'NOBODY EVER KILLS US' pattern, generalized): the
+    backend spawns every child with stdin=PIPE and never writes to it. The OS closes that
+    pipe when the backend dies -- cleanly, by crash, or by hard kill alike -- so a child
+    that watches its stdin for EOF can never be orphaned. Returns a threading.Event that
+    is set on EOF; long-running loops check it beside their usual stop conditions.
+
+    Harmless in standalone/interactive runs: stdin is a console there, the watcher thread
+    just blocks forever (daemon, dies with the process), and the event stays unset.
+    """
+    dead = threading.Event()
+
+    def _watch():
+        import sys
+        try:
+            while sys.stdin.readline():        # nobody writes; a line is ignored, EOF = parent gone
+                pass
+        except Exception:
+            pass                               # stdin closed/invalid counts as "parent gone" too
+        dead.set()
+
+    threading.Thread(target=_watch, daemon=True).start()
+    return dead
 
 
 def mono_ns():

@@ -434,9 +434,10 @@ def main(argv=None):
                           skew_rad_x, skew_rad_y))
         total += 1
 
+    parent_dead = session_mod.parent_lifeline()   # backend gone (however it died) -> stop
     try:
         while True:
-            if args.stop_file and os.path.exists(args.stop_file):
+            if parent_dead.is_set() or (args.stop_file and os.path.exists(args.stop_file)):
                 break
             det_fo.poll()                             # refresh the target location (latest record)
             got_det = det_fo.latest()

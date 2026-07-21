@@ -871,8 +871,12 @@ def main(argv=None):
               + (f"  [{get_settings()}]" if get_settings else "")
               + f"  (warmup {args.benchmark_warmup:g}s, window {args.benchmark_seconds:g}s, "
               f"{'shm' if args.shm_ser else 'disk'})", flush=True)
+    parent_dead = session_mod.parent_lifeline()   # backend gone (however it died) -> stop
     try:
         while True:
+            if parent_dead.is_set():
+                print(f"[cam:{args.role}] parent gone; stopping", flush=True)
+                stop = True
             if control is not None:
                 for cmd in control.drain():
                     if cmd.get('stop'):

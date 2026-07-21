@@ -1069,9 +1069,10 @@ def main(argv=None):
                      t_mono_ns=frame_t_ns, src_index=i)
         total += 1
 
+    parent_dead = session_mod.parent_lifeline()  # backend gone (however it died) -> stop
     try:
         while True:
-            if args.stop_file and os.path.exists(args.stop_file):
+            if parent_dead.is_set() or (args.stop_file and os.path.exists(args.stop_file)):
                 break
             poll_state()                         # refresh the predicted track ROI (if any)
             fo.poll()

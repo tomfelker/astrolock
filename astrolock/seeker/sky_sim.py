@@ -29,7 +29,7 @@ import numpy as np
 from astrolock.seeker import bodies
 from astrolock.seeker.almanac import fix_record
 from astrolock.seeker.sidecar import JsonlWriter
-from astrolock.seeker.session import mono_ns
+from astrolock.seeker.session import mono_ns, parent_lifeline
 
 
 def _enu_from_altaz(az_rad, alt_rad):
@@ -167,8 +167,9 @@ def run(argv=None):
     nstars = len(pub.star_ids)
     star_pending = None                                    # [t_ns list, dirs (K,N,3), cursor]
 
+    parent_dead = parent_lifeline()                        # backend gone (however it died) -> stop
     while True:
-        if args.stop_file and os.path.exists(args.stop_file):
+        if parent_dead.is_set() or (args.stop_file and os.path.exists(args.stop_file)):
             break
         now = mono_ns()
 
