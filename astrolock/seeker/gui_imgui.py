@@ -96,7 +96,7 @@ MAXPIP = 4                       # pool of PIP panes along the bottom; each show
 
 def _default_settings():
     return {'zoom': 1, 'reticles': True, 'histogram': False, 'wait_for_detector': True,
-            'show_stars': True}
+            'show_stars': True, 'show_target_names': True, 'show_star_names': False}
 
 
 def _fmt_time_delta(delta_ns):
@@ -736,20 +736,16 @@ def main(argv=None):
     COL_NAV_STAR = (255, 215, 90, 220)      # gold: where the sky model says a star is
     COL_NAV_SAT = (255, 140, 220, 235)      # magenta: the satellite's pass track + position
 
-    def _star_glyph(dl, sx, sy):
-        """Five-pointed star outline centred at screen (sx, sy), fixed UI size (not zoomed)."""
+    def _star_glyph(dl, sx, sy, col=COL_NAV_STAR):
+        """Five-pointed star outline centred at screen (sx, sy), fixed UI size (not zoomed).
+        THE overlay glyph: a star means 'drawn from our alignment + sim time' -- as distinct
+        from a box (a detection from the camera) and the pipper circle (a modelled target)."""
         pts = []
         for k in range(10):
             ang = -math.pi / 2.0 + k * math.pi / 5.0
             rr = S(8) if k % 2 == 0 else S(3)
             pts.append(imgui.ImVec2(sx + rr * math.cos(ang), sy + rr * math.sin(ang)))
-        dl.add_polyline(pts, C(COL_NAV_STAR), 1.5, int(imgui.ImDrawFlags_.closed))
-
-    def _diamond_glyph(dl, sx, sy):
-        r = S(7)
-        pts = [imgui.ImVec2(sx, sy - r), imgui.ImVec2(sx + r, sy),
-               imgui.ImVec2(sx, sy + r), imgui.ImVec2(sx - r, sy)]
-        dl.add_polyline(pts, C(COL_NAV_SAT), 1.8, int(imgui.ImDrawFlags_.closed))
+        dl.add_polyline(pts, C(col), 1.5, int(imgui.ImDrawFlags_.closed))
 
     def _green(active, a=210):
         """Detection green: bright when it comes from the active tracking source, dim otherwise."""
@@ -1043,14 +1039,18 @@ def main(argv=None):
                 dl.add_line(A(cx, it), A(cx, cy - PIPPER_R), C(RED), 1.0)
                 dl.add_line(A(cx, ib), A(cx, cy + PIPPER_R), C(RED), 1.0)
 
-        # --- Sky overlay (navigation feed): gold stars where the sky model says stars are, at
-        # the encoder pose + the manual Alignment yaw -- align by turning the yaw until they sit
-        # on the real stars. The satellite's upcoming pass draws as a line, a diamond at 'now'.
-        # Projection = skysim.project_dirs, the SAME pinhole math the sim renders with.
+        # --- Sky overlay (navigation feed): five-pointed stars wherever the sky model puts
+        # things (stars, Sun/Moon/planets, the satellite), at the encoder pose + the manual
+        # Alignment yaw -- align by turning the yaw until they sit on the real sky. The star
+        # glyph MEANS 'drawn from alignment + sim time'; the satellite's upcoming pass adds a
+        # line, and bodies with a real angular size get their disc at true scale. Projection =
+        # skysim.project_dirs, the SAME pinhole math the sim renders with.
         if (sset.get('show_stars', True) and role in roles and nav.get('alm') is not None
                 and stt.get('enc_az_deg') is not None):
             fv_nav = (stt.get('optics') or {}).get(role)
             nav_ids = nav['alm'].ids
+            nav_names = nav['alm'].names
+            nav_radius = nav['alm'].angular_radius_rad
             if fv_nav and nav_ids:
                 torch_, _, skysim_ = nav['ready']
                 # Everything evaluates AT THE DISPLAYED FRAME'S capture time: almanac query
@@ -1082,22 +1082,43 @@ def main(argv=None):
                     return A(offx + (x + 0.5) * scale, offy + (y + 0.5) * scale)
 
                 trk = nav_ids.index('sat:track') if has_track else -1
+                show_target_names = sset.get('show_target_names', True)
+                show_star_names = sset.get('show_star_names', False)
+
+                def _nav_label(sx, sy, i_t, col):
+                    nm = nav_names[i_t]
+                    if nm.startswith('star:'):    # no proper name published: fall back to HIP
+                        nm = 'HIP ' + nm[5:]
+                    _text(dl, imgui.ImVec2(sx + S(9), sy - S(16)), nm, S(13), (*col[:3], 210))
+
                 for i_t in range(len(nav_ids)):
                     if i_t == trk or not okn[i_t][0]:
                         continue
                     x0, y0 = pxn[i_t][0], pyn[i_t][0]
-                    if -64 <= x0 <= cam['w'] + 64 and -64 <= y0 <= cam['h'] + 64:
-                        _star_glyph(dl, *NP(x0, y0))
+                    if not (-64 <= x0 <= cam['w'] + 64 and -64 <= y0 <= cam['h'] + 64):
+                        continue
+                    sx, sy = NP(x0, y0)
+                    _star_glyph(dl, sx, sy)
+                    if nav_radius[i_t]:           # sun/moon/planets: the TRUE disc, at scale
+                        r_px = f_px_nav * nav_radius[i_t] * scale
+                        if r_px >= 2.0:
+                            dl.add_circle(imgui.ImVec2(sx, sy), r_px, C(COL_NAV_STAR), 0, 1.5)
+                    is_star = nav_ids[i_t].startswith('star:')
+                    if (show_star_names if is_star else show_target_names):
+                        _nav_label(sx, sy, i_t, COL_NAV_STAR)
                 if trk >= 0:
                     for k in range(K - 1):        # the pass line, from 'now' (k=0) forward --
-                        # starting at k=1 left a 20 s gap ahead of the diamond, so the line led
-                        # the satellite and each piece vanished before the satellite crossed it
+                        # starting at k=1 left a 20 s gap ahead of the satellite glyph, so the
+                        # line led it and each piece vanished before the satellite crossed it
                         if okn[trk][k] and okn[trk][k + 1]:
                             dl.add_line(NP(pxn[trk][k], pyn[trk][k]),
                                         NP(pxn[trk][k + 1], pyn[trk][k + 1]),
                                         C((*COL_NAV_SAT[:3], 150)), 1.5)
                     if okn[trk][0]:
-                        _diamond_glyph(dl, *NP(pxn[trk][0], pyn[trk][0]))
+                        sx, sy = NP(pxn[trk][0], pyn[trk][0])
+                        _star_glyph(dl, sx, sy, COL_NAV_SAT)
+                        if show_target_names:
+                            _nav_label(sx, sy, trk, COL_NAV_SAT)
 
         # Clamp box = the visible camera view (image ∩ pane): letterboxed image zoomed out, the pane zoomed in.
         box = (max(0.0, il), max(0.0, it), min(float(SW), ir), min(float(SH), ib))
@@ -1534,7 +1555,8 @@ def main(argv=None):
                 layout[k] = v
         for role, s in (data.get('display') or {}).items():
             vs = view_settings.setdefault(role, _default_settings())
-            for k in ('zoom', 'reticles', 'histogram', 'wait_for_detector', 'show_stars'):
+            for k in ('zoom', 'reticles', 'histogram', 'wait_for_detector', 'show_stars',
+                      'show_target_names', 'show_star_names'):
                 if k in s:
                     vs[k] = s[k]
         opt = data.get('optics') or {}
@@ -2050,8 +2072,20 @@ def main(argv=None):
         ch, v = imgui.checkbox(f"Show stars##stars_{role}", sset.get('show_stars', True))
         if ch:
             sset['show_stars'] = v
-        _tip("Overlay the sky model on this pane: gold stars where the navigation almanac puts "
-             "them (at the encoder pose + Alignment yaw) and the satellite's upcoming pass line.")
+        _tip("Overlay the sky model on this pane: five-pointed stars for everything it places "
+             "(stars, Sun/Moon/planets, the satellite + its pass line), at the encoder pose + "
+             "Alignment yaw.")
+        ch, v = imgui.checkbox(f"Show target names##tnames_{role}",
+                               sset.get('show_target_names', True))
+        if ch:
+            sset['show_target_names'] = v
+        _tip("Label the overlay's non-star objects -- the satellite, Sun, Moon, planets.")
+        ch, v = imgui.checkbox(f"Show star names##snames_{role}",
+                               sset.get('show_star_names', False))
+        if ch:
+            sset['show_star_names'] = v
+        _tip("Label the overlay stars with their proper names (Vega, ...; HIP ids when a star "
+             "has no name).")
         ch, v = imgui.checkbox(f"Wait for detector##waitdet_{role}", sset.get('wait_for_detector', True))
         if ch:
             sset['wait_for_detector'] = v

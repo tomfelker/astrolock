@@ -39,12 +39,19 @@ import torch
 from astrolock.seeker.sidecar import JsonlTailer
 
 
-def fix_record(target_id, mag, times_ns, dirs):
+def fix_record(target_id, mag, times_ns, dirs, name=None, angular_radius_rad=None):
     """Build a JSONL record extending ``target_id`` with fixes ``(times_ns[i], dirs[i])``.
-    ``dirs`` is an (n, 3) array-like of unit ENU directions."""
-    return {'id': target_id, 'mag': float(mag),
-            'fixes': [[int(t), float(d[0]), float(d[1]), float(d[2])]
-                      for t, d in zip(times_ns, dirs)]}
+    ``dirs`` is an (n, 3) array-like of unit ENU directions. Optional per-target metadata
+    rides along: a display ``name`` (GUI labels) and an ``angular_radius_rad`` (true
+    angular size -- the GUI draws sun/moon/planet discs at scale)."""
+    rec = {'id': target_id, 'mag': float(mag),
+           'fixes': [[int(t), float(d[0]), float(d[1]), float(d[2])]
+                     for t, d in zip(times_ns, dirs)]}
+    if name is not None:
+        rec['name'] = str(name)
+    if angular_radius_rad is not None:
+        rec['angular_radius_rad'] = float(angular_radius_rad)
+    return rec
 
 
 def _grow_cols(need):
@@ -64,6 +71,8 @@ class SkyAlmanac:
         self._t = []            # per target: list[int ns], sorted -- unbounded source of truth
         self._d = []            # per target: list[[x, y, z]]
         self._mag = []
+        self._name = []         # per target: display name (defaults to the id)
+        self._angular_radius = []   # per target: true angular radius (rad), or None
         self._pending = set()   # rows whose fix list changed since the last flush
         self._last_q = None     # newest query time seen (drives age-based eviction)
         self._cols = 8          # current tensor width (data-driven high-water mark)
@@ -80,6 +89,7 @@ class SkyAlmanac:
                 # every fix published before it -- including future ones, which the out-of-order
                 # guard below would otherwise trust over the corrections -- is now wrong.
                 self._ids, self._index, self._t, self._d, self._mag = [], {}, [], [], []
+                self._name, self._angular_radius = [], []
                 self._pending.clear()
                 new = 0
                 self._times = torch.zeros((0, self._cols), dtype=torch.int64, device=self.device)
@@ -97,9 +107,15 @@ class SkyAlmanac:
                 self._t.append([])
                 self._d.append([])
                 self._mag.append(float(rec.get('mag', 12.0)))
+                self._name.append(tid)
+                self._angular_radius.append(None)
                 new += 1
             if 'mag' in rec:
                 self._mag[i] = float(rec['mag'])
+            if 'name' in rec:
+                self._name[i] = str(rec['name'])
+            if 'angular_radius_rad' in rec:
+                self._angular_radius[i] = float(rec['angular_radius_rad'])
             ts, ds = self._t[i], self._d[i]
             for f in rec.get('fixes', ()):
                 t = int(f[0])
@@ -200,6 +216,16 @@ class SkyAlmanac:
     @property
     def ids(self):
         return list(self._ids)
+
+    @property
+    def names(self):
+        """Per-target display names, aligned with ``ids`` (default: the id itself)."""
+        return list(self._name)
+
+    @property
+    def angular_radius_rad(self):
+        """Per-target true angular radius (rad) aligned with ``ids``; None for point sources."""
+        return list(self._angular_radius)
 
     def close(self):
         self._tailer.close()

@@ -30,6 +30,46 @@ from astrolock.seeker import bodies
 from astrolock.seeker.almanac import fix_record
 from astrolock.seeker.sidecar import JsonlWriter
 from astrolock.seeker.session import mono_ns, parent_lifeline
+from astrolock.seeker.tles import tle_epoch_utc
+
+# Solar-system bodies for the NAVIGATION feed (alignment overlay): point targets like
+# everything else, plus a display name and a true angular radius (the GUI draws the disc at
+# scale). de421 keys tried in order (it has the inner planets proper, barycenters for the
+# rest -- at overlay precision the difference is arcseconds). Magnitudes are rough visual
+# constants; good enough for a glyph.
+NAV_BODIES = [   # (target id, display name, de421 keys, visual mag, body radius km)
+    ('sun', 'Sun', ('sun',), -26.7, 696000.0),
+    ('moon', 'Moon', ('moon',), -12.7, 1737.4),
+    ('planet:mercury', 'Mercury', ('mercury',), 0.2, 2439.7),
+    ('planet:venus', 'Venus', ('venus',), -4.1, 6051.8),
+    ('planet:mars', 'Mars', ('mars', 'mars barycenter'), -0.5, 3389.5),
+    ('planet:jupiter', 'Jupiter', ('jupiter barycenter',), -2.2, 69911.0),
+    ('planet:saturn', 'Saturn', ('saturn barycenter',), 0.6, 58232.0),
+    ('planet:uranus', 'Uranus', ('uranus barycenter',), 5.7, 25362.0),
+    ('planet:neptune', 'Neptune', ('neptune barycenter',), 7.8, 24622.0),
+]
+
+
+def _star_names(loader):
+    """HIP -> proper name from the IAU Working Group on Star Names catalog. The skyfield
+    loader caches the download; offline with a cold cache -> {} and labels fall back to
+    HIP ids. Fixed-column text format (the old astrolock parser, condensed)."""
+    url = 'https://www.pas.rochester.edu/~emamajek/WGSN/IAU-CSN.txt'
+    try:
+        with loader.open(url) as f:
+            text = f.read().decode('utf-8')
+    except Exception as e:
+        print(f"[sky_sim] star-name catalog unavailable ({e}); labels fall back to HIP ids",
+              flush=True)
+        return {}
+    out = {}
+    for line in text.split('\n'):
+        if not line or line[0] in ('#', '$'):
+            continue
+        hip = line[90:96].strip() if len(line) >= 96 else ''
+        if hip.isdigit():
+            out[int(hip)] = line[18:36].rstrip()
+    return out
 
 
 def _enu_from_altaz(az_rad, alt_rad):
@@ -73,11 +113,25 @@ class SkyPublisher:
         self.nav_stars = Star.from_dataframe(nav_df)
         self.nav_ids = [f"star:{int(h)}" for h in nav_df.index.to_numpy()]
         self.nav_mag = nav_df['magnitude'].to_numpy().astype(float)
+        proper = _star_names(loader)
+        self.nav_names = [proper.get(int(h)) for h in nav_df.index.to_numpy()]
+        # Sun/Moon/planets for the nav feed: same point-target machinery, from the ephemeris
+        # already loaded. Missing keys are skipped (ephemeris variants differ).
+        self.nav_bodies = []
+        for tid, disp, keys, mag, radius_km in NAV_BODIES:
+            for k in keys:
+                try:
+                    self.nav_bodies.append((tid, disp, eph[k], mag, radius_km))
+                    break
+                except (KeyError, ValueError):
+                    pass
 
         self.sat = None
         if args.tle_file:
             name, l1, l2 = _load_tle(args.tle_file)
             self.sat = EarthSatellite(l1, l2, name, self.ts)
+            self.sat_name = name
+            self.sat_epoch_utc = tle_epoch_utc(l1)
             self.body_pts = bodies.points_for_name(name).astype(float)     # (P, 3) body-frame metres
             npts = len(self.body_pts)
             self.sat_ids = [f"{name} point {p}/{npts}" for p in range(npts)]
@@ -142,11 +196,24 @@ class SkyPublisher:
         world = pos[:, None, :] + np.einsum('kij,pj->kpi', rot, self.body_pts)   # (K, P, 3)
         return world / np.linalg.norm(world, axis=-1, keepdims=True)
 
-    def emit_group(self, writer, ids, mags, dirs, t_ns):
-        """Write one record per point-target, carrying this chunk of fixes. ``dirs`` is (K, N, 3)."""
+    def body_fixes(self, obj, t_ns):
+        """((K, 3) ENU dirs, distance_km at the last anchor) for one ephemeris body."""
+        dirs = []
+        dist_km = 0.0
+        for t in t_ns:
+            alt, az, dist = (self.observer.at(self._sf_times(float(t)))
+                             .observe(obj).apparent().altaz())
+            dirs.append(_enu_from_altaz(float(az.radians), float(alt.radians)))
+            dist_km = float(dist.km)
+        return np.stack(dirs, axis=0), dist_km
+
+    def emit_group(self, writer, ids, mags, dirs, t_ns, names=None):
+        """Write one record per point-target, carrying this chunk of fixes. ``dirs`` is (K, N, 3).
+        ``names`` (optional, aligned with ids): display names; None entries are omitted."""
         for i, tid in enumerate(ids):
             mag = mags if np.isscalar(mags) else mags[i]
-            writer.append(fix_record(tid, mag, t_ns, dirs[:, i, :]))
+            writer.append(fix_record(tid, mag, t_ns, dirs[:, i, :],
+                                     name=names[i] if names else None))
 
 
 def run(argv=None):
@@ -193,10 +260,16 @@ def run(argv=None):
     # SAME files). Everything already published -- including fixes minutes into the future -- is
     # wrong under the new time/site, so open with a reset: consumers drop all targets on sight.
     writer.append({'reset': True})
+    tle_note = ""
+    if pub.sat:
+        age_d = (pub.epoch - pub.sat_epoch_utc).total_seconds() / 86400.0
+        tle_note = (f" [{pub.sat_name} TLE epoch {pub.sat_epoch_utc:%Y-%m-%d}, "
+                    f"{abs(age_d):.1f} d {'older' if age_d >= 0 else 'newer'} than sim time]")
     print(f"[sky_sim] {len(pub.star_ids)} stars"
           + (f" + {len(pub.sat_ids)} sat points" if pub.sat else "")
-          + (f", nav feed {len(pub.nav_ids)} stars -> {args.nav_out}" if args.nav_out else "")
-          + f", epoch {args.epoch}", flush=True)
+          + (f", nav feed {len(pub.nav_ids)} stars + {len(pub.nav_bodies)} bodies"
+             f" -> {args.nav_out}" if args.nav_out else "")
+          + f", epoch {args.epoch}" + tle_note, flush=True)
 
     star_next = pub.perf0_ns - int(args.star_dt * 1e9)     # one anchor already behind 'now'
     sat_next = pub.perf0_ns - int(args.sat_dt * 1e9)
@@ -244,13 +317,19 @@ def run(argv=None):
         if nav_writer is not None and nav_next <= now + nav_lead_ns:
             t_ns = [int(nav_next), int(nav_next + nav_dt_ns)]
             pub.emit_group(nav_writer, pub.nav_ids, pub.nav_mag,
-                           pub.star_dirs(np.array(t_ns, dtype=np.int64), stars=pub.nav_stars), t_ns)
+                           pub.star_dirs(np.array(t_ns, dtype=np.int64), stars=pub.nav_stars),
+                           t_ns, names=pub.nav_names)
+            for tid, disp, obj, bmag, radius_km in pub.nav_bodies:   # sun/moon/planets
+                bd, dist_km = pub.body_fixes(obj, t_ns)
+                nav_writer.append(fix_record(
+                    tid, bmag, t_ns, bd, name=disp,
+                    angular_radius_rad=math.asin(min(1.0, radius_km / max(dist_km, radius_km)))))
             nav_next = t_ns[-1] + nav_dt_ns
         if nav_writer is not None and pub.sat and nav_track_next <= now + nav_horizon_ns:
             t_ns = np.arange(nav_track_next, now + nav_horizon_ns, nav_sat_dt_ns, dtype=np.int64)
             if len(t_ns):
-                nav_writer.append(fix_record('sat:track', args.target_mag,
-                                             t_ns.tolist(), pub.sat_center_dirs(t_ns)))
+                nav_writer.append(fix_record('sat:track', args.target_mag, t_ns.tolist(),
+                                             pub.sat_center_dirs(t_ns), name=pub.sat_name))
                 nav_track_next = int(t_ns[-1]) + nav_sat_dt_ns
 
         time.sleep(min(args.sat_dt, 0.05))

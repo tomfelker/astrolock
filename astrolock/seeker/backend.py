@@ -30,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 from astrolock.seeker import cam as cam_mod
@@ -38,6 +39,7 @@ from astrolock.seeker import framestream
 from astrolock.seeker import mount as mount_mod
 from astrolock.seeker import session as session_mod
 from astrolock.seeker import sidecar
+from astrolock.seeker import tles
 from astrolock.seeker import optics
 from astrolock.seeker.follower import SerFollower
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
@@ -288,7 +290,15 @@ def main(argv=None):
     p.add_argument('--track-debug', action='store_true',
                    help="print per-frame commanded vs measured axis rates and target offset")
     p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
-                   help="sky source: satellite TLE file (default: the ISS)")
+                   help="sky source: FALLBACK satellite TLE file, used when the Celestrak "
+                        "auto-download (and its cache) can't provide --tle-norad-id")
+    p.add_argument('--tle-norad-id', type=int, default=25544,
+                   help="auto-download fresh TLEs from Celestrak for this NORAD id (default: "
+                        "the ISS; 0 = off, use --sky-tle-file as-is). One group download per "
+                        "UTC day, cached in data/skyfield_cache; offline uses the newest "
+                        "cached day, then --sky-tle-file. Re-checked hourly while running.")
+    p.add_argument('--tle-group', default='stations',
+                   help="Celestrak group file the target satellite is picked from by NORAD id")
     p.add_argument('--sky-target-mag', type=float, default=-4.0, help="sky source: satellite magnitude")
     p.add_argument('--sky-rate-az', type=float, default=0.0, help="sky source: scripted az slew (deg/s)")
     p.add_argument('--sky-rate-alt', type=float, default=0.0, help="sky source: scripted alt slew (deg/s)")
@@ -392,6 +402,18 @@ def main(argv=None):
 
     almanac_path = os.path.join(session_dir, f"{ts}_almanac.jsonl")       # sky_sim publishes here
     navigation_path = os.path.join(session_dir, f"{ts}_navigation.jsonl")  # sparse feed (GUI overlay)
+    # Target satellite TLE: freshest available for --tle-norad-id (blocking fetch here, before
+    # the control loop starts -- at most one Celestrak download per UTC day; offline falls back
+    # to the newest cached day, then --sky-tle-file). Re-checked hourly on a background thread;
+    # a changed element set respawns sky_sim (its reset record re-syncs every consumer).
+    tle_state = {'path': args.sky_tle_file, 'sig': None}
+    if args.tle_norad_id:
+        _ti = tles.fresh_tle_file(args.tle_norad_id, 'data/skyfield_cache',
+                                  group=args.tle_group, fallback=args.sky_tle_file)
+        tle_state.update(path=_ti['path'], sig=_ti['sig'])
+        print(f"[backend] TLE for {args.tle_norad_id}: {_ti['source']}"
+              + (f" ({_ti['name']}, epoch {_ti['epoch_utc']:%Y-%m-%d})" if _ti['epoch_utc'] else "")
+              + (f" -- {_ti['note']}" if _ti['note'] else ""), flush=True)
     # Sky *positions* come from the shared sky_sim almanac (one propagator, one system clock) -- not
     # from each cam, which used to drift apart. The follow flag (which mount trajectory to render
     # from) is added per-launch by sky_follow_flag(), so switching mounts in the GUI re-points them.
@@ -828,8 +850,8 @@ def main(argv=None):
                    '--lon', str(site['lon_deg']), '--elev', str(site['elev_m']),
                    '--epoch', current_utc_iso(anchor_ns), '--epoch-t-ns', str(anchor_ns),
                    '--stop-file', stop_file]
-        if args.sky_tle_file:
-            ss_args += ['--tle-file', args.sky_tle_file, '--target-mag', str(args.sky_target_mag)]
+        if tle_state['path']:
+            ss_args += ['--tle-file', tle_state['path'], '--target-mag', str(args.sky_target_mag)]
         sky_sim_proc = _spawn('astrolock.seeker.sky_sim', ss_args)
         print(f"[backend] sky_sim -> {almanac_path}", flush=True)
 
@@ -1484,6 +1506,7 @@ def main(argv=None):
     start = session_mod.mono_s()
     last_health = start
     last_cleanup = start
+    tle_check = {'last': start, 'busy': False, 'result': None}   # hourly TLE re-check (thread)
     handoff_last = start          # for the handoff integrator's real-time dt (framerate-independent)
     clean = False
     parent_dead = session_mod.parent_lifeline()   # armed only when a supervisor/test gave us a
@@ -1527,6 +1550,28 @@ def main(argv=None):
                     gps_status = f"GPS: {gps_res.get('error', 'read failed')}"
                 gps_want['time'] = gps_want['site'] = False
                 print(f"[backend] {gps_status}", flush=True)
+            # Hourly TLE re-check, off-loop (a Celestrak fetch must never stall estop handling).
+            # New element set -> respawn sky_sim; its reset record re-syncs every consumer.
+            if args.tle_norad_id and not tle_check['busy'] and now - tle_check['last'] >= 3600.0:
+                tle_check['last'] = now
+                tle_check['busy'] = True
+
+                def _tle_refresh():
+                    try:
+                        tle_check['result'] = tles.fresh_tle_file(
+                            args.tle_norad_id, 'data/skyfield_cache', group=args.tle_group,
+                            fallback=args.sky_tle_file)
+                    finally:
+                        tle_check['busy'] = False
+                threading.Thread(target=_tle_refresh, daemon=True).start()
+            if tle_check['result'] is not None:
+                _ti = tle_check['result']
+                tle_check['result'] = None
+                if _ti['sig'] and _ti['sig'] != tle_state['sig']:
+                    tle_state.update(path=_ti['path'], sig=_ti['sig'])
+                    print(f"[backend] fresh TLE ({_ti['name']}, epoch "
+                          f"{_ti['epoch_utc']:%Y-%m-%d}); respawning sky_sim", flush=True)
+                    ensure_sky_sim(restart=True)
             update_detections()
             for role in roles:
                 read_caps(role)                        # pick up each cam's live-control descriptors
