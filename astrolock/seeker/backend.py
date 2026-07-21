@@ -22,6 +22,7 @@ a sim downscale and NxN binning render identically.
 """
 
 import argparse
+import datetime
 import glob
 import json
 import math
@@ -188,13 +189,15 @@ def main(argv=None):
     p.add_argument('--mount', default='sim', choices=['sim', 'celestron'],
                    help="sim integrates commanded rates; celestron drives the real NexStar mount")
     p.add_argument('--mount-url', default=None, help="celestron: e.g. celestron_nexstar_hc:COM3")
-    # simulated site (the sim mount's GPS) + dynamics + global sim time scale
-    p.add_argument('--lat', type=float, default=37.51089, help="sim site latitude (deg)")
-    p.add_argument('--lon', type=float, default=-122.2719388888889, help="sim site longitude (deg)")
-    p.add_argument('--elev', type=float, default=60.0, help="sim site elevation (m)")
+    # Default site + the EXAMPLE PASS. The backend starts at the system clock and this site;
+    # the GUI's Time/Location tabs change both live, and Simulation > Set Time and Location to
+    # Example Pass jumps back to (--lat, --lon, --elev, --epoch) -- so these four args define
+    # YOUR example pass (default: the ISS test pass over San Carlos, just rising).
+    p.add_argument('--lat', type=float, default=37.51089, help="site latitude (deg)")
+    p.add_argument('--lon', type=float, default=-122.2719388888889, help="site longitude (deg)")
+    p.add_argument('--elev', type=float, default=60.0, help="site elevation (m)")
     p.add_argument('--epoch', default='2026-07-06T05:22:00Z',
-                   help="sim start UTC -- the sim mount's GPS time and the sky-sim epoch "
-                        "(default: the ISS test pass over San Carlos, just rising)")
+                   help="the example pass UTC (also the sim mount's GPS clock epoch)")
     p.add_argument('--mount-accel-deg-s2', type=float, default=20.0, help="sim mount acceleration limit (deg/s^2)")
     p.add_argument('--mount-update-hz', type=float, default=10.0, help="sim mount update rate (Hz)")
     # guide/main plate scale, optics, and binning
@@ -355,6 +358,17 @@ def main(argv=None):
 
     max_rate = math.radians(args.max_rate_deg_s)
     site = {'lat_deg': args.lat, 'lon_deg': args.lon, 'elev_m': args.elev, 'epoch_utc': args.epoch}
+    # Backend-owned CURRENT TIME, as an offset on the shared timeline: UTC ns = mono_ns() + this.
+    # Starts at the system clock; the GUI Time tab moves it (skips / mount GPS / example pass).
+    # Every change respawns sky_sim (its streams open with a reset record), so the sky follows.
+    utc_offset_ns = time.time_ns() - session_mod.mono_ns()
+    gps_want = {'time': False, 'site': False}     # which halves of the next mount-GPS fix to apply
+    gps_status = None                             # last GPS outcome, published for the GUI
+
+    def current_utc_iso(t_mono_ns=None):
+        t = session_mod.mono_ns() if t_mono_ns is None else t_mono_ns
+        dt = datetime.datetime.fromtimestamp((utc_offset_ns + t) * 1e-9, tz=datetime.timezone.utc)
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     # The sim mount writes its ground-truth trajectory here for the sim camera to follow (truth, not
     # the backend's estimate). Harmless/ignored for the real mount.
     sim_mount_path = os.path.join(session_dir, session_mod.sim_mount_name(ts))
@@ -371,10 +385,8 @@ def main(argv=None):
         mount = mount_mod.NullMount(math.radians(args.start_az_deg),
                                     math.radians(args.start_alt_deg), site=site)
         mount_connected = False
-    msite = mount.get_site()        # GPS/site comes from the mount; it drives the sky-sim camera
-    # Mount lifecycle (GUI connect/disconnect). The site is captured here from the startup mount and
-    # feeds the sky-sim once; switching mounts later doesn't re-derive it (fine -- the sky sim is the
-    # sim workflow, and a real mount's site is a TODO fallback anyway).
+    # Mount lifecycle (GUI connect/disconnect). Time/site are backend-owned (`utc_offset_ns` +
+    # `site` above) -- a mount's GPS is just a SOURCE the GUI can grab either from, on request.
     mount_desired_url = 'sim' if args.mount == 'sim' else (args.mount_url or 'sim')
     mounts_available = mount_mod.available_mount_urls()     # detected Celestron COM ports (GUI chooser)
 
@@ -793,10 +805,11 @@ def main(argv=None):
     def ensure_sky_sim(restart=False):
         """Spawn (or with restart=True, respawn) the one sky_sim propagator: it publishes
         stars + satellite directions on the shared system clock so every camera reads
-        identical positions. sky_sim maps its --epoch to its own process start, so a
-        restart re-anchors sim time to the example epoch. Also pre-warms the skyfield
-        ephemeris/star cache once, serially -- two sky cams starting together otherwise
-        race the de421/hipparcos download and one loses the rename (WinError 5)."""
+        identical positions. It gets the backend's CURRENT time (--epoch anchored to an
+        explicit --epoch-t-ns), so a respawn continues the same time unless utc_offset_ns
+        or site changed -- which is exactly when callers pass restart=True. Also pre-warms
+        the skyfield ephemeris/star cache once, serially -- two sky cams starting together
+        otherwise race the de421/hipparcos download and one loses the rename (WinError 5)."""
         nonlocal sky_sim_proc
         alive = sky_sim_proc is not None and sky_sim_proc.poll() is None
         if alive and not restart:
@@ -809,10 +822,12 @@ def main(argv=None):
             skysim.ensure_cache()
         except Exception as e:
             print(f"[backend] ephemeris pre-warm skipped: {e}", flush=True)
+        anchor_ns = session_mod.mono_ns()
         ss_args = ['--out', almanac_path, '--nav-out', navigation_path,
-                   '--lat', str(msite['lat_deg']),
-                   '--lon', str(msite['lon_deg']), '--elev', str(msite['elev_m']),
-                   '--epoch', str(msite['epoch_utc']), '--stop-file', stop_file]
+                   '--lat', str(site['lat_deg']),
+                   '--lon', str(site['lon_deg']), '--elev', str(site['elev_m']),
+                   '--epoch', current_utc_iso(anchor_ns), '--epoch-t-ns', str(anchor_ns),
+                   '--stop-file', stop_file]
         if args.sky_tle_file:
             ss_args += ['--tle-file', args.sky_tle_file, '--target-mag', str(args.sky_target_mag)]
         sky_sim_proc = _spawn('astrolock.seeker.sky_sim', ss_args)
@@ -826,7 +841,10 @@ def main(argv=None):
                 launch_detect(role)
     else:
         print("[backend] idle at startup: connect cams/mount in the GUI, or press "
-              "Simulation -> Start Simulation", flush=True)
+              "Simulation -> Connect Simulated Cameras", flush=True)
+    # sky_sim always runs: the GUI's alignment overlay consumes the navigation feed even when
+    # every camera is real -- and idle it's cheap (nav cadence is seconds; stars dribble out).
+    ensure_sky_sim()
     gui_proc = _spawn('astrolock.seeker.gui_imgui',
                       ['--session', session_dir, '--wb-r', str(args.wb_r), '--wb-b', str(args.wb_b),
                        '--device', args.device]) \
@@ -1101,6 +1119,7 @@ def main(argv=None):
         nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_det, gui_quit
         nonlocal track_center, mount_desired_url, follow_enabled, track_primary, handoff_fine, handoff_conf
         nonlocal track_pref, focus_proc, focus_role, track_delay_s, track_started_t
+        nonlocal utc_offset_ns, gps_status
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -1183,6 +1202,41 @@ def main(argv=None):
         elif t == 'set_alignment':
             alignment['yaw_deg'] = float(cmd.get('yaw_deg', 0.0))
             print(f"[backend] alignment yaw -> {alignment['yaw_deg']:+.3f} deg", flush=True)
+        elif t == 'set_time':
+            # Move the backend's current time: an absolute offset, a relative skip, the system
+            # clock, or (asynchronously) the mount's GPS. The sky follows via a sky_sim respawn.
+            if cmd.get('source') == 'gps':
+                gps_want['time'] = True
+                gps_status = 'reading mount GPS...'
+                mount.request_gps()
+            else:
+                if 'adjust_ns' in cmd:
+                    utc_offset_ns += int(cmd['adjust_ns'])
+                elif 'utc_offset_ns' in cmd:
+                    utc_offset_ns = int(cmd['utc_offset_ns'])
+                else:                                     # source 'system' (the default)
+                    utc_offset_ns = time.time_ns() - session_mod.mono_ns()
+                ensure_sky_sim(restart=True)
+                print(f"[backend] time -> {current_utc_iso()}", flush=True)
+        elif t == 'set_site':
+            if cmd.get('source') == 'gps':
+                gps_want['site'] = True
+                gps_status = 'reading mount GPS...'
+                mount.request_gps()
+            else:
+                for k in ('lat_deg', 'lon_deg', 'elev_m'):
+                    if k in cmd:
+                        site[k] = float(cmd[k])
+                ensure_sky_sim(restart=True)
+                print(f"[backend] site -> {site['lat_deg']:.5f}, {site['lon_deg']:.5f}, "
+                      f"{site['elev_m']:.0f} m", flush=True)
+        elif t == 'set_example_pass':
+            # Jump time AND site to the launch-configured example pass (--lat/--lon/--elev/--epoch).
+            site['lat_deg'], site['lon_deg'], site['elev_m'] = args.lat, args.lon, args.elev
+            ep = datetime.datetime.fromisoformat(args.epoch.replace('Z', '+00:00'))
+            utc_offset_ns = int(ep.timestamp() * 1e9) - session_mod.mono_ns()
+            ensure_sky_sim(restart=True)
+            print(f"[backend] time + site -> example pass ({args.epoch})", flush=True)
         elif t == 'set_boresight':
             boresight['x'] = float(cmd.get('x_mrad', 0.0)) * 1e-3
             boresight['y'] = float(cmd.get('y_mrad', 0.0)) * 1e-3
@@ -1324,18 +1378,18 @@ def main(argv=None):
                 print(f"[backend] {role} playback -> {pb['ser']} loop={pb['loop']}", flush=True)
                 if sources[role] == 'playback' and is_connected(role):
                     restart_cam(role, stop_first=True)
-        elif t == 'start_sim':
-            # Simulation tab's Start Simulation: bring the sim up wherever nothing else is
-            # already connected, and reset sim time to the example epoch (a fresh sky_sim +
-            # sim mount re-anchor --epoch to their own start).
+        elif t == 'connect_sim_cams':
+            # Simulation tab: bring sim cameras up wherever nothing else is already connected
+            # (and a sim mount, if none). Deliberately does NOT touch time or site -- those are
+            # the Time/Location tabs and the example-pass button now.
             if not mount_connected or isinstance(mount, mount_mod.SimMount):
                 connect_mount('sim')
-            ensure_sky_sim(restart=True)
+            ensure_sky_sim()
             for role in roles:
                 if not is_connected(role):
                     sources[role] = 'sky'
                     restart_cam(role, stop_first=False)
-            print("[backend] simulation started (sim time reset to the epoch)", flush=True)
+            print("[backend] simulated cameras connected", flush=True)
         elif t == 'set_detector':
             role = cmd.get('role')
             if role in roles:
@@ -1451,6 +1505,28 @@ def main(argv=None):
 
             for cmd in cmd_server.drain():
                 apply_command(cmd)
+            gps_res = mount.take_gps_result()      # a requested mount-GPS fix landed (or failed)
+            if gps_res is not None:
+                if gps_res.get('ok'):
+                    applied = []
+                    if gps_want['site']:
+                        site['lat_deg'], site['lon_deg'] = gps_res['lat_deg'], gps_res['lon_deg']
+                        site['elev_m'] = float(gps_res.get('elev_m', site['elev_m']))
+                        applied.append('site')
+                    if gps_want['time'] and 'utc_ns' in gps_res:
+                        utc_offset_ns = int(gps_res['utc_ns']) - int(gps_res['t_mono_ns'])
+                        applied.append('time')
+                    if applied:
+                        ensure_sky_sim(restart=True)
+                    gps_status = (f"GPS applied: {' + '.join(applied)} "
+                                  f"({gps_res['lat_deg']:.5f}, {gps_res['lon_deg']:.5f})"
+                                  if applied else 'GPS: fix received, nothing pending')
+                    if gps_want['time'] and 'utc_ns' not in gps_res:
+                        gps_status = 'GPS: position ok, but its time is not valid yet'
+                else:
+                    gps_status = f"GPS: {gps_res.get('error', 'read failed')}"
+                gps_want['time'] = gps_want['site'] = False
+                print(f"[backend] {gps_status}", flush=True)
             update_detections()
             for role in roles:
                 read_caps(role)                        # pick up each cam's live-control descriptors
@@ -1621,6 +1697,9 @@ def main(argv=None):
                               for r in roles},               # for the GUI Detection tab
                 'boresight_mrad': [round(boresight['x'] * 1e3, 4), round(boresight['y'] * 1e3, 4)],
                 'align_yaw_deg': round(alignment['yaw_deg'], 4),   # manual alignment (GUI overlay)
+                'utc_offset_ns': utc_offset_ns,     # current UTC = mono_ns() + this (Time tab)
+                'site': {k: site[k] for k in ('lat_deg', 'lon_deg', 'elev_m')},   # Location tab
+                'gps_status': gps_status,           # last mount-GPS outcome (or in-flight note)
             })
 
             # Per-second health line -- commented out so stdout carries only rare events. Uncomment

@@ -32,7 +32,6 @@ its image speed, so it is usually a non-issue; it bites only near the pole, wher
 second feasibility term (residual speed at t_a under budget) alongside the reachability term below.
 """
 
-import collections
 import math
 
 import torch
@@ -64,8 +63,7 @@ class SkyTracker:
         # Piecewise-linear history of mount measurements (t, az, alt) to look up the pose at a *past*
         # frame time by interpolation. The latest measured rate is kept only to extrapolate *forward*
         # past the last measurement (the servo's command-latency lookahead) -- never backward.
-        self._hist = collections.deque(maxlen=256)
-        self._mount_rate = (0.0, 0.0)
+        self._pose = geo.PoseHistory(maxlen=256)
 
     def target_speed_rad_s(self):
         """Apparent SKY angular speed of the model's prediction (rad/s), for status display.
@@ -92,36 +90,15 @@ class SkyTracker:
     # ---- reconstruction: pixel <-> absolute sky direction, given the mount pose at that instant ----
 
     def push_mount(self, st):
-        """Record a mount measurement into the history. Call it as often as the mount is polled
-        (finer than frame rate is fine); duplicates/out-of-order samples are ignored."""
-        t = st['t_mono_ns'] * 1e-9
-        self._mount_rate = (st['rate_az_rad_s'], st['rate_alt_rad_s'])
-        if self._hist and t <= self._hist[-1][0]:
-            return
-        self._hist.append((t, st['az_rad'], st['alt_rad']))
+        """Record a mount measurement into the pose history (geo.PoseHistory -- shared with the
+        GUI overlay). Call it as often as the mount is polled (finer than frame rate is fine)."""
+        self._pose.push(st['t_mono_ns'] * 1e-9, st['az_rad'], st['alt_rad'],
+                        st['rate_az_rad_s'], st['rate_alt_rad_s'])
 
     def _pose_at(self, t):
-        """Mount (az, alt) at time ``t`` (seconds) from the measurement history.
-
-        For a ``t`` within the history (a past frame time) we interpolate the bracketing measurements
-        -- the piecewise-linear pose the mount actually followed, correct through rate changes. Only
-        for ``t`` beyond the last measurement do we extrapolate, at the last measured rate.
-        """
-        hist = self._hist
-        if not hist:
-            return (0.0, 0.0)
-        t_last, az_last, alt_last = hist[-1]
-        if t >= t_last:                                   # future: extrapolate at the last measured rate
-            dt = t - t_last
-            return (az_last + self._mount_rate[0] * dt, alt_last + self._mount_rate[1] * dt)
-        newer = None
-        for s in reversed(hist):                          # walk back to the bracketing segment
-            if newer is not None and s[0] <= t:
-                frac = (t - s[0]) / (newer[0] - s[0]) if newer[0] > s[0] else 0.0
-                return (s[1] + geo.wrap_pi(newer[1] - s[1]) * frac,
-                        s[2] + geo.wrap_pi(newer[2] - s[2]) * frac)
-            newer = s
-        return (hist[0][1], hist[0][2])                   # older than the whole history: clamp
+        """Mount (az, alt) at time ``t`` (seconds): interpolated within the history,
+        rate-extrapolated beyond it (see geo.PoseHistory)."""
+        return self._pose.pose_at(t)
 
     def _pixel_to_dir(self, px, py, az, alt):
         """Absolute sky direction of a detection at (px, py) when the boresight is at (az, alt).

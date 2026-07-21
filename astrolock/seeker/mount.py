@@ -16,7 +16,8 @@ interchangeable -- the backend treats both as "real":
   epoch + elapsed wall-clock); a global time-scale is deferred.
 - CelestronMount drives the real NexStar mount on a single dedicated serial thread (the
   Prolific USB-serial drivers BSOD on multi-threaded access -- only that thread touches the
-  port). Real GPS read is still TODO; it reports a configured fallback site for now.
+  port). Its GPS is read on request (request_gps/take_gps_result) on that same thread;
+  get_site() still reports the configured fallback (the backend owns live time/site).
 
 Pick one with make_mount(); --mount selects sim vs celestron.
 """
@@ -39,6 +40,8 @@ def _clamp(x, lo, hi):
 
 
 class Mount:
+    _gps_result = None
+
     def set_rates(self, az_rad_s, alt_rad_s):
         raise NotImplementedError
 
@@ -49,6 +52,18 @@ class Mount:
     def get_site(self):
         """-> dict(lat_deg, lon_deg, elev_m, epoch_utc)."""
         raise NotImplementedError
+
+    def request_gps(self):
+        """Ask this mount's GPS for a fix; the answer lands later via take_gps_result()
+        (the Celestron read happens on its serial thread). Base: no GPS."""
+        self._gps_result = {'ok': False, 'error': 'this mount has no GPS'}
+
+    def take_gps_result(self):
+        """Return-and-clear the last GPS answer: None (still pending / never asked), or
+        {'ok': True, lat_deg, lon_deg, elev_m[, utc_ns, t_mono_ns]} -- utc_ns is unix UTC ns
+        and t_mono_ns the system time it was valid at -- or {'ok': False, 'error': str}."""
+        r, self._gps_result = self._gps_result, None
+        return r
 
     def close(self):
         pass
@@ -141,6 +156,14 @@ class SimMount(Mount):
         elapsed = time.perf_counter() - self._wall0
         return (self._t0 + datetime.timedelta(seconds=elapsed)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
+    def request_gps(self):
+        """The sim mount's 'GPS': its configured site + clock (epoch + elapsed), instantly --
+        so the GUI's Set-from-Mount-GPS buttons are exercisable end-to-end in sim."""
+        utc = self._t0 + datetime.timedelta(seconds=time.perf_counter() - self._wall0)
+        self._gps_result = {'ok': True, 'lat_deg': self._site['lat_deg'],
+                            'lon_deg': self._site['lon_deg'], 'elev_m': self._site['elev_m'],
+                            'utc_ns': int(utc.timestamp() * 1e9), 't_mono_ns': mono_ns()}
+
     def close(self):
         self._stop = True
         self._thread.join(timeout=2.0)
@@ -152,9 +175,10 @@ class CelestronMount(Mount):
     """
     Real Celestron mount via the NexStar hand controller. One thread owns the serial port and
     runs the ~7 Hz send-rates / read-positions loop, reusing the existing driver's protocol.
+    GPS reads (request_gps) run between iterations on that same thread.
 
-    UNTESTED against hardware in this milestone. Real GPS read is TODO -- get_site() returns a
-    configured fallback for now.
+    UNTESTED against hardware in this milestone (including the GPS read). get_site() returns
+    the configured fallback; live time/site are backend-owned, fed by take_gps_result().
     """
 
     def __init__(self, url, az0_rad=0.0, alt0_rad=0.0, site=None, max_rate_rad_s=math.radians(8.0)):
@@ -168,6 +192,7 @@ class CelestronMount(Mount):
         self._angles = [az0_rad, alt0_rad]
         self._rates = [0.0, 0.0]
         self._angle_t_ns = mono_ns()
+        self._gps_requested = False
         self._stop = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -192,6 +217,46 @@ class CelestronMount(Mount):
                         self._angles[axis] = a
                         self._angle_t_ns = t          # serial measurement time of the angle
                     last_a[axis], last_t[axis] = a, t
+                if self._gps_requested:              # on THIS thread: only it touches the port
+                    self._gps_requested = False
+                    try:
+                        self._gps_result = self._read_gps()
+                    except Exception as e:
+                        self._gps_result = {'ok': False, 'error': f'GPS read failed: {e}'}
+
+    def _read_gps(self):
+        """One GPS fix via the hand controller's 'P' passthrough to the GPS module (0xb0) --
+        the legacy driver's _read_gps sequence, without the astropy wrapping. Serial thread only."""
+        from astrolock.model.telescope_connections.celestron_nexstar_hc import (
+            CelestronNexstarDeviceIds as DEV, CelestronNexstarCommands as CMD,
+            bytes_to_uint, bytes_to_radians)
+        conn = self._conn
+
+        def ask(msg_id, response_len):
+            return conn._send_and_receive_via_hc(DEV.DEV_ID_GPS, msg_id, response_len=response_len)
+
+        linked, = ask(CMD.GPS_LINKED, 1)
+        if not linked:
+            return {'ok': False, 'error': 'GPS not linked (no satellite fix yet)'}
+        out = {'ok': True,
+               'lat_deg': math.degrees(_wrap_pi(bytes_to_radians(ask(CMD.GPS_GET_LAT, 3)))),
+               'lon_deg': math.degrees(_wrap_pi(bytes_to_radians(ask(CMD.GPS_GET_LONG, 3)))),
+               'elev_m': float(bytes_to_uint(ask(CMD.GPS_GET_HEIGHT, 2)))}
+        time_valid, = ask(CMD.GPS_TIME_VALID, 1)
+        if time_valid:
+            year = bytes_to_uint(ask(CMD.GPS_GET_YEAR, 2))
+            month, day = ask(CMD.GPS_GET_DATE, 2)
+            hour, minute, second = ask(CMD.GPS_GET_TIME, 3)
+            t_mono_ns = mono_ns()                # the moment the reported second is valid for...
+            utc = datetime.datetime(year, month, day, hour, minute, second,
+                                    tzinfo=datetime.timezone.utc)
+            # ...plus the HC's ~200 ms answer lag after the 1PPS edge (legacy driver's correction).
+            out['utc_ns'] = int(utc.timestamp() * 1e9) + 200_000_000
+            out['t_mono_ns'] = t_mono_ns
+        return out
+
+    def request_gps(self):
+        self._gps_requested = True           # picked up by the serial loop
 
     def set_rates(self, az_rad_s, alt_rad_s):
         with self._lock:
@@ -230,6 +295,9 @@ class NullMount(Mount):
 
     def get_site(self):
         return dict(self._site)
+
+    def request_gps(self):
+        self._gps_result = {'ok': False, 'error': 'no mount connected'}
 
 
 def available_mount_urls():

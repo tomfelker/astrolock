@@ -12,6 +12,7 @@ candidate times at once (the intercept solver leans on this), and a future fitte
 autodiff, with no change to the interface.
 """
 
+import collections
 import math
 
 import torch
@@ -78,3 +79,52 @@ def rodrigues(v, axis, angle):
 def wrap_pi(a):
     """Shortest signed representative in (-pi, pi]. Works on floats or tensors."""
     return (a + math.pi) % _TWO_PI - math.pi
+
+
+class PoseHistory:
+    """Mount pose measurements -> the pose at an arbitrary instant. One problem, one solver:
+    the tracker asks where the mount pointed when a (possibly several-frames-old) detection
+    was captured, and the GUI overlay asks where it pointed at the displayed frame's capture
+    stamp. Extracted from SkyTracker so both use the SAME battle-tested lookup.
+
+    Within the history: piecewise-linear interpolation of the bracketing measurements
+    (wrap-aware) -- the pose the mount actually followed, correct through rate changes.
+    Beyond the newest measurement: extrapolate at the last measured rate -- clamping to a
+    stale pose instead would displace a consumer by slew_rate x staleness the moment its
+    query outruns the feed (a one-frame glyph jump in the GUI). Before the oldest: clamp.
+    Duplicate / out-of-order pushes are ignored (their rates still update). Times are
+    SECONDS on the shared mono timeline (mono_s); angles/rates are radians (house rule).
+    """
+
+    def __init__(self, maxlen=256):
+        self._hist = collections.deque(maxlen=maxlen)
+        self._rate = (0.0, 0.0)
+
+    def __len__(self):
+        return len(self._hist)
+
+    def push(self, t_s, az_rad, alt_rad, rate_az_rad_s=0.0, rate_alt_rad_s=0.0):
+        """Record a measurement. Call as often as the mount is polled (finer than frame
+        rate is fine)."""
+        self._rate = (rate_az_rad_s, rate_alt_rad_s)
+        if self._hist and t_s <= self._hist[-1][0]:
+            return
+        self._hist.append((t_s, az_rad, alt_rad))
+
+    def pose_at(self, t_s):
+        """Mount (az_rad, alt_rad) at time ``t_s`` (seconds)."""
+        hist = self._hist
+        if not hist:
+            return (0.0, 0.0)
+        t_last, az_last, alt_last = hist[-1]
+        if t_s >= t_last:                                 # future: extrapolate at the last rate
+            dt = t_s - t_last
+            return (az_last + self._rate[0] * dt, alt_last + self._rate[1] * dt)
+        newer = None
+        for s in reversed(hist):                          # walk back to the bracketing segment
+            if newer is not None and s[0] <= t_s:
+                frac = (t_s - s[0]) / (newer[0] - s[0]) if newer[0] > s[0] else 0.0
+                return (s[1] + wrap_pi(newer[1] - s[1]) * frac,
+                        s[2] + wrap_pi(newer[2] - s[2]) * frac)
+            newer = s
+        return (hist[0][1], hist[0][2])                   # older than the whole history: clamp

@@ -26,6 +26,8 @@ the small result is exact -- then float32 is plenty for the fraction (sub-micros
 
 File format: JSONL, one record per target-extension:
     {"id": "<str>", "mag": <float>, "fixes": [[t_mono_ns, x, y, z], ...]}
+plus {"reset": true}, written by a (re)starting publisher: drop every target -- the time or site
+changed, so all previously published fixes (even future ones) are wrong.
 """
 
 import bisect
@@ -73,6 +75,17 @@ class SkyAlmanac:
         """Ingest newly-committed records; append fixes and evict stale ones (floor-and-newer)."""
         new = 0
         for rec in self._tailer.poll():
+            if rec.get('reset'):
+                # A respawned sky_sim (time/site changed) opens its stream with {"reset": true}:
+                # every fix published before it -- including future ones, which the out-of-order
+                # guard below would otherwise trust over the corrections -- is now wrong.
+                self._ids, self._index, self._t, self._d, self._mag = [], {}, [], [], []
+                self._pending.clear()
+                new = 0
+                self._times = torch.zeros((0, self._cols), dtype=torch.int64, device=self.device)
+                self._dirs = torch.zeros((0, self._cols, 3), dtype=torch.float32, device=self.device)
+                self._mag_t = torch.zeros((0,), dtype=torch.float32, device=self.device)
+                continue
             tid = rec.get('id')
             if tid is None:
                 continue

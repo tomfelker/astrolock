@@ -24,6 +24,7 @@ Requires `imgui-bundle`, `moderngl`, `glfw` (pip install imgui-bundle moderngl g
 
 import argparse
 import ctypes
+import datetime
 import glob
 import json
 import math
@@ -36,6 +37,7 @@ import time
 import numpy as np
 
 from astrolock.seeker import bayer, control, ser
+from astrolock.seeker import geometry as geo
 from astrolock.seeker import optics as optics_db
 from astrolock.seeker import settings as settings_store
 from astrolock.seeker import framestream
@@ -93,7 +95,20 @@ MAXPIP = 4                       # pool of PIP panes along the bottom; each show
 
 
 def _default_settings():
-    return {'zoom': 1, 'reticles': True, 'histogram': False, 'wait_for_detector': True}
+    return {'zoom': 1, 'reticles': True, 'histogram': False, 'wait_for_detector': True,
+            'show_stars': True}
+
+
+def _fmt_time_delta(delta_ns):
+    """'13d 20:07:03.2 ahead of system time' -- the backend-time vs system-clock offset. Never
+    exactly zero: mono_ns is the perf counter, which drifts against (and ignores changes to)
+    the system clock."""
+    s = abs(delta_ns) * 1e-9
+    d, s = divmod(s, 86400.0)
+    h, s = divmod(s, 3600.0)
+    m, s = divmod(s, 60.0)
+    return ((f"{int(d)}d " if d else "") + f"{int(h):02d}:{int(m):02d}:{s:04.1f} "
+            + ('ahead of' if delta_ns >= 0 else 'behind') + " system time")
 
 
 def _floor_pow2(x):
@@ -460,6 +475,7 @@ def main(argv=None):
               'pip_map': {}, 'pip_slots': []}
     boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
     align_ui = {'yaw': 0.0}                               # deg; manual mount alignment (Alignment panel)
+    site_ui = {'lat': 0.0, 'lon': 0.0, 'elev': 0.0}       # observer location (Location panel)
     # Sky/navigation overlay: torch + the almanac reader are heavy imports, loaded on a
     # background thread so GUI startup stays snappy ('no slow per-frame work' is the rule,
     # not 'no torch'). nav['ready'] becomes (torch, SkyAlmanac, skysim) when loaded.
@@ -476,27 +492,10 @@ def main(argv=None):
             print(f"[gui] sky overlay unavailable ({e})", flush=True)
     threading.Thread(target=_nav_loader, daemon=True).start()
 
-    pose_hist = []            # (enc_t_mono_ns, az_deg, alt_deg) from each state update (~20 Hz)
-
-    def _pose_at(t_ns, stt):
-        """Mount pose (az_deg, alt_deg) at time t_ns, lerped from the state pose history.
-        The sky overlay evaluates at the DISPLAYED FRAME'S capture stamp -- frame, pose, and
-        almanac share one clock, so display latency can't smear the overlay off the stars.
-        Falls back to the latest state pose when history is empty. (Az lerp is naive: one
-        glitchy segment if the mount crosses az 0/360 -- harmless for an overlay.)"""
-        if not pose_hist:
-            return stt.get('enc_az_deg', 0.0), stt.get('enc_alt_deg', 0.0)
-        if t_ns <= pose_hist[0][0]:
-            return pose_hist[0][1], pose_hist[0][2]
-        for j in range(len(pose_hist) - 1, -1, -1):       # newest-first: frame time is near the tail
-            t1, az1, alt1 = pose_hist[j]
-            if t1 <= t_ns:
-                if j == len(pose_hist) - 1:
-                    return az1, alt1                      # newer than every sample: hold the last
-                t2, az2, alt2 = pose_hist[j + 1]
-                frac = (t_ns - t1) / max(1, t2 - t1)
-                return az1 + frac * (az2 - az1), alt1 + frac * (alt2 - alt1)
-        return pose_hist[0][1], pose_hist[0][2]
+    # Pose at the DISPLAYED frame's capture stamp, for the sky overlay -- the SAME solver the
+    # tracker uses to place old detections on the sky (interpolate within the history,
+    # rate-extrapolate beyond it; clamping instead caused one-frame glyph jumps while slewing).
+    pose_hist = geo.PoseHistory(maxlen=256)
 
     def _poll_navigation():
         """Attach to the session's navigation feed once the imports are up, then tail it."""
@@ -1048,7 +1047,8 @@ def main(argv=None):
         # the encoder pose + the manual Alignment yaw -- align by turning the yaw until they sit
         # on the real stars. The satellite's upcoming pass draws as a line, a diamond at 'now'.
         # Projection = skysim.project_dirs, the SAME pinhole math the sim renders with.
-        if role in roles and nav.get('alm') is not None and stt.get('enc_az_deg') is not None:
+        if (sset.get('show_stars', True) and role in roles and nav.get('alm') is not None
+                and stt.get('enc_az_deg') is not None):
             fv_nav = (stt.get('optics') or {}).get(role)
             nav_ids = nav['alm'].ids
             if fv_nav and nav_ids:
@@ -1056,9 +1056,13 @@ def main(argv=None):
                 # Everything evaluates AT THE DISPLAYED FRAME'S capture time: almanac query
                 # and pose alike, so the overlay can't lag the pixels it sits on.
                 t0 = int(cam.get('t_ns') or session_mod.mono_ns())
-                az0, alt0 = _pose_at(t0, stt)
-                az_nav = math.radians(az0 + (stt.get('align_yaw_deg') or 0.0))
-                alt_nav = math.radians(alt0)
+                if len(pose_hist):
+                    az0, alt0 = pose_hist.pose_at(t0 * 1e-9)
+                else:                                     # no samples yet: latest state pose
+                    az0 = math.radians(stt.get('enc_az_deg') or 0.0)
+                    alt0 = math.radians(stt.get('enc_alt_deg') or 0.0)
+                az_nav = az0 + math.radians(stt.get('align_yaw_deg') or 0.0)
+                alt_nav = alt0
                 f_px_nav = (cam['w'] / 2.0) / math.tan(math.radians(fv_nav['fov_x_deg'] / 2.0))
                 has_track = 'sat:track' in nav_ids
                 n_track = 32                      # pass samples, 20 s apart -> ~10 min of track
@@ -1509,6 +1513,10 @@ def main(argv=None):
             'cameras': {role: ui['src'].get(role) for role in roles if ui['src'].get(role)},
             'boresight': [boresight_ui['x'], boresight_ui['y']],
             'alignment': {'yaw_deg': align_ui['yaw']},
+            # Location persists; TIME deliberately does not (a stale offset next session would be
+            # worse than starting at the system clock).
+            'location': {'lat_deg': site_ui['lat'], 'lon_deg': site_ui['lon'],
+                         'elev_m': site_ui['elev']},
             'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
                          'auto_switch': track_ui['auto_switch'], 'delay': track_ui['delay'],
                          'model': track_ui['model'], 'alt_km': track_ui['alt_km'],
@@ -1526,7 +1534,7 @@ def main(argv=None):
                 layout[k] = v
         for role, s in (data.get('display') or {}).items():
             vs = view_settings.setdefault(role, _default_settings())
-            for k in ('zoom', 'reticles', 'histogram', 'wait_for_detector'):
+            for k in ('zoom', 'reticles', 'histogram', 'wait_for_detector', 'show_stars'):
                 if k in s:
                     vs[k] = s[k]
         opt = data.get('optics') or {}
@@ -1553,6 +1561,10 @@ def main(argv=None):
         if 'yaw_deg' in al:
             _align_set(al['yaw_deg'])                   # push the saved alignment to the backend
             ctrl['align_init'] = True
+        loc = data.get('location') or {}
+        if 'lat_deg' in loc:
+            _site_set(loc['lat_deg'], loc.get('lon_deg', 0.0), loc.get('elev_m', 0.0))
+            ctrl['site_init'] = True                    # ...and don't let the state-init clobber it
         trk = data.get('tracking') or {}
         if 'smoothing' in trk:
             track_ui['smoothing'] = max(0.0, float(trk['smoothing']))
@@ -1615,6 +1627,16 @@ def main(argv=None):
         ui['txt']['align_yaw'] = f"{align_ui['yaw']:.4g}"
         if send:
             _send({'type': 'set_alignment', 'yaw_deg': align_ui['yaw']})
+
+    def _site_set(lat_deg, lon_deg, elev_m, send=True):
+        site_ui['lat'], site_ui['lon'] = float(lat_deg), float(lon_deg)
+        site_ui['elev'] = float(elev_m)
+        ui['txt']['site_lat'] = f"{site_ui['lat']:.8g}"       # 1e-5 deg ~ 1 m: keep full precision
+        ui['txt']['site_lon'] = f"{site_ui['lon']:.8g}"
+        ui['txt']['site_elev'] = f"{site_ui['elev']:g}"
+        if send:
+            _send({'type': 'set_site', 'lat_deg': site_ui['lat'], 'lon_deg': site_ui['lon'],
+                   'elev_m': site_ui['elev']})
 
     def _bore_set(x, y, send=True):
         boresight_ui['x'], boresight_ui['y'] = float(x), float(y)
@@ -1820,10 +1842,11 @@ def main(argv=None):
                 ctrl['state'] = got[1]
                 tp = got[1].get('enc_t_mono_ns')          # pose history: lets the sky overlay use
                 if tp:                                    # the pose AT the displayed frame's time
-                    pose_hist.append((int(tp), float(got[1].get('enc_az_deg', 0.0)),
-                                      float(got[1].get('enc_alt_deg', 0.0))))
-                    if len(pose_hist) > 256:
-                        del pose_hist[:128]
+                    pose_hist.push(int(tp) * 1e-9,
+                                   math.radians(float(got[1].get('enc_az_deg', 0.0))),
+                                   math.radians(float(got[1].get('enc_alt_deg', 0.0))),
+                                   math.radians(float(got[1].get('rate_az_deg_s', 0.0))),
+                                   math.radians(float(got[1].get('rate_alt_deg_s', 0.0))))
         st = ctrl['state']
         _poll_focus_metrics()                           # tail focus metrics into the graphs
         _poll_sweep()                                   # tail sweep prompts/result (if one ran)
@@ -1902,6 +1925,12 @@ def main(argv=None):
         if 'align_init' not in ctrl and st and st.get('align_yaw_deg') is not None:
             _align_set(st['align_yaw_deg'], send=False)
             ctrl['align_init'] = True
+
+        if 'site_init' not in ctrl and st and st.get('site') is not None:
+            s = st['site']
+            _site_set(s.get('lat_deg', 0.0), s.get('lon_deg', 0.0), s.get('elev_m', 0.0),
+                      send=False)                          # reflect the backend; don't echo it back
+            ctrl['site_init'] = True
 
         # Restored layout had Dbg on but the detectors aren't writing debug streams: sync once.
         if 'dbg_init' not in ctrl and st is not None:
@@ -2018,6 +2047,11 @@ def main(argv=None):
         if ch:
             sset['histogram'] = v
         _tip("Show a luminance histogram inset on this camera's pane (judge exposure/clipping).")
+        ch, v = imgui.checkbox(f"Show stars##stars_{role}", sset.get('show_stars', True))
+        if ch:
+            sset['show_stars'] = v
+        _tip("Overlay the sky model on this pane: gold stars where the navigation almanac puts "
+             "them (at the encoder pose + Alignment yaw) and the satellite's upcoming pass line.")
         ch, v = imgui.checkbox(f"Wait for detector##waitdet_{role}", sset.get('wait_for_detector', True))
         if ch:
             sset['wait_for_detector'] = v
@@ -2111,11 +2145,75 @@ def main(argv=None):
             _tip("Resume slewing the mount to hold the locked target (undo Stop Moving).")
             imgui.tree_pop()
         imgui.separator()
-        if imgui.tree_node_ex("Simulation", OPEN):         # sim-truth render knobs
-            if imgui.button("  Start Simulation  "):
-                _send({'type': 'start_sim'})
-            _tip("Connect the sim mount and sim cameras -- only where nothing else is already "
-                 "connected -- and reset sim time to the example epoch.")
+        if imgui.tree_node_ex("Time", OPEN):
+            off_ns = st.get('utc_offset_ns')
+            if off_ns is None:
+                _ctext(C4(150, 155, 170), "(waiting for backend)")
+            else:
+                utc_ns = off_ns + session_mod.mono_ns()    # ticks every frame; jumps on skips
+                dt_utc = datetime.datetime.fromtimestamp(utc_ns * 1e-9, tz=datetime.timezone.utc)
+                _mono_text(f"UTC    {dt_utc.strftime('%Y-%m-%d %H:%M:%S')}Z\n"
+                           f"Local  {dt_utc.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                           f"({_fmt_time_delta(utc_ns - time.time_ns())})")
+                _tip("The backend's current time: what the sky model (star overlay, satellite "
+                     "pass) is computed for. All processes share one monotonic clock; this is "
+                     "its offset to UTC, owned by the backend.")
+            if imgui.button("Set from System Time"):
+                _send({'type': 'set_time', 'source': 'system'})
+            _tip("Set the current time from this computer's clock.")
+            imgui.same_line()
+            if imgui.button("Set from Mount GPS##time_gps"):
+                _send({'type': 'set_time', 'source': 'gps'})
+            _tip("Ask the mount's GPS for the time (Celestron: read through the hand controller; "
+                 "sim mount: its example-pass clock). Applies when the read completes.")
+            for i, (label, secs) in enumerate((('<d', -86_400), ('<h', -3_600), ('<m', -60),
+                                               ('<<s', -10), ('<s', -1), ('s>', 1), ('s>>', 10),
+                                               ('m>', 60), ('h>', 3_600), ('d>', 86_400))):
+                if i:
+                    imgui.same_line()
+                if imgui.button(f"{label}##time_skip"):
+                    _send({'type': 'set_time', 'adjust_ns': secs * 1_000_000_000})
+                unit = {86_400: 'one day', 3_600: 'one hour', 60: 'one minute',
+                        10: '10 seconds', 1: 'one second'}[abs(secs)]
+                _tip(f"Skip the current time {'back' if secs < 0 else 'forward'} {unit}.")
+            if st.get('gps_status'):
+                _ctext(C4(150, 155, 170), st['gps_status'])
+            imgui.tree_pop()
+        imgui.separator()
+        if imgui.tree_node_ex("Location", OPEN):
+            for label, key, field in (("Latitude:", 'site_lat', 'lat'),
+                                      ("Longitude:", 'site_lon', 'lon'),
+                                      ("Elevation:", 'site_elev', 'elev')):
+                imgui.text(label)
+                imgui.same_line(S(76))
+
+                def _commit_site(txt, _f=field):
+                    v = dict(site_ui)
+                    v[_f] = _flt(txt, site_ui[_f])
+                    _site_set(v['lat'], v['lon'], v['elev'])
+                    return ui['txt'][key]
+                _input_commit(key, S(100), _commit_site)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "m" if field == 'elev' else "deg")
+            _tip("Observer site, decimal degrees (north / east positive) + metres.")
+            if imgui.button("Set from Mount GPS##site_gps"):
+                _send({'type': 'set_site', 'source': 'gps'})
+            _tip("Ask the mount's GPS for the site (Celestron: read through the hand controller; "
+                 "sim mount: its example-pass site). Applies when the read completes.")
+            if st.get('gps_status'):
+                _ctext(C4(150, 155, 170), st['gps_status'])
+            imgui.tree_pop()
+        imgui.separator()
+        if imgui.tree_node_ex("Simulation", OPEN):         # sim connect + sim-truth render knobs
+            if imgui.button("Set Time and Location to Example Pass"):
+                _send({'type': 'set_example_pass'})
+            _tip("Jump the Time and Location tabs to the launch-configured example pass "
+                 "(default: the ISS test pass over San Carlos, just rising) -- the sky model "
+                 "re-propagates there.")
+            if imgui.button("Connect Sim Mount and Cameras"):
+                _send({'type': 'connect_sim_cams'})
+            _tip("Connect the sim mount (if no mount is connected) and sim cameras wherever "
+                 "nothing else is already connected. Does not touch time or location.")
             imgui.text("Seeing r0:")
             _tip("Atmospheric seeing as the Fried parameter r0 (m): bigger = steadier air. 0 = off; "
                  "~0.05 poor, ~0.2 excellent. One sky, so it blurs all sim cameras (FWHM ~ 0.98*lambda/r0). "

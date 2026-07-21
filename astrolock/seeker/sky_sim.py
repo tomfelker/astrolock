@@ -84,11 +84,15 @@ class SkyPublisher:
             self.sat_mag = args.target_mag + 2.5 * math.log10(npts)        # split flux over the points
 
         self.epoch = datetime.datetime.fromisoformat(args.epoch.replace('Z', '+00:00'))
-        self.perf0_ns = mono_ns()                                          # system time <-> sim epoch anchor
+        self.perf0_ns = mono_ns()                                          # process start (emit cursors)
+        # The system-time <-> UTC anchor: sim UTC == --epoch at system time --epoch-t-ns. The
+        # backend passes an explicit anchor so time is absolute on the shared timeline (a respawn
+        # at the same anchor+epoch continues the SAME time); 0 = anchor to process start (standalone).
+        self.epoch_t_ns = args.epoch_t_ns or self.perf0_ns
 
     def _sf_secs(self, t_ns):
         """Seconds-from-epoch (as skyfield.ts.utc wants them) for system-time anchor(s) t_ns."""
-        return (np.asarray(t_ns, dtype=np.float64) - self.perf0_ns) * 1e-9
+        return (np.asarray(t_ns, dtype=np.float64) - self.epoch_t_ns) * 1e-9
 
     def _sf_times(self, t_ns):
         """Skyfield Time for system-time anchors t_ns (scalar -> single Time, array -> Time array)."""
@@ -151,7 +155,9 @@ def run(argv=None):
     p.add_argument('--lat', type=float, required=True)
     p.add_argument('--lon', type=float, required=True)
     p.add_argument('--elev', type=float, default=0.0)
-    p.add_argument('--epoch', required=True, help="simulated UTC epoch (ISO); maps to process start")
+    p.add_argument('--epoch', required=True, help="UTC epoch (ISO) at system time --epoch-t-ns")
+    p.add_argument('--epoch-t-ns', type=int, default=0,
+                   help="system time (mono_ns) at which sim UTC == --epoch (0 = process start)")
     p.add_argument('--tle-file', default=None)
     p.add_argument('--target-mag', type=float, default=-4.0)
     p.add_argument('--mag-limit', type=float, default=7.0)
@@ -183,6 +189,10 @@ def run(argv=None):
 
     pub = SkyPublisher(args)
     writer = JsonlWriter(args.out)
+    # Streams are append-only across respawns (a time/site change restarts this process into the
+    # SAME files). Everything already published -- including fixes minutes into the future -- is
+    # wrong under the new time/site, so open with a reset: consumers drop all targets on sight.
+    writer.append({'reset': True})
     print(f"[sky_sim] {len(pub.star_ids)} stars"
           + (f" + {len(pub.sat_ids)} sat points" if pub.sat else "")
           + (f", nav feed {len(pub.nav_ids)} stars -> {args.nav_out}" if args.nav_out else "")
@@ -196,6 +206,8 @@ def run(argv=None):
     star_pending = None                                    # [t_ns list, dirs (K,N,3), cursor]
 
     nav_writer = JsonlWriter(args.nav_out) if args.nav_out else None
+    if nav_writer is not None:
+        nav_writer.append({'reset': True})                 # same respawn contract as the main stream
     nav_next = pub.perf0_ns - int(args.nav_dt * 1e9)       # nav stars: one anchor behind 'now'
     nav_track_next = pub.perf0_ns                          # sat track: forward-only cursor (no
     nav_dt_ns = int(args.nav_dt * 1e9)                     # overlapping re-emits -- fixes append)
@@ -244,6 +256,8 @@ def run(argv=None):
         time.sleep(min(args.sat_dt, 0.05))
 
     writer.close()
+    if nav_writer is not None:
+        nav_writer.close()
 
 
 if __name__ == '__main__':
