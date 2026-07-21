@@ -459,6 +459,56 @@ def main(argv=None):
               'pip_h': S(200), 'big_role': roles[0] if roles else ROLES[0], 'big_stream': None,
               'pip_map': {}, 'pip_slots': []}
     boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
+    align_ui = {'yaw': 0.0}                               # deg; manual mount alignment (Alignment panel)
+    # Sky/navigation overlay: torch + the almanac reader are heavy imports, loaded on a
+    # background thread so GUI startup stays snappy ('no slow per-frame work' is the rule,
+    # not 'no torch'). nav['ready'] becomes (torch, SkyAlmanac, skysim) when loaded.
+    nav = {'ready': None, 'alm': None}
+
+    def _nav_loader():
+        try:
+            import torch as torch_
+            from astrolock.seeker.almanac import SkyAlmanac
+            from astrolock.seeker import skysim
+            nav['ready'] = (torch_, SkyAlmanac, skysim)
+        except Exception as e:
+            nav['ready'] = False
+            print(f"[gui] sky overlay unavailable ({e})", flush=True)
+    threading.Thread(target=_nav_loader, daemon=True).start()
+
+    pose_hist = []            # (enc_t_mono_ns, az_deg, alt_deg) from each state update (~20 Hz)
+
+    def _pose_at(t_ns, stt):
+        """Mount pose (az_deg, alt_deg) at time t_ns, lerped from the state pose history.
+        The sky overlay evaluates at the DISPLAYED FRAME'S capture stamp -- frame, pose, and
+        almanac share one clock, so display latency can't smear the overlay off the stars.
+        Falls back to the latest state pose when history is empty. (Az lerp is naive: one
+        glitchy segment if the mount crosses az 0/360 -- harmless for an overlay.)"""
+        if not pose_hist:
+            return stt.get('enc_az_deg', 0.0), stt.get('enc_alt_deg', 0.0)
+        if t_ns <= pose_hist[0][0]:
+            return pose_hist[0][1], pose_hist[0][2]
+        for j in range(len(pose_hist) - 1, -1, -1):       # newest-first: frame time is near the tail
+            t1, az1, alt1 = pose_hist[j]
+            if t1 <= t_ns:
+                if j == len(pose_hist) - 1:
+                    return az1, alt1                      # newer than every sample: hold the last
+                t2, az2, alt2 = pose_hist[j + 1]
+                frac = (t_ns - t1) / max(1, t2 - t1)
+                return az1 + frac * (az2 - az1), alt1 + frac * (alt2 - alt1)
+        return pose_hist[0][1], pose_hist[0][2]
+
+    def _poll_navigation():
+        """Attach to the session's navigation feed once the imports are up, then tail it."""
+        if not nav['ready']:
+            return
+        if nav['alm'] is None:
+            hits = glob.glob(os.path.join(args.session, '*_navigation.jsonl'))
+            if not hits:
+                return
+            _, SkyAlmanac, _ = nav['ready']
+            nav['alm'] = SkyAlmanac(max(hits, key=os.path.getmtime))
+        nav['alm'].update()
     track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True,   # Tracking panel state; backend defaults
                 'delay': 0.0,                                            # post-lock mount-hold (s)
                 'model': 'ema', 'alt_km': 250.0}                         # target model (next lock)
@@ -481,7 +531,8 @@ def main(argv=None):
     FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
     # Immediate-mode UI state: text-input buffers + selections the panel reads/writes each frame.
-    ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'track_delay': f"{track_ui['delay']:g}",
+    ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'align_yaw': '0',
+                  'track_delay': f"{track_ui['delay']:g}",
                   'sim_r0': f"{sim_ui['r0']:g}", 'track_smooth': f"{track_ui['smoothing']:g}",
                   'track_alt': f"{track_ui['alt_km']:g}",
                   'focus_alpha': f"{focus_ui['alpha']:g}", 'focus_com_mult': f"{focus_ui['com_mult']:g}",
@@ -651,6 +702,7 @@ def main(argv=None):
             # place; the view's exit validates the slot wasn't reused mid-use.
             with f.view(FrameRef(seg, show_idx)) as (_rec, disp):
                 fh, fw = disp.shape[0], disp.shape[1]
+                cam['t_ns'] = int(_rec['t_mono_ns'] or 0)    # capture stamp of the DISPLAYED frame
                 _t = time.perf_counter()
                 w, h = cam['gl'].upload(disp, f.header.color_id, wb)
                 _prof('upload', (time.perf_counter() - _t) * 1e3)
@@ -682,6 +734,23 @@ def main(argv=None):
     COL_COAST = (255, 180, 40, 200)         # amber
     COL_STATIC = (255, 200, 40, 200)        # yellow: a non-moving detection (potential target)
     _SCREW_COL = (230, 185, 70, 235)        # collimation-screw guide colour (amber)
+    COL_NAV_STAR = (255, 215, 90, 220)      # gold: where the sky model says a star is
+    COL_NAV_SAT = (255, 140, 220, 235)      # magenta: the satellite's pass track + position
+
+    def _star_glyph(dl, sx, sy):
+        """Five-pointed star outline centred at screen (sx, sy), fixed UI size (not zoomed)."""
+        pts = []
+        for k in range(10):
+            ang = -math.pi / 2.0 + k * math.pi / 5.0
+            rr = S(8) if k % 2 == 0 else S(3)
+            pts.append(imgui.ImVec2(sx + rr * math.cos(ang), sy + rr * math.sin(ang)))
+        dl.add_polyline(pts, C(COL_NAV_STAR), 1.5, int(imgui.ImDrawFlags_.closed))
+
+    def _diamond_glyph(dl, sx, sy):
+        r = S(7)
+        pts = [imgui.ImVec2(sx, sy - r), imgui.ImVec2(sx + r, sy),
+               imgui.ImVec2(sx, sy + r), imgui.ImVec2(sx - r, sy)]
+        dl.add_polyline(pts, C(COL_NAV_SAT), 1.8, int(imgui.ImDrawFlags_.closed))
 
     def _green(active, a=210):
         """Detection green: bright when it comes from the active tracking source, dim otherwise."""
@@ -974,6 +1043,57 @@ def main(argv=None):
                 dl.add_line(A(ir, cy), A(cx + PIPPER_R, cy), C(RED), 1.0)
                 dl.add_line(A(cx, it), A(cx, cy - PIPPER_R), C(RED), 1.0)
                 dl.add_line(A(cx, ib), A(cx, cy + PIPPER_R), C(RED), 1.0)
+
+        # --- Sky overlay (navigation feed): gold stars where the sky model says stars are, at
+        # the encoder pose + the manual Alignment yaw -- align by turning the yaw until they sit
+        # on the real stars. The satellite's upcoming pass draws as a line, a diamond at 'now'.
+        # Projection = skysim.project_dirs, the SAME pinhole math the sim renders with.
+        if role in roles and nav.get('alm') is not None and stt.get('enc_az_deg') is not None:
+            fv_nav = (stt.get('optics') or {}).get(role)
+            nav_ids = nav['alm'].ids
+            if fv_nav and nav_ids:
+                torch_, _, skysim_ = nav['ready']
+                # Everything evaluates AT THE DISPLAYED FRAME'S capture time: almanac query
+                # and pose alike, so the overlay can't lag the pixels it sits on.
+                t0 = int(cam.get('t_ns') or session_mod.mono_ns())
+                az0, alt0 = _pose_at(t0, stt)
+                az_nav = math.radians(az0 + (stt.get('align_yaw_deg') or 0.0))
+                alt_nav = math.radians(alt0)
+                f_px_nav = (cam['w'] / 2.0) / math.tan(math.radians(fv_nav['fov_x_deg'] / 2.0))
+                has_track = 'sat:track' in nav_ids
+                n_track = 32                      # pass samples, 20 s apart -> ~10 min of track
+                t_q = [t0] + ([t0 + k * 20_000_000_000 for k in range(1, n_track)]
+                              if has_track else [])
+                dirs_nav, _m = nav['alm'].dirs_at(torch_.tensor(t_q, dtype=torch_.int64))
+                pxn, pyn, okn = skysim_.project_dirs(dirs_nav.reshape(-1, 3), az_nav, alt_nav,
+                                                     f_px_nav, cam['w'] / 2.0, cam['h'] / 2.0)
+                K = len(t_q)
+                pxn = pxn.reshape(-1, K).tolist()
+                pyn = pyn.reshape(-1, K).tolist()
+                okn = okn.reshape(-1, K).tolist()
+
+                def NP(x, y):                     # frame coords -> pane: +0.5 because a frame
+                    # coordinate is a PIXEL CENTRE (skysim's splat convention) and pixel i
+                    # displays spanning [i, i+1) -- at high zoom the half pixel is visible.
+                    return A(offx + (x + 0.5) * scale, offy + (y + 0.5) * scale)
+
+                trk = nav_ids.index('sat:track') if has_track else -1
+                for i_t in range(len(nav_ids)):
+                    if i_t == trk or not okn[i_t][0]:
+                        continue
+                    x0, y0 = pxn[i_t][0], pyn[i_t][0]
+                    if -64 <= x0 <= cam['w'] + 64 and -64 <= y0 <= cam['h'] + 64:
+                        _star_glyph(dl, *NP(x0, y0))
+                if trk >= 0:
+                    for k in range(K - 1):        # the pass line, from 'now' (k=0) forward --
+                        # starting at k=1 left a 20 s gap ahead of the diamond, so the line led
+                        # the satellite and each piece vanished before the satellite crossed it
+                        if okn[trk][k] and okn[trk][k + 1]:
+                            dl.add_line(NP(pxn[trk][k], pyn[trk][k]),
+                                        NP(pxn[trk][k + 1], pyn[trk][k + 1]),
+                                        C((*COL_NAV_SAT[:3], 150)), 1.5)
+                    if okn[trk][0]:
+                        _diamond_glyph(dl, *NP(pxn[trk][0], pyn[trk][0]))
 
         # Clamp box = the visible camera view (image ∩ pane): letterboxed image zoomed out, the pane zoomed in.
         box = (max(0.0, il), max(0.0, it), min(float(SW), ir), min(float(SH), ib))
@@ -1388,6 +1508,7 @@ def main(argv=None):
             },
             'cameras': {role: ui['src'].get(role) for role in roles if ui['src'].get(role)},
             'boresight': [boresight_ui['x'], boresight_ui['y']],
+            'alignment': {'yaw_deg': align_ui['yaw']},
             'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
                          'auto_switch': track_ui['auto_switch'], 'delay': track_ui['delay'],
                          'model': track_ui['model'], 'alt_km': track_ui['alt_km'],
@@ -1428,6 +1549,10 @@ def main(argv=None):
         if b and len(b) >= 2:
             _bore_set(b[0], b[1])                       # updates the buffers + pushes to the backend
             ctrl['bore_init'] = True                    # ...and don't let the state-init clobber it
+        al = data.get('alignment') or {}
+        if 'yaw_deg' in al:
+            _align_set(al['yaw_deg'])                   # push the saved alignment to the backend
+            ctrl['align_init'] = True
         trk = data.get('tracking') or {}
         if 'smoothing' in trk:
             track_ui['smoothing'] = max(0.0, float(trk['smoothing']))
@@ -1484,6 +1609,12 @@ def main(argv=None):
     # ---- Boresight / Tracking / Simulation setters ----------------------------------------------
     def _bore_send():
         _send({'type': 'set_boresight', 'x_mrad': boresight_ui['x'], 'y_mrad': boresight_ui['y']})
+
+    def _align_set(yaw_deg, send=True):
+        align_ui['yaw'] = float(yaw_deg)
+        ui['txt']['align_yaw'] = f"{align_ui['yaw']:.4g}"
+        if send:
+            _send({'type': 'set_alignment', 'yaw_deg': align_ui['yaw']})
 
     def _bore_set(x, y, send=True):
         boresight_ui['x'], boresight_ui['y'] = float(x), float(y)
@@ -1687,9 +1818,16 @@ def main(argv=None):
                 perf['mount'].hit(got[0] - (ctrl.get('state_v') or 0))   # meter true update count
                 ctrl['state_v'] = got[0]
                 ctrl['state'] = got[1]
+                tp = got[1].get('enc_t_mono_ns')          # pose history: lets the sky overlay use
+                if tp:                                    # the pose AT the displayed frame's time
+                    pose_hist.append((int(tp), float(got[1].get('enc_az_deg', 0.0)),
+                                      float(got[1].get('enc_alt_deg', 0.0))))
+                    if len(pose_hist) > 256:
+                        del pose_hist[:128]
         st = ctrl['state']
         _poll_focus_metrics()                           # tail focus metrics into the graphs
         _poll_sweep()                                   # tail sweep prompts/result (if one ran)
+        _poll_navigation()                              # tail the sparse sky feed (overlay)
         # Auto-switch the main pane to follow the active tracking source (as if its ^ button were pressed):
         # only when the *previously* active cam is the one currently in the big pane, so manual choices hold.
         tr = (st or {}).get('track_role')
@@ -1760,6 +1898,10 @@ def main(argv=None):
             bx, by = (list(st['boresight_mrad']) + [0.0, 0.0])[:2]
             _bore_set(bx, by, send=False)              # reflect the backend's value; don't echo it back
             ctrl['bore_init'] = True
+
+        if 'align_init' not in ctrl and st and st.get('align_yaw_deg') is not None:
+            _align_set(st['align_yaw_deg'], send=False)
+            ctrl['align_init'] = True
 
         # Restored layout had Dbg on but the detectors aren't writing debug streams: sync once.
         if 'dbg_init' not in ctrl and st is not None:
@@ -2097,6 +2239,28 @@ def main(argv=None):
                         else:
                             s_ = boresight_ui['step']
                             _bore_set(boresight_ui['x'] + dx * s_, boresight_ui['y'] + dy * s_)
+            imgui.tree_pop()
+        imgui.separator()
+        if imgui.tree_node_ex("Alignment"):
+            imgui.text("Yaw offset:")
+            _tip("Manual mount alignment: degrees added to the encoder azimuth when projecting "
+                 "the sky onto the cameras. Tweak until the gold star overlay sits on the real "
+                 "stars, then the satellite pass line is where the satellite will actually fly. "
+                 "(No plate solving yet -- this is the rudimentary version.)")
+            imgui.same_line()
+
+            def _commit_align(txt):
+                _align_set(_flt(txt, align_ui['yaw']))
+                return ui['txt']['align_yaw']
+            _input_commit('align_yaw', S(64), _commit_align)
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "deg")
+            for label, delta in (('<<', -1.0), ('<', -0.1), ('>', +0.1), ('>>', +1.0)):
+                if label != '<<':
+                    imgui.same_line()
+                if imgui.button(f"  {label}  ##align_nudge{delta}"):
+                    _align_set(align_ui['yaw'] + delta)
+                _tip(f"Nudge the yaw offset by {delta:+g} deg.")
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Focus"):          # focus + collimation assist (see astrolock.seeker.focus)

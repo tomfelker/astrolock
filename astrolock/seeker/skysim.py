@@ -84,6 +84,29 @@ def _enu(az, alt):
     return torch.stack([ca * torch.sin(az), ca * torch.cos(az), torch.sin(alt)], dim=-1)
 
 
+def project_dirs(dirs, az_rad, alt_rad, f_px, cx, cy):
+    """
+    Gnomonic (pinhole) projection of ENU unit directions onto an ideal upright alt-az
+    camera at (az_rad, alt_rad) -- the same math SkySim.render uses (boresight_basis with
+    zero tripod tilt / roll / offsets), shared so overlays land exactly where the sim
+    renders. ``dirs`` is (N, 3) torch; returns (px, py, in_front) each (N,), where
+    ``in_front`` marks directions on the camera side of the tangent plane (project only
+    those -- behind-the-camera points blow up through the gnomonic pole).
+    """
+    az = torch.as_tensor(az_rad, dtype=torch.float32)
+    alt = torch.as_tensor(alt_rad, dtype=torch.float32)
+    b = _enu(az, alt)                                         # boresight
+    A = torch.stack([torch.cos(az), -torch.sin(az), torch.zeros_like(az)], dim=-1)   # image right
+    L = torch.stack([-torch.sin(alt) * torch.sin(az),                                 # image up
+                     -torch.sin(alt) * torch.cos(az), torch.cos(alt)], dim=-1)
+    denom = dirs @ b
+    in_front = denom > 0.05                                   # a hair inside the tangent hemisphere
+    safe = torch.where(in_front, denom, torch.ones_like(denom))
+    px = cx + f_px * (dirs @ A) / safe
+    py = cy - f_px * (dirs @ L) / safe
+    return px, py, in_front
+
+
 def _render_tail(fb, noise, bg_e, read_var, adu_per_e, adu_max):
     """The render's elementwise tail: add the sky background, apply signal-dependent shot noise + read
     noise (unit-normal field * per-pixel std sqrt(signal + read^2) -- the Poisson->Gaussian approx), and

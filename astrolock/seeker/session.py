@@ -24,24 +24,34 @@ _EPOCH_OFFSET_NS = 3_000_000_000 * 1_000_000_000
 
 def parent_lifeline():
     """
-    Orphan prevention (the recorder's 'NOBODY EVER KILLS US' pattern, generalized): the
-    backend spawns every child with stdin=PIPE and never writes to it. The OS closes that
-    pipe when the backend dies -- cleanly, by crash, or by hard kill alike -- so a child
+    Orphan prevention (the recorder's 'NOBODY EVER KILLS US' pattern, generalized): a
+    parent spawns its children with stdin=PIPE and never writes to it. The OS closes that
+    pipe when the parent dies -- cleanly, by crash, or by hard kill alike -- so a child
     that watches its stdin for EOF can never be orphaned. Returns a threading.Event that
     is set on EOF; long-running loops check it beside their usual stop conditions.
 
-    Harmless in standalone/interactive runs: stdin is a console there, the watcher thread
-    just blocks forever (daemon, dies with the process), and the event stays unset.
+    ARMS ONLY WHEN STDIN IS AN ACTUAL PIPE: an interactive console, a redirected file, or
+    NUL never trigger it (the event just stays unset forever), so standalone runs behave
+    exactly as before. The backend itself calls this too -- a test harness or supervisor
+    that spawns the backend with a pipe takes the WHOLE tree down even if it crashes
+    without cleanup (a crashed harness abandoning a LIVE backend was the one orphan case
+    the child lifelines could not cover: nothing had died).
     """
+    import stat
+    import sys
     dead = threading.Event()
+    try:
+        if not stat.S_ISFIFO(os.fstat(sys.stdin.fileno()).st_mode):
+            return dead                        # console/file/NUL stdin: never armed
+    except (OSError, ValueError, AttributeError):
+        return dead                            # no usable stdin at all: never armed
 
     def _watch():
-        import sys
         try:
             while sys.stdin.readline():        # nobody writes; a line is ignored, EOF = parent gone
                 pass
         except Exception:
-            pass                               # stdin closed/invalid counts as "parent gone" too
+            pass                               # stdin torn down counts as "parent gone" too
         dead.set()
 
     threading.Thread(target=_watch, daemon=True).start()

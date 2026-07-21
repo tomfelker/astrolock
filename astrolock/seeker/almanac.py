@@ -13,9 +13,10 @@ lerp over (target, fix) tensors.
 Design (two structures, one job each):
   - the unbounded source of truth is a per-target Python list of fixes -- it never discards a fix it
     might still need. Eviction is by *age*, not count: we keep the "floor" fix (newest with
-    time <= the last query) and everything after it, dropping strictly older ones, so a re-query at
-    the last time still lands inside a real segment. This makes retention independent of how far ahead
-    the producer publishes -- no ring size to agree on across processes.
+    time <= the OLDEST time of the last query batch) and everything after it, dropping strictly older
+    ones, so a re-query at that time still lands inside a real segment -- and a batch that also looks
+    into the future (the GUI's satellite pass line) can't evict the present. This makes retention
+    independent of how far ahead the producer publishes -- no ring size to agree on across processes.
   - a dense torch tensor is a *derived cache* for the batched lerp; its width is data-driven (the max
     fixes-in-window across targets, grown in steps), not a fixed tunable.
 
@@ -154,7 +155,12 @@ class SkyAlmanac:
         """Interpolated unit directions at query times ``t_ns`` (shape (S,), int64 ns).
         Returns (dirs (T, S, 3), mags (T,)). One batched piecewise-linear lerp over all targets."""
         t_ns = t_ns.to(torch.int64).view(-1)
-        self._last_q = int(t_ns.max())
+        # Retention keys to the OLDEST query time in the batch: that's the earliest time a
+        # consumer might still re-ask about. Keying to the newest was fine when consumers
+        # only queried 'now', but a batch that looks into the FUTURE (the GUI's satellite
+        # pass line, +10 min) would evict every current fix -- stars then clamp to stale
+        # anchors and the track loses its geometry.
+        self._last_q = int(t_ns.min())
         self._flush()
         T = self._times.shape[0]
         if T == 0:

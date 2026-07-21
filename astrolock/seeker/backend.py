@@ -278,6 +278,10 @@ def main(argv=None):
                         "cam. Tune live in the GUI (Boresight).")
     p.add_argument('--boresight-y-mrad', type=float, default=0.0,
                    help="boresight Y offset (mrad, guide image down)")
+    p.add_argument('--align-yaw-deg', type=float, default=0.0,
+                   help="mount alignment: azimuth (yaw) offset added to the encoder azimuth when "
+                        "mapping sky to camera -- rudimentary manual alignment, tuned live in the "
+                        "GUI (Alignment) until the star overlay sits on the real stars")
     p.add_argument('--track-debug', action='store_true',
                    help="print per-frame commanded vs measured axis rates and target offset")
     p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
@@ -375,6 +379,7 @@ def main(argv=None):
     mounts_available = mount_mod.available_mount_urls()     # detected Celestron COM ports (GUI chooser)
 
     almanac_path = os.path.join(session_dir, f"{ts}_almanac.jsonl")       # sky_sim publishes here
+    navigation_path = os.path.join(session_dir, f"{ts}_navigation.jsonl")  # sparse feed (GUI overlay)
     # Sky *positions* come from the shared sky_sim almanac (one propagator, one system clock) -- not
     # from each cam, which used to drift apart. The follow flag (which mount trajectory to render
     # from) is added per-launch by sky_follow_flag(), so switching mounts in the GUI re-points them.
@@ -430,6 +435,7 @@ def main(argv=None):
     # Boresight: where the main cam points relative to the guide, as an image-frame angular offset
     # (x right, y down), radians. Offsets the guide tracker's hold point so the target lands in the main.
     boresight = {'x': args.boresight_x_mrad * 1e-3, 'y': args.boresight_y_mrad * 1e-3}
+    alignment = {'yaw_deg': args.align_yaw_deg}    # backend-owned so future pointing math inherits it
     rad_per_px = (math.radians(args.arcsec_per_px / 3600.0) if args.arcsec_per_px > 0
                   else args.sky_pixel_um * 1e-3 / args.sky_focal_mm)
     # Per-role plate scale from the optics DB if a sensor+optic is named for that role; else the
@@ -803,7 +809,8 @@ def main(argv=None):
             skysim.ensure_cache()
         except Exception as e:
             print(f"[backend] ephemeris pre-warm skipped: {e}", flush=True)
-        ss_args = ['--out', almanac_path, '--lat', str(msite['lat_deg']),
+        ss_args = ['--out', almanac_path, '--nav-out', navigation_path,
+                   '--lat', str(msite['lat_deg']),
                    '--lon', str(msite['lon_deg']), '--elev', str(msite['elev_m']),
                    '--epoch', str(msite['epoch_utc']), '--stop-file', stop_file]
         if args.sky_tle_file:
@@ -1173,6 +1180,9 @@ def main(argv=None):
                         print(f"[backend] track {role}: {ln}", flush=True)
                     for w in warns:
                         print(f"[backend] WARNING (track {role}): {w}", flush=True)
+        elif t == 'set_alignment':
+            alignment['yaw_deg'] = float(cmd.get('yaw_deg', 0.0))
+            print(f"[backend] alignment yaw -> {alignment['yaw_deg']:+.3f} deg", flush=True)
         elif t == 'set_boresight':
             boresight['x'] = float(cmd.get('x_mrad', 0.0)) * 1e-3
             boresight['y'] = float(cmd.get('y_mrad', 0.0)) * 1e-3
@@ -1422,9 +1432,13 @@ def main(argv=None):
     last_cleanup = start
     handoff_last = start          # for the handoff integrator's real-time dt (framerate-independent)
     clean = False
-    try:
+    parent_dead = session_mod.parent_lifeline()   # armed only when a supervisor/test gave us a
+    try:                                          # stdin pipe; interactive runs are never armed
         while True:
             time.sleep(0.05)                      # ~20 Hz control loop
+            if parent_dead.is_set():
+                print("[backend] parent gone; stopping", flush=True)
+                break
             for fo_ in followers.values():
                 fo_.poll()                        # keeps each follower's header/meta loaded -- the
                                                   # 'track' path NEEDS them (plate scale, binning) and
@@ -1606,6 +1620,7 @@ def main(argv=None):
                 'detectors': {r: {'detector': detector_sel[r], 'track': track_det_sel[r]}
                               for r in roles},               # for the GUI Detection tab
                 'boresight_mrad': [round(boresight['x'] * 1e3, 4), round(boresight['y'] * 1e3, 4)],
+                'align_yaw_deg': round(alignment['yaw_deg'], 4),   # manual alignment (GUI overlay)
             })
 
             # Per-second health line -- commented out so stdout carries only rare events. Uncomment
