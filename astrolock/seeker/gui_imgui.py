@@ -540,7 +540,6 @@ def main(argv=None):
                   'sweep_step': f"{sweep_ui['step']:g}",
                   'settings_name': ''},
           'src': {},                                      # role -> unified source dropdown value
-          'rec': {r: False for r in roles}, 'autorec': {r: False for r in roles},
           'pb_loop': {r: True for r in roles}, 'pb_dlg': None,     # (role, pfd.open_file) in flight
           'mount_sel': 'sim',
           'opt': {r: {'sensor': '', 'optic': '', 'reducer': '(none)'} for r in roles},
@@ -1882,12 +1881,7 @@ def main(argv=None):
             layout['big_role'] = tr
         ctrl['prev_track_role'] = tr
 
-        rec_st = (st or {}).get('recording') or {}     # per-role: {role: bool}
-        src_st = (st or {}).get('sources') or {}
-        tracking_st = bool((st or {}).get('tracking'))
-        rec_sent = ctrl.setdefault('rec_sent', {})
         src_init = ctrl.setdefault('src_init', set())
-        src_last = ctrl.setdefault('src_last', {})
         for role in roles:
             if st is None:
                 continue
@@ -1896,25 +1890,14 @@ def main(argv=None):
             if role not in src_init and uval:
                 ui['src'][role] = uval
                 src_init.add(role)
-            # Auto-record follows the source: switching TO a zwo (real) cam turns it on; first sight of a
-            # sim cam leaves it off. Otherwise it's the user's to toggle.
-            cur_src = src_st.get(role)
-            if cur_src and cur_src != src_last.get(role):
-                if cur_src == 'zwo':
-                    ui['autorec'][role] = True
-                elif role not in src_last:
-                    ui['autorec'][role] = False
-                src_last[role] = cur_src
             # Playback loop checkbox: one-time init from state.
             pb = ((st or {}).get('playback') or {}).get(role) or {}
             if role not in ctrl.setdefault('pbloop_init', set()) and pb:
                 ui['pb_loop'][role] = bool(pb.get('loop', True))
                 ctrl['pbloop_init'].add(role)
-            # Recording = the manual box OR (Auto-record AND tracking), per camera.
-            want_rec = bool(ui['rec'][role]) or (bool(ui['autorec'][role]) and tracking_st)
-            if want_rec != bool(rec_st.get(role)) and want_rec != rec_sent.get(role):
-                _send({'type': 'record', 'role': role, 'on': want_rec})
-                rec_sent[role] = want_rec
+            # Recording has NO logic here: policy (manual / record-while-tracking) lives in
+            # the backend, which reconciles it against reality every tick. The checkboxes in
+            # _panel_camera render the backend's flags and send plain toggles.
 
         # One-time init of the Optics tab dropdowns from the backend's current selection.
         opt_sel = (st or {}).get('optics_sel') or {}
@@ -2050,17 +2033,24 @@ def main(argv=None):
                 _send({'type': 'set_playback', 'role': role, 'loop': v})
             _tip("Loop the recording instead of stopping at the end.")
         _panel_cam_controls(role, ((st or {}).get('camera_caps') or {}).get(role))
-        ch, v = imgui.checkbox(f"Record now##rec_{role}", ui['rec'][role])
+        # Recording checkboxes render the BACKEND'S policy flags and send plain toggles; the
+        # backend computes desire (manual or auto-and-tracking) and keeps a recorder process
+        # matching it every tick -- so a dead recorder is its problem to fix, never ours to
+        # have silently latched over (the missed-ISS-pass bug).
+        ch, v = imgui.checkbox(f"Record now##rec_{role}",
+                               bool(((st or {}).get('record_manual') or {}).get(role)))
         if ch:
-            ui['rec'][role] = v
+            _send({'type': 'record', 'role': role, 'manual': v})
         _tip("Archive this camera's frames: a recorder process tails the shared-memory ring and "
              "writes every frame to a .ser in the recordings dir at drive pace (the camera never "
              "touches the disk). Uncheck to finalize the file.")
-        ch, v = imgui.checkbox(f"Auto record##autorec_{role}", ui['autorec'][role])
+        ch, v = imgui.checkbox(f"Auto record##autorec_{role}",
+                               bool(((st or {}).get('record_auto') or {}).get(role)))
         if ch:
-            ui['autorec'][role] = v
+            _send({'type': 'record', 'role': role, 'auto': v})
         _tip("Record this camera automatically whenever tracking is engaged (same recorder as "
-             "Record now; the file finalizes when the lock drops).")
+             "Record now; the file finalizes when the lock drops). Turns itself on when you "
+             "switch this role to a real camera.")
         ch, v = imgui.checkbox(f"Reticles##ret_{role}", sset['reticles'])
         if ch:
             sset['reticles'] = v

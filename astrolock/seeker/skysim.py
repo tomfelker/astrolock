@@ -457,6 +457,8 @@ class SkySim:
                                torch.tensor(self.read_noise_e ** 2, dtype=torch.float32, device=dev),
                                torch.tensor(self.adu_per_e * self.gain_mult, dtype=torch.float32, device=dev),
                                torch.tensor(self.adu_max, dtype=torch.float32, device=dev))
+        # Return TORCH (on the render device): callers may still upscale/crop; converting to
+        # numpy is the CALLER'S egress step (the shm write), per the one-array-library rule.
         if c.adc_bits <= 8:
-            return adu.cpu().numpy().astype(np.uint8)         # 8-bit container (RAW8-equivalent)
-        return (adu << (16 - c.adc_bits)).cpu().numpy().astype(np.uint16)   # left-justify into 16 bits
+            return adu.to(torch.uint8)                        # 8-bit container (RAW8-equivalent)
+        return (adu << (16 - c.adc_bits)).to(torch.uint16)    # left-justify into 16 bits

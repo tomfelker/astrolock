@@ -163,10 +163,11 @@ def main(argv=None):
                         "tracker NORMAL; idle detectors/focus BELOW_NORMAL; sim/playback cams IDLE -- "
                         "plus reserved cores per real cam (see --reserve-cores).")
     p.add_argument('--reserve-cores', default='auto',
-                   help="dedicated CPU cores per real cam: 'auto' (top physical core pair per role, if "
-                        "enough cores), 'off', or explicit 'main=14,15;guide=12,13' (use explicit ids "
-                        "on hybrid P/E-core CPUs). The backend keeps itself and all other children off "
-                        "these cores; the cam process pins onto them.")
+                   help="dedicated CPU cores per real cam: 'auto' (top TWO physical cores per role -- "
+                        "capture loop + the SDK's USB threads -- if enough cores), 'off', or explicit "
+                        "'main=12,13,14,15;guide=8,9,10,11' (use explicit ids on hybrid P/E-core "
+                        "CPUs). The backend keeps itself and all other children off these cores; the "
+                        "cam process pins onto them.")
     p.add_argument('--bit-depth', type=int, default=16, choices=[8, 16],
                    help="capture container depth: 8 = RAW8 (half the USB bytes/frame -> higher fps), "
                         "16 = full precision (12-bit ASI / 12-bit sim). Per-role, relaunch on change.")
@@ -435,12 +436,45 @@ def main(argv=None):
     # the GUI. Seeded from the launch args; launch_cam builds the per-role --playback-* flags.
     playback_by_role = {role: {'ser': args.playback_ser, 'loop': bool(args.playback_loop)} for role in roles}
     estop = False
-    recording = {role: False for role in roles}   # per-role: a recorder process is running
-    rec_procs = {}                                # role -> recorder subprocess
+    # Recording POLICY lives here, not in the GUI: a manual flag per role, plus record-while-
+    # tracking ('auto'). Every control-loop tick computes desire = manual or (auto and
+    # tracking), gated on the cam actually being connected, and RECONCILES it against reality:
+    # a wanted-but-missing recorder is spawned (however its predecessor died -- cam relaunch
+    # ending its stream, a crash, a failed spawn), an unwanted one is stopped. The GUI merely
+    # renders these flags and sends toggles -- it can be closed, wedged, or plain wrong without
+    # recording being affected (the missed-ISS-pass bug was GUI-side edge-triggering that
+    # latched shut after one recorder death).
+    record_manual = {role: False for role in roles}
+    record_auto = {role: args.source == 'zwo' for role in roles}   # real cam: on by default
+    record_desired_prev = {role: False for role in roles}
+    recorder_processes = {}                       # role -> the recorder we're managing
+    recorder_spawned_s = {}                       # role -> last spawn time (crash-loop brake;
+    stopped_recorders = []                        # cleared whenever recording isn't wanted)
+                                                  # ^ forgotten-on-stop handles, kept ONLY so
+                                                  #   shutdown can wait out their final flush
 
     def _recorder_alive(role):
-        pr = rec_procs.get(role)
-        return pr is not None and pr.poll() is None
+        process = recorder_processes.get(role)
+        return process is not None and process.poll() is None
+
+    def start_recorder(role, resume=False):
+        """Spawn a recorder for `role`. We hold its stdin: 'stop' is a line on it, and if WE
+        die the pipe closes and the recorder freezes+flushes+exits on its own. Nobody is ever
+        killed; it also self-exits when its stream ends. ``resume`` (a relaunch, not a fresh
+        click) starts from the ring's oldest available frame instead of 'now' -- the ring
+        bridges the predecessor's death with no gap."""
+        old = recorder_processes.get(role)
+        if old is not None and old.stdin is not None:
+            try:
+                old.stdin.close()                  # dead predecessor: drop our end of its pipe
+            except OSError:
+                pass
+        recorder_spawned_s[role] = session_mod.mono_s()
+        recorder_processes[role] = subprocess.Popen(
+            [sys.executable, '-m', 'astrolock.seeker.recorder',
+             '--session', session_dir, '--role', role,
+             '--out-dir', args.recordings_dir] + (['--resume'] if resume else []),
+            stdin=subprocess.PIPE)
     gui_quit = False        # set when the GUI tells us it's closing (faster than watching it exit)
 
     # Auto-tracking state (sky-space closed loop).
@@ -599,7 +633,9 @@ def main(argv=None):
     if args.sched == 'auto' and args.reserve_cores != 'off':
         ncpu = os.cpu_count() or 0
         if args.reserve_cores == 'auto':
-            per = 2                                       # one physical core = both SMT siblings
+            per = 4                                       # TWO physical cores (all 4 SMT siblings):
+            # the capture loop gets one and the ZWO SDK's USB transfer threads get the other --
+            # on a single shared core the loop's wait starved the very threads moving the frames.
             if ncpu >= 4 + per * len(roles):              # keep >= 4 cores for everything else
                 for i, role in enumerate(roles):
                     top = ncpu - i * per
@@ -1043,8 +1079,8 @@ def main(argv=None):
             return
         real = {r for r in roles if sources[r] == 'zwo'}
         trk = track_role if (tracking and track_role in detect_roles) else None
-        hero = trk if trk in real else next((r for r in roles if recording.get(r) and r in real),
-                                            None)
+        hero = trk if trk in real else next(
+            (r for r in roles if record_desired_prev.get(r) and r in real), None)
         key = (hero, trk, tuple(sorted(real)),
                tuple(sorted((r, p.pid) for r, p in cam_procs.items() if p.poll() is None)),
                tuple(sorted((r, p.pid) for r, p in detect_procs.items() if p.poll() is None)))
@@ -1138,7 +1174,7 @@ def main(argv=None):
         print("[backend] mount disconnected", flush=True)
 
     def apply_command(cmd):
-        nonlocal estop, recording, tracking, coasting, track_role, tracker, track_seen_det, gui_quit
+        nonlocal estop, tracking, coasting, track_role, tracker, track_seen_det, gui_quit
         nonlocal track_center, mount_desired_url, follow_enabled, track_primary, handoff_fine, handoff_conf
         nonlocal track_pref, focus_proc, focus_role, track_delay_s, track_started_t
         nonlocal utc_offset_ns, gps_status
@@ -1328,30 +1364,20 @@ def main(argv=None):
                 stop_sweep()
                 print("[backend] focus sweep aborted", flush=True)
         elif t == 'record':
-            # Recording is a separate PROCESS per role (astrolock.seeker.recorder): it tails the
-            # role's shm stream and archives every frame to recordings/ at drive pace -- the cam
-            # never touches the disk, and the held shm sections are the write-behind buffer. The
-            # cam process isn't told anything; there is no 'important' concept anymore.
-            on = bool(cmd.get('on', False))
+            # Sets recording POLICY flags; the control loop makes them real (see record_manual
+            # at the top of run()). Recording itself is a separate PROCESS per role
+            # (astrolock.seeker.recorder): it tails the role's shm stream and archives every
+            # frame to recordings/ at drive pace -- the cam never touches the disk, and the
+            # held shm sections are the write-behind buffer.
             r = cmd.get('role')
             targets = [r] if r in roles else roles    # a named role, else all (back-compat)
             for role in targets:
-                if on and not _recorder_alive(role):
-                    # We hold the recorder's stdin: 'stop' is a line on it, and if WE die the
-                    # pipe closes and the recorder freezes+flushes+exits on its own. Nobody is
-                    # ever killed; it also self-exits at the stream's 'ended' record.
-                    rec_procs[role] = subprocess.Popen(
-                        [sys.executable, '-m', 'astrolock.seeker.recorder',
-                         '--session', session_dir, '--role', role,
-                         '--out-dir', args.recordings_dir],
-                        stdin=subprocess.PIPE)
-                elif not on and _recorder_alive(role):
-                    try:
-                        rec_procs[role].stdin.close()     # freeze + flush + exit
-                    except OSError:
-                        pass
-                recording[role] = on
-            print(f"[backend] recording {'ON' if on else 'off'} for {', '.join(targets)}", flush=True)
+                if 'manual' in cmd or 'on' in cmd:    # 'on' = the legacy name for manual
+                    record_manual[role] = bool(cmd.get('manual', cmd.get('on')))
+                if 'auto' in cmd:
+                    record_auto[role] = bool(cmd.get('auto'))
+                print(f"[backend] record policy for {role}: manual={record_manual[role]} "
+                      f"auto(while tracking)={record_auto[role]}", flush=True)
         elif t == 'capture':
             role = cmd.get('role')
             if role in roles:
@@ -1366,7 +1392,9 @@ def main(argv=None):
             role = cmd.get('role')
             src = cmd.get('source')
             if role in roles and src in ('synthetic', 'zwo', 'sky', 'playback'):
-                sources[role] = src
+                if src == 'zwo' and sources[role] != 'zwo':
+                    record_auto[role] = True       # switching TO a real camera: record passes
+                sources[role] = src                # by default (toggle off in the GUI if not)
                 # Don't jump the gun: a driver change never auto-connects. Stop any running cam and
                 # wait for an explicit Connect, so the user can pick which camera first -- two roles
                 # both left on '(auto)' zwo would otherwise open one camera twice and wedge the USB bus.
@@ -1573,6 +1601,42 @@ def main(argv=None):
                           f"{_ti['epoch_utc']:%Y-%m-%d}); respawning sky_sim", flush=True)
                     ensure_sky_sim(restart=True)
             update_detections()
+            # Recording reconciliation (policy lives at record_manual/_auto): every tick, per
+            # camera: want recording and no recorder -> start one; don't want it but have one
+            # -> close its pipe and forget it. One brake: never spawn within 2 s of the last
+            # spawn for that camera -- so a crash-looper isn't respawned every frame, while a
+            # recorder that dies after a healthy run (its stream ended at a cam relaunch) is
+            # replaced THE TICK its death is seen. Not wanting recording clears the brake, so
+            # a fresh turn-on always starts immediately. A fresh turn-on records from 'now'
+            # (the click); a relaunch resumes from the ring's oldest frame (no gap). Spawns
+            # also wait for the cam to be connected (no churn against a missing stream).
+            for role in roles:
+                desired = record_manual[role] or (record_auto[role] and tracking)
+                turned = desired != record_desired_prev[role]
+                if turned:
+                    record_desired_prev[role] = desired
+                    print(f"[backend] recording {'ON' if desired else 'off'} for {role}",
+                          flush=True)
+                if desired:
+                    if (not _recorder_alive(role) and is_connected(role)
+                            and now - recorder_spawned_s.get(role, 0.0) >= 2.0):
+                        if not turned:
+                            print(f"[backend] recorder for {role} exited while recording is ON "
+                                  f"(stream ended or crashed); relaunching, resuming from the "
+                                  f"ring", flush=True)
+                        start_recorder(role, resume=not turned)
+                else:
+                    recorder_spawned_s.pop(role, None)     # clear the brake for the next click
+                    process = recorder_processes.pop(role, None)
+                    if process is not None:
+                        if process.stdin is not None:
+                            try:
+                                process.stdin.close()      # freeze + flush + exit
+                            except OSError:
+                                pass
+                        stopped_recorders.append(process)  # shutdown waits out its flush
+                        stopped_recorders[:] = [p for p in stopped_recorders
+                                                if p.poll() is None]
             for role in roles:
                 read_caps(role)                        # pick up each cam's live-control descriptors
 
@@ -1699,6 +1763,9 @@ def main(argv=None):
                 'rate_az_deg_s': round(math.degrees(st['rate_az_rad_s']), 4),
                 'rate_alt_deg_s': round(math.degrees(st['rate_alt_rad_s']), 4),
                 'recording': {r: _recorder_alive(r) for r in roles},   # recorder process alive
+                'recording_desired': dict(record_desired_prev),   # what the loop is enforcing
+                'record_manual': dict(record_manual),   # policy flags (GUI checkboxes render
+                'record_auto': dict(record_auto),       # these; the backend owns them)
                 'tracking': tracking,                   # "locked": the tracker has a target
                 'following': bool(tracking and follow_enabled and delay_left <= 0),   # actively slewing
                 'follow_enabled': follow_enabled,       # the persistent user intent (GUI checkbox)
@@ -1812,7 +1879,8 @@ def main(argv=None):
         # (4K) detect that misses the graceful window used to leave whole sessions behind on exit.
         _step('reap children', lambda: _reap(list(cam_procs.values()) + list(detect_procs.values())
                                              + [focus_proc, sweep_proc, gui_proc, sky_sim_proc]))
-        _step('reap recorders', lambda: _reap(list(rec_procs.values()), graceful_s=300.0))
+        _step('reap recorders', lambda: _reap(list(recorder_processes.values())
+                                              + stopped_recorders, graceful_s=300.0))
 
         _cleanup(session_dir, keep=args.keep, clean=clean)
         print("[backend] done", flush=True)

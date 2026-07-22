@@ -310,6 +310,12 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
     timeout_ms = max(1000, (auto_max_exp_ms if auto else exposure_us // 1000) + 2000)
 
     def capture():
+        # ASIGetVideoData BUSY-POLLS while it waits (measured live: the waiting thread burns
+        # a full hyperthread inside the call), and timeout=0 does NOT mean 'return
+        # immediately' -- measured live too: the call blocks (and spins) all the same, so
+        # the SDK offers no non-blocking mode to build a gentle poll on. Keep the bounded
+        # blocking call; the spin is contained instead by --reserve-cores giving each real
+        # cam TWO physical cores, so the SDK's USB threads never share a core with the wait.
         try:
             f = cam.capture_video_frame(timeout=timeout_ms)
         except z.ZWO_IOError:
@@ -559,10 +565,15 @@ def _open_sky(args, state_path=None, mount_path=None):
         almanac.update()
         dirs, mags = almanac.dirs_at(sub_t)
         frame = sim.render(az, alt, pose['raz'], pose['ralt'], dirs, mags, exposure_s=exp, substeps=S)
-        if ds > 1:                              # publish at full size (nearest keeps ADU values exact)
-            dt0 = frame.dtype
-            frame = torch.nn.functional.interpolate(
-                frame[None, None].to(torch.float32), size=(pub_h, pub_w), mode='nearest')[0, 0].to(dt0)
+        if ds > 1:                              # publish at full size, like a real camera whose
+            # output size is set by its arguments: INTEGER pixel replication (ADU values exact,
+            # no interpolation), edge rows/cols replicated when the size doesn't divide evenly.
+            frame = frame.repeat_interleave(ds, 0).repeat_interleave(ds, 1)
+            if frame.shape[1] < pub_w:
+                frame = torch.cat([frame, frame[:, -1:].expand(-1, pub_w - frame.shape[1])], 1)
+            if frame.shape[0] < pub_h:
+                frame = torch.cat([frame, frame[-1:, :].expand(pub_h - frame.shape[0], -1)], 0)
+        frame = frame.cpu().numpy()             # egress: the shm ring write is the numpy edge
         _bw_wait()                              # the data link caps delivery rate, whatever the exposure
         # (frame, stamp, available-at): the sim renders in ~zero wall-clock, but a real camera can't
         # deliver a frame until the exposure ends. Stamp at the exposure midpoint (best time to

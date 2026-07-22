@@ -223,3 +223,36 @@ Came back out later in the night, with the shared memory fixes:
 - Too hard to find the main vs guide cameras - need dividers, some minor UI design stuff
 - seeing was just so horrible
 - ended up leaving the scope and cameras outside, screw the dew, yolo.  zzz
+
+2026-07-18
+
+- after showing off the telescope to my friend, it was handy and there was a decent Tiangong pass, so tried to capture it - but...
+- didn't set up early enough, and ran into a few problems:
+- I tripped on a cord, pulling it out of the hand controller, and didn't notice, so thought I had a driver issue with the com port not showing up - rebooted - finally figured it out, but lost a few minutes
+- because of this, didn't even have the main scope focused in time for the pass
+- also, a recent 'hey claude please clean stuff up' led to it making a bug where it couldn't actually handle the click on the guide scope window, so it wouldn't have worked anyway.  syncing back was fine, and it figured it out.  I guess one needs better testing for all this, and earlier setup.
+- worse still - it seems I broke the USB-micro connector off the hand controller board :-/
+- the focus detector seems to lag - it ought to be grabbing latest, not next frames
+- with the broken hand controller, still tried some stuff
+- boresight is still pretty bad even after fixing the dovetail
+- using rifle scope was necessary - it's much better than red dot for this purpose
+- collimation thing kinda worked - focus is still very finicky though.
+- should fix the crosshairs in the focus cam thing - need two crosshairs, and need collimation to be a circle not a dot so you can see the shape of the psf
+- should do color display, now that we have it - shader magic I guess.  not sure if focus should though
+
+2026-07-21
+- gotta do better... plan is to look at an ISS and USA 60 pass late tonight, as sort of a test, and then be ready for Friday (2026-07-24) which has an 82 degree ISS pass.  Then, no more for 2 months (I hear it's roughly a 60 day cycle)
+- So - after doing the star thing - will do some tests, but no more major changes.  This is the 0.99 release, after getting some pictures, we'll call it 1.0 and get some press.
+- Also no optical changes to the scope - it's well collimated now (from the other day), so I'll not touch it.  Though it still needs some bugs cleaned off the secondary, and the corrector plate to be cleaned, and maybe one spec to brush off the primary...  for later.
+- Also I'm not sure about the secondary/corrector clocking - years ago I had it off to fix a screw blocking sticker that had fallen on the primary, and may not have put it back right, as I didn't make a mark and had to guess from photos.  So, very interested to detect any astigmatism - but haven't really seen any thus far.
+
+Still having perf issues getting both cameras to run at full framerate...
+Got things dialed in, but couldn't see any planes... boresight is the biggest weak point here
+maybe need spiral search?  Shouldn't be an issue on real stars, but kills it when zeroing on trees.
+planes visible when near south san francisco at 11k feet from shed door
+
+Haha, another learning:  focus between even very distant trees and infinity is so far, that is why I couldn't find the planes.  Even couldn't find the moon it was so far - like 5 turns of main focuser.
+
+OKAY I AM ANNOYED - got all set up, tracked ISS fine - but, Main cam was flashing 'not recording',
+and would not record with checking the Record now box, even tried disconnecting and reconnecting from it
+so I saw it even on my screen, bits on this PC, but it didn't save the darn thing.  Le sigh...

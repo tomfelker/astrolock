@@ -30,7 +30,9 @@ def test_source_projects_to_boresight():
     # a source exactly at the boresight -> image centre
     dirs = b.view(1, 1, 3).contiguous()
     frame = sim.render(enc_az, enc_alt, 0.0, 0.0, dirs, torch.tensor([2.0]), exposure_s=0.2, substeps=1)
-    win = frame[cy - 8:cy + 9, cx - 8:cx + 9]
+    # render returns the torch container dtype (uint16), for which torch implements few
+    # reductions -- widen for the max/argmax analysis here.
+    win = frame[cy - 8:cy + 9, cx - 8:cx + 9].to(torch.int32)
     assert int(win.max()) > 1000, f"no bright peak at boresight: {int(win.max())}"
     ly, lx = np.unravel_index(int(win.argmax()), win.shape)
     assert abs(lx - 8) <= 2 and abs(ly - 8) <= 2, f"boresight peak off-center at ({lx},{ly})"
@@ -39,7 +41,7 @@ def test_source_projects_to_boresight():
     off = math.radians(0.5)
     d2 = (b * math.cos(off) + A * math.sin(off)).view(1, 1, 3).contiguous()
     frame2 = sim.render(enc_az, enc_alt, 0.0, 0.0, d2, torch.tensor([2.0]), exposure_s=0.2, substeps=1)
-    py, px = np.unravel_index(int(frame2.argmax()), frame2.shape)
+    py, px = np.unravel_index(int(frame2.to(torch.int32).argmax()), frame2.shape)
     exp_x = cx + sim.f_px * math.tan(off)
     assert abs(px - exp_x) <= 3, f"off-axis peak at x={px}, expected {exp_x:.1f}"
     assert abs(py - cy) <= 3, f"off-axis peak drifted in y: {py}"

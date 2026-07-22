@@ -11,7 +11,9 @@ dropping frames, up to the ring's whole capacity; beyond that the writer laps us
 is counted explicitly (and a frame overwritten mid-write is detected and un-written).
 
 NOBODY EVER KILLS US. Stop signals:
-  * the stream's ended flag (clean shutdown): drain everything committed, finalize, exit;
+  * the stream's ended flag (the cam stopped or relaunched): drain everything committed,
+    finalize, exit. Continuity across a cam relaunch is the backend's reconciliation loop's
+    job -- it spawns a fresh recorder against the successor stream;
   * a line -- or EOF -- on STDIN (the backend holds our pipe: 'stop recording' is a line, and a
     crashed backend closes the pipe): one final drain pass of what's already committed,
     finalize, exit.
@@ -44,6 +46,10 @@ def main(argv=None):
     p.add_argument('--session', required=True, help="session directory of the live stream")
     p.add_argument('--role', default='main', help="stream to record (guide/main)")
     p.add_argument('--out-dir', default='recordings', help="archive directory (never cleaned up)")
+    p.add_argument('--resume', action='store_true',
+                   help="a reconcile RELAUNCH (predecessor died mid-recording): start from the "
+                        "ring's oldest available frame instead of 'now', so the ring bridges "
+                        "the handover with no gap")
     p.add_argument('--poll', type=float, default=0.02)
     args = p.parse_args(argv)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -59,7 +65,9 @@ def main(argv=None):
     threading.Thread(target=_stdin_watch, daemon=True).start()
 
     fo = framestream.StreamFollower(args.session, args.role)
-    fo.skip_to_latest()                       # record from the CLICK; history is not backlog
+    fo.poll()
+    if not args.resume:
+        fo.skip_to_latest()                   # record from the CLICK; history is not backlog
     base_lost = fo.lost                       # anything before this moment isn't "skipped recording"
 
     out = None
@@ -92,10 +100,14 @@ def main(argv=None):
         wrote = False
         try:
             with rd.view(i) as (rec, frame):           # ZERO-COPY: write() reads the slot in place
-                if out is None or out_geom != frame.shape:
+                # A new file on ANY format change -- shape, mosaic, or bit depth (a bit-depth
+                # switch keeps the shape while changing the sample size; appending those frames
+                # to the old file would corrupt it).
+                geom = (frame.shape, rd.header.color_id, rd.header.pixel_depth_per_plane)
+                if out is None or out_geom != geom:
                     if out is not None:
                         out.close()
-                    out_geom = frame.shape
+                    out_geom = geom
                     # Every output file is named for its FIRST frame's capture time (a
                     # geometry change just starts the next file the same way).
                     t0 = _utc_of(rec) or dt.datetime.now(dt.timezone.utc)
@@ -147,6 +159,11 @@ def main(argv=None):
                     _archive_or_thin(rd, i)
                 break
             if not worked and fo.ended():
+                # The stream ended (cam stopped or relaunched). Finalize and exit -- simple,
+                # testable lifecycle. Continuity across a cam RELAUNCH is the BACKEND'S job:
+                # its reconciliation loop sees a wanted-but-dead recorder and spawns a fresh
+                # one against the successor stream (the missed-ISS-pass bug was that nothing
+                # ever did).
                 break
             if not worked:
                 time.sleep(args.poll)
