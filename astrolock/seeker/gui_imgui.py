@@ -94,9 +94,12 @@ _TRACK_DETECTORS = ['peak', 'matched']
 MAXPIP = 4                       # pool of PIP panes along the bottom; each shows a stream not in the big pane
 
 
-def _default_settings():
+def _default_settings(key=None):
+    # The sky overlay defaults ON for the guide (wide FoV -- it's how you find the pass) and
+    # OFF for the main (narrow FoV, already on target; keeps its pane clean and cheap).
+    main = (key == 'main')
     return {'zoom': 1, 'reticles': True, 'histogram': False, 'wait_for_detector': True,
-            'show_stars': True, 'show_target_names': True, 'show_star_names': False}
+            'show_stars': not main, 'show_target_names': not main, 'show_star_names': False}
 
 
 def _fmt_time_delta(delta_ns):
@@ -621,7 +624,7 @@ def main(argv=None):
         return ['big'] + ((layout.get('pip_slots') or []) if layout['pip_open'] else [])
 
     def _zoom_step(stream, delta):
-        s = view_settings.setdefault(stream, _default_settings())
+        s = view_settings.setdefault(stream, _default_settings(stream))
         i = ZOOM_MULTS.index(s['zoom']) if s['zoom'] in ZOOM_MULTS else ZOOM_MULTS.index(1)
         s['zoom'] = ZOOM_MULTS[max(0, min(len(ZOOM_MULTS) - 1, i + delta))]
 
@@ -735,15 +738,18 @@ def main(argv=None):
     COL_NAV_STAR = (255, 215, 90, 220)      # gold: where the sky model says a star is
     COL_NAV_SAT = (255, 140, 220, 235)      # magenta: the satellite's pass track + position
 
+    # The 10 outline vertices of the star glyph, as (dx, dy) offsets from its centre. Fixed for
+    # the session (S() scales by the startup UI scale), so precompute once instead of 20 trig
+    # calls per star per frame -- the overlay draws ~100 of these each redraw.
+    _STAR_OFF = [((S(8) if k % 2 == 0 else S(3)) * math.cos(-math.pi / 2.0 + k * math.pi / 5.0),
+                  (S(8) if k % 2 == 0 else S(3)) * math.sin(-math.pi / 2.0 + k * math.pi / 5.0))
+                 for k in range(10)]
+
     def _star_glyph(dl, sx, sy, col=COL_NAV_STAR):
         """Five-pointed star outline centred at screen (sx, sy), fixed UI size (not zoomed).
         THE overlay glyph: a star means 'drawn from our alignment + sim time' -- as distinct
         from a box (a detection from the camera) and the pipper circle (a modelled target)."""
-        pts = []
-        for k in range(10):
-            ang = -math.pi / 2.0 + k * math.pi / 5.0
-            rr = S(8) if k % 2 == 0 else S(3)
-            pts.append(imgui.ImVec2(sx + rr * math.cos(ang), sy + rr * math.sin(ang)))
+        pts = [imgui.ImVec2(sx + dx, sy + dy) for dx, dy in _STAR_OFF]
         dl.add_polyline(pts, C(col), 1.5, int(imgui.ImDrawFlags_.closed))
 
     def _green(active, a=210):
@@ -856,7 +862,7 @@ def main(argv=None):
         main-cam FoV centre instead of the frame centre, so a deep guide zoom previews
         what the main cam should be seeing."""
         w, h = cam['w'], cam['h']
-        zoom = view_settings.setdefault(stream, _default_settings())['zoom']
+        zoom = view_settings.setdefault(stream, _default_settings(stream))['zoom']
         scale = _floor_pow2(min(SW / w, SH / h) * 0.95) * zoom
         offx, offy = (SW - w * scale) / 2.0, (SH - h * scale) / 2.0
         if zoom > 1:
@@ -912,7 +918,7 @@ def main(argv=None):
             _draw_placeholder(dl, A, SW, SH, [f"{str(role).capitalize()} Camera", "No Data"])
             return
         w, h = cam['w'], cam['h']
-        sset = view_settings.setdefault(role, _default_settings())
+        sset = view_settings.setdefault(role, _default_settings(role))
         scale, offx, offy = _pane_geom(cam, role, SW, SH)
         dw, dh = w * scale, h * scale
         cx, cy = offx + dw / 2.0, offy + dh / 2.0   # FRAME centre (≠ pane centre when zoom
@@ -1063,61 +1069,70 @@ def main(argv=None):
                 az_nav = az0 + math.radians(stt.get('align_yaw_deg') or 0.0)
                 alt_nav = alt0
                 f_px_nav = (cam['w'] / 2.0) / math.tan(math.radians(fv_nav['fov_x_deg'] / 2.0))
-                has_track = 'sat:track' in nav_ids
-                n_track = 32                      # pass samples, 20 s apart -> ~10 min of track
-                t_q = [t0] + ([t0 + k * 20_000_000_000 for k in range(1, n_track)]
-                              if has_track else [])
-                dirs_nav, _m = nav['alm'].dirs_at(torch_.tensor(t_q, dtype=torch_.int64))
-                pxn, pyn, okn = skysim_.project_dirs(dirs_nav.reshape(-1, 3), az_nav, alt_nav,
-                                                     f_px_nav, cam['w'] / 2.0, cam['h'] / 2.0)
-                K = len(t_q)
-                pxn = pxn.reshape(-1, K).tolist()
-                pyn = pyn.reshape(-1, K).tolist()
-                okn = okn.reshape(-1, K).tolist()
+                cx_nav, cy_nav = cam['w'] / 2.0, cam['h'] / 2.0
+                # Two DIFFERENT kinds of thing, drawn differently:
+                #  - stars / Sun / Moon / planets: look up NOW (t0) in each one's fix list to get
+                #    its current direction -> one glyph. (The satellite is in here too: its 'now'
+                #    glyph.)  One batched lerp over every target at the single time t0.
+                #  - the satellite pass line: the almanac ALREADY holds it as a list of (time,
+                #    dir) fixes -- the fixes ARE the polyline, so just draw them, no lookup and no
+                #    resampling. Past fixes are already evicted at the query floor (~t0), so this
+                #    is now -> horizon. Not worth the complexity to also trim points behind us.
+                now_dirs, _mags = nav['alm'].dirs_at(torch_.tensor([t0], dtype=torch_.int64))
+                now_dirs = now_dirs[:, 0, :]                    # one current direction per target
+                track_index = nav_ids.index('sat:track') if 'sat:track' in nav_ids else -1
+                _track_times, track_dirs = nav['alm'].fixes('sat:track')   # raw pass fixes (points, 3)
+                # Project the glyphs (one per target) and the raw track fixes in ONE call, then split.
+                n_targets = len(nav_ids)
+                all_dirs = (now_dirs if track_dirs is None
+                            else torch_.cat([now_dirs, track_dirs], 0))
+                px, py, ok = skysim_.project_dirs(all_dirs, az_nav, alt_nav,
+                                                  f_px_nav, cx_nav, cy_nav)
+                px, py, ok = px.tolist(), py.tolist(), ok.tolist()
 
-                def NP(x, y):                     # frame coords -> pane: +0.5 because a frame
+                def to_pane(x, y):                # frame coords -> pane: +0.5 because a frame
                     # coordinate is a PIXEL CENTRE (skysim's splat convention) and pixel i
                     # displays spanning [i, i+1) -- at high zoom the half pixel is visible.
                     return A(offx + (x + 0.5) * scale, offy + (y + 0.5) * scale)
 
-                trk = nav_ids.index('sat:track') if has_track else -1
                 show_target_names = sset.get('show_target_names', True)
                 show_star_names = sset.get('show_star_names', False)
 
-                def _nav_label(sx, sy, i_t, col):
-                    nm = nav_names[i_t]
-                    if nm.startswith('star:'):    # no proper name published: fall back to HIP
-                        nm = 'HIP ' + nm[5:]
-                    _text(dl, imgui.ImVec2(sx + S(9), sy - S(16)), nm, S(13), (*col[:3], 210))
+                def _nav_label(sx, sy, target_index, col):
+                    name = nav_names[target_index]
+                    if name.startswith('star:'):  # no proper name published: fall back to HIP
+                        name = 'HIP ' + name[5:]
+                    _text(dl, imgui.ImVec2(sx + S(9), sy - S(16)), name, S(13), (*col[:3], 210))
 
-                for i_t in range(len(nav_ids)):
-                    if i_t == trk or not okn[i_t][0]:
+                for target_index in range(n_targets):   # glyph at each target's current direction
+                    if target_index == track_index or not ok[target_index]:
                         continue
-                    x0, y0 = pxn[i_t][0], pyn[i_t][0]
+                    x0, y0 = px[target_index], py[target_index]
                     if not (-64 <= x0 <= cam['w'] + 64 and -64 <= y0 <= cam['h'] + 64):
                         continue
-                    sx, sy = NP(x0, y0)
+                    sx, sy = to_pane(x0, y0)
                     _star_glyph(dl, sx, sy)
-                    if nav_radius[i_t]:           # sun/moon/planets: the TRUE disc, at scale
-                        r_px = f_px_nav * nav_radius[i_t] * scale
+                    if nav_radius[target_index]:  # sun/moon/planets: the TRUE disc, at scale
+                        r_px = f_px_nav * nav_radius[target_index] * scale
                         if r_px >= 2.0:
                             dl.add_circle(imgui.ImVec2(sx, sy), r_px, C(COL_NAV_STAR), 0, 1.5)
-                    is_star = nav_ids[i_t].startswith('star:')
+                    is_star = nav_ids[target_index].startswith('star:')
                     if (show_star_names if is_star else show_target_names):
-                        _nav_label(sx, sy, i_t, COL_NAV_STAR)
-                if trk >= 0:
-                    for k in range(K - 1):        # the pass line, from 'now' (k=0) forward --
-                        # starting at k=1 left a 20 s gap ahead of the satellite glyph, so the
-                        # line led it and each piece vanished before the satellite crossed it
-                        if okn[trk][k] and okn[trk][k + 1]:
-                            dl.add_line(NP(pxn[trk][k], pyn[trk][k]),
-                                        NP(pxn[trk][k + 1], pyn[trk][k + 1]),
+                        _nav_label(sx, sy, target_index, COL_NAV_STAR)
+                if track_index >= 0 and track_dirs is not None:
+                    # The track fixes were projected right after the glyphs, so slice them back out.
+                    track_px, track_py, track_visible = (px[n_targets:], py[n_targets:],
+                                                         ok[n_targets:])
+                    for point in range(len(track_px) - 1):   # raw pass fixes, drawn segment by segment
+                        if track_visible[point] and track_visible[point + 1]:
+                            dl.add_line(to_pane(track_px[point], track_py[point]),
+                                        to_pane(track_px[point + 1], track_py[point + 1]),
                                         C((*COL_NAV_SAT[:3], 150)), 1.5)
-                    if okn[trk][0]:
-                        sx, sy = NP(pxn[trk][0], pyn[trk][0])
+                    if ok[track_index]:           # 'now' glyph at the satellite's current direction
+                        sx, sy = to_pane(px[track_index], py[track_index])
                         _star_glyph(dl, sx, sy, COL_NAV_SAT)
                         if show_target_names:
-                            _nav_label(sx, sy, trk, COL_NAV_SAT)
+                            _nav_label(sx, sy, track_index, COL_NAV_SAT)
 
         # Clamp box = the visible camera view (image ∩ pane): letterboxed image zoomed out, the pane zoomed in.
         box = (max(0.0, il), max(0.0, it), min(float(SW), ir), min(float(SH), ib))
@@ -1524,7 +1539,7 @@ def main(argv=None):
         return {
             'version': 1,
             'layout': {k: layout[k] for k in ('panel_w', 'pip_h', 'panel_open', 'pip_open', 'pip_debug', 'big_role')},
-            'display': {role: dict(view_settings.get(role, _default_settings())) for role in roles},
+            'display': {role: dict(view_settings.get(role, _default_settings(role))) for role in roles},
             'optics': {
                 'owned': {k: sorted(v) for k, v in owned.items()},
                 'selection': {role: [ui['opt'][role][k] for k in ('sensor', 'optic', 'reducer')]
@@ -1553,7 +1568,7 @@ def main(argv=None):
             if k in layout:
                 layout[k] = v
         for role, s in (data.get('display') or {}).items():
-            vs = view_settings.setdefault(role, _default_settings())
+            vs = view_settings.setdefault(role, _default_settings(role))
             for k in ('zoom', 'reticles', 'histogram', 'wait_for_detector', 'show_stars',
                       'show_target_names', 'show_star_names'):
                 if k in s:
@@ -1998,7 +2013,7 @@ def main(argv=None):
     def _panel_camera(role):
         """One camera's connection/capture/display settings (immediate mode)."""
         st = ctrl['state']
-        sset = view_settings.setdefault(role, _default_settings())
+        sset = view_settings.setdefault(role, _default_settings(role))
         imgui.text("camera:")
         _tip("Where this pane's frames come from: a detected ZWO camera (by model), 'sky' (ISS "
              "simulator), or 'playback' (replay a .ser). Press Rescan after plugging a camera in.")
@@ -2232,8 +2247,8 @@ def main(argv=None):
             if imgui.button("Set Time and Location to Example Pass"):
                 _send({'type': 'set_example_pass'})
             _tip("Jump the Time and Location tabs to the launch-configured example pass "
-                 "(default: the ISS test pass over San Carlos, just rising) -- the sky model "
-                 "re-propagates there.")
+                 "(default: the Friday 2026-07-24 82-deg ISS pass over San Carlos, just rising) -- "
+                 "the sky model re-propagates there.")
             if imgui.button("Connect Sim Mount and Cameras"):
                 _send({'type': 'connect_sim_cams'})
             _tip("Connect the sim mount (if no mount is connected) and sim cameras wherever "

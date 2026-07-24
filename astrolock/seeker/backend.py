@@ -180,9 +180,9 @@ def main(argv=None):
     p.add_argument('--auto', dest='auto', action='store_true', default=True,
                    help="zwo: auto-exposure + auto-gain (default on)")
     p.add_argument('--no-auto', dest='auto', action='store_false', help="zwo: fixed exposure/gain")
-    p.add_argument('--start-az-deg', type=float, default=228.0,
+    p.add_argument('--start-az-deg', type=float, default=307.0,
                    help="sim mount initial az -- roughly (not exactly) at the ISS test target, so "
-                        "acquisition is exercised")
+                        "acquisition is exercised (Friday pass rises ~308.5 deg)")
     p.add_argument('--start-alt-deg', type=float, default=19.5, help="sim mount initial alt")
     p.add_argument('--max-rate-deg-s', type=float, default=3.0,
                    help="max slew rate -- matches the real CPC (~3 deg/s, battery-dependent)")
@@ -195,11 +195,12 @@ def main(argv=None):
     # Default site + the EXAMPLE PASS. The backend starts at the system clock and this site;
     # the GUI's Time/Location tabs change both live, and Simulation > Set Time and Location to
     # Example Pass jumps back to (--lat, --lon, --elev, --epoch) -- so these four args define
-    # YOUR example pass (default: the ISS test pass over San Carlos, just rising).
+    # YOUR example pass (default: the Friday 2026-07-24 82-deg ISS pass over San Carlos,
+    # just rising -- culminates 05:00:11Z at 82.4 deg / az 221; rises 04:56:47Z, sets 05:03:34Z).
     p.add_argument('--lat', type=float, default=37.51089, help="site latitude (deg)")
     p.add_argument('--lon', type=float, default=-122.2719388888889, help="site longitude (deg)")
     p.add_argument('--elev', type=float, default=60.0, help="site elevation (m)")
-    p.add_argument('--epoch', default='2026-07-06T05:22:00Z',
+    p.add_argument('--epoch', default='2026-07-25T04:55:00Z',
                    help="the example pass UTC (also the sim mount's GPS clock epoch)")
     p.add_argument('--mount-accel-deg-s2', type=float, default=20.0, help="sim mount acceleration limit (deg/s^2)")
     p.add_argument('--mount-update-hz', type=float, default=10.0, help="sim mount update rate (Hz)")

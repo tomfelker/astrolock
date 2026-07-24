@@ -213,6 +213,20 @@ class SkyAlmanac:
         d = d / d.norm(dim=-1, keepdim=True).clamp(min=1e-9)
         return d, self._mag_t
 
+    def fixes(self, target_id):
+        """The raw stored fixes for one target as (times_ns (M,), dirs (M, 3)) tensors -- the
+        actual published (time, direction) samples, NOT interpolated. The GUI draws the
+        satellite pass line straight from these: a track is a list of directions you already
+        have, so you just draw them (no time lookup), unlike a star, which needs the current
+        time looked up in its fix list to place its single glyph. Older-than-floor fixes are
+        already evicted by update(), so this is the retained window (~last query time forward).
+        Returns (None, None) when the target is absent or has no fixes."""
+        i = self._index.get(target_id)
+        if i is None or not self._t[i]:
+            return None, None
+        return (torch.tensor(self._t[i], dtype=torch.int64, device=self.device),
+                torch.tensor(self._d[i], dtype=torch.float32, device=self.device))
+
     @property
     def ids(self):
         return list(self._ids)

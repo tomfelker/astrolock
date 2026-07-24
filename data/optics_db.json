@@ -56,7 +56,8 @@
     {"name": "Canon EF-S 18-55mm f/3.5-5.6 IS II @ 18mm", "focal_length_mm": 18, "aperture_mm": 5.1, "source": "Canon T4i kit zoom, wide end (18 mm, f/3.5)"},
     {"name": "Canon EF-S 18-55mm f/3.5-5.6 IS II @ 55mm", "focal_length_mm": 55, "aperture_mm": 9.8, "source": "Canon T4i kit zoom, tele end (55 mm, f/5.6)"},
     {"name": "Canon 50mm f/1.8 (nifty fifty)", "focal_length_mm": 50, "aperture_mm": 27.8, "source": "Canon EF/RF 50mm f/1.8 STM 'nifty fifty' prime"},
-    {"name": "7artisans 25mm f/0.95 APS-C", "focal_length_mm": 25, "aperture_mm": 26.3, "source": "7artisans 25mm f/0.95 APS-C manual large-aperture prime"}
+    {"name": "7artisans 25mm f/0.95 APS-C", "focal_length_mm": 25, "aperture_mm": 26.3, "source": "7artisans 25mm f/0.95 APS-C manual large-aperture prime"},
+    {"name": "25mm CCTV f/1.4 C-mount", "focal_length_mm": 25, "aperture_mm": 17.9, "source": "cheap 25mm f/1.4 CCTV C-mount lens (~19.6 deg diagonal FoV rating); aperture = 25/1.4"}
   ],
   "reducers": [
     {"name": "Celestron f/6.3 Reducer/Corrector", "multiplier": 0.63, "source": "Celestron 0.63x reducer/corrector for SCTs (e.g. CPC 1100)"},
