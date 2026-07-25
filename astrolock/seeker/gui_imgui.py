@@ -513,6 +513,8 @@ def main(argv=None):
         nav['alm'].update()
     track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True,   # Tracking panel state; backend defaults
                 'delay': 0.0,                                            # post-lock mount-hold (s)
+                'latency': 0.0,                                          # assumed command latency (s)
+                'rate_scale': 1.0,                                       # commanded-rate trim multiplier
                 'model': 'ema', 'alt_km': 250.0}                         # target model (next lock)
     sim_ui = {'r0': 0.0, 'bortle': 4}                     # Simulation panel: seeing r0 (m) + Bortle sky class
     focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'fo': None,
@@ -536,6 +538,8 @@ def main(argv=None):
     ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'align_yaw': '0',
                   'track_delay': f"{track_ui['delay']:g}",
                   'sim_r0': f"{sim_ui['r0']:g}", 'track_smooth': f"{track_ui['smoothing']:g}",
+                  'track_latency': f"{track_ui['latency']:g}",
+                  'track_rate_scale': f"{track_ui['rate_scale']:g}",
                   'track_alt': f"{track_ui['alt_km']:g}",
                   'focus_alpha': f"{focus_ui['alpha']:g}", 'focus_com_mult': f"{focus_ui['com_mult']:g}",
                   'focus_shape_gain': f"{focus_ui['shape_gain']:g}",
@@ -1552,7 +1556,8 @@ def main(argv=None):
             # worse than starting at the system clock).
             'location': {'lat_deg': site_ui['lat'], 'lon_deg': site_ui['lon'],
                          'elev_m': site_ui['elev']},
-            'tracking': {'smoothing': track_ui['smoothing'], 'pref': track_ui['pref'],
+            'tracking': {'smoothing': track_ui['smoothing'], 'latency': track_ui['latency'],
+                         'rate_scale': track_ui['rate_scale'], 'pref': track_ui['pref'],
                          'auto_switch': track_ui['auto_switch'], 'delay': track_ui['delay'],
                          'model': track_ui['model'], 'alt_km': track_ui['alt_km'],
                          'follow': bool((ctrl['state'] or {}).get('follow_enabled', True))},
@@ -1606,6 +1611,14 @@ def main(argv=None):
             track_ui['smoothing'] = max(0.0, float(trk['smoothing']))
             ui['txt']['track_smooth'] = f"{track_ui['smoothing']:g}"
             _send({'type': 'set_track_smoothing', 'value': track_ui['smoothing']})
+        if 'latency' in trk:
+            track_ui['latency'] = max(-5.0, min(5.0, float(trk['latency'])))
+            ui['txt']['track_latency'] = f"{track_ui['latency']:g}"
+            _send({'type': 'set_track_latency', 'value': track_ui['latency']})
+        if 'rate_scale' in trk:
+            track_ui['rate_scale'] = max(0.5, min(2.0, float(trk['rate_scale'])))
+            ui['txt']['track_rate_scale'] = f"{track_ui['rate_scale']:g}"
+            _send({'type': 'set_track_rate_scale', 'value': track_ui['rate_scale']})
         if trk.get('pref') in ('guide', 'main', 'auto'):
             _set_track_pref(trk['pref'])                # push to the backend + reflect on the radio
         if 'auto_switch' in trk:
@@ -2669,6 +2682,56 @@ def main(argv=None):
             _input_commit('track_smooth', S(48), _commit_smooth)
             imgui.same_line()
             imgui.text_colored(C4(140, 145, 160), "s")
+            imgui.text("Command latency:")
+            _tip("Assumed delay before a mount rate command takes effect (serial pickup + wire + "
+                 "controller processing). The servo aims its intercept this far ahead; an "
+                 "under-modeled delay leaves the target trailing under acceleration. Try "
+                 "~0.05-0.3 s on the NexStar serial link; nudge while locked and watch the "
+                 "target re-centre. Negative is allowed: on the ideal sim mount it reproduces "
+                 "an UNDER-modeled latency. Applies live and to the next lock.")
+            imgui.same_line()
+
+            def _latency_set(v):
+                track_ui['latency'] = max(-5.0, min(5.0, v))
+                ui['txt']['track_latency'] = f"{track_ui['latency']:g}"
+                _send({'type': 'set_track_latency', 'value': track_ui['latency']})
+
+            def _commit_latency(txt):
+                _latency_set(_flt(txt, track_ui['latency']))
+                return ui['txt']['track_latency']
+            _input_commit('track_latency', S(48), _commit_latency)
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "s")
+            for label, delta in (('<<', -0.1), ('<', -0.02), ('>', +0.02), ('>>', +0.1)):
+                if label != '<<':
+                    imgui.same_line()
+                if imgui.button(f"  {label}  ##latency_nudge{delta}"):
+                    _latency_set(track_ui['latency'] + delta)
+                _tip(f"Nudge the assumed command latency by {delta:+g} s.")
+            imgui.text("Rate scale:")
+            _tip("Trim multiplier on the tracker's commanded rates, applied just before the mount "
+                 "(manual slews are NOT scaled). If the mount executes rates slightly slow, the "
+                 "target rides a constant offset ahead of centre -- nudge this up while locked "
+                 "until it centres. Validate in sim against --sim-mount-rate-scale-alt. Applies live.")
+            imgui.same_line()
+
+            def _rate_scale_set(v):
+                track_ui['rate_scale'] = max(0.5, min(2.0, v))
+                ui['txt']['track_rate_scale'] = f"{track_ui['rate_scale']:g}"
+                _send({'type': 'set_track_rate_scale', 'value': track_ui['rate_scale']})
+
+            def _commit_rate_scale(txt):
+                _rate_scale_set(_flt(txt, track_ui['rate_scale']))
+                return ui['txt']['track_rate_scale']
+            _input_commit('track_rate_scale', S(48), _commit_rate_scale)
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "x")
+            for label, delta in (('<<', -0.01), ('<', -0.002), ('>', +0.002), ('>>', +0.01)):
+                if label != '<<':
+                    imgui.same_line()
+                if imgui.button(f"  {label}  ##rate_scale_nudge{delta}"):
+                    _rate_scale_set(track_ui['rate_scale'] + delta)
+                _tip(f"Nudge the commanded-rate trim by {delta:+g} ({delta * 100:+g}%).")
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Settings"):

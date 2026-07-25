@@ -248,6 +248,10 @@ def main(argv=None):
     p.add_argument('--track-command-latency-s', type=float, default=0.0,
                    help="assumed delay before a rate command takes effect (s). ~0 for a direct mount; "
                         "only worth setting for a slow serial link (e.g. 9600-baud NexStar)")
+    p.add_argument('--track-rate-scale', type=float, default=1.0,
+                   help="multiplier on the tracker's commanded rates just before the mount (trim for "
+                        "a mount that executes rates slightly off; manual slews are NOT scaled). "
+                        "Live-adjustable in the GUI Tracking panel")
     p.add_argument('--track-max-horizon-s', type=float, default=8.0,
                    help="declare the target uncatchable if no intercept is reachable within this long")
     p.add_argument('--track-gate-px', type=float, default=80.0, help="max px to associate a blob to the target")
@@ -313,6 +317,21 @@ def main(argv=None):
     p.add_argument('--sim-cam-bandwidth-limit', type=float, default=400.0,
                    help="sky source: model of the camera data link (MB/s; default ~USB3, capping "
                         "full-res frames at ~24 fps like the real hardware). 0 = unlimited")
+    # Sim imperfection knobs: inject the real rig's flaws one at a time to see which one
+    # reproduces a field symptom (and to prove a fix kills it) -- all default OFF (ideal).
+    p.add_argument('--sim-cam-stamp-lag-ms', type=float, default=0.0,
+                   help="sky source: frames are STAMPED (and delivered) this many ms after the "
+                        "light arrived, like a real camera stamping at USB-transfer completion. "
+                        "Pixels stay true to the earlier instant; only the claimed time shifts")
+    p.add_argument('--sim-mount-latency-s', type=float, default=0.0,
+                   help="sim mount: a rate command takes effect only this long after set_rates() "
+                        "(models serial pickup + wire + controller processing; commands queue in order)")
+    p.add_argument('--sim-mount-rate-scale-az', type=float, default=1.0,
+                   help="sim mount: the EXECUTED az rate is command * this (firmware calibration / "
+                        "load deficit); encoders report the executed truth, like a real mount")
+    p.add_argument('--sim-mount-rate-scale-alt', type=float, default=1.0,
+                   help="sim mount: the EXECUTED alt rate is command * this (e.g. 0.97 = a 3%% "
+                        "gravity-load deficit); encoders report the executed truth")
     p.add_argument('--shm-ser', dest='shm_ser', action='store_true', default=True,
                    help="non-recording cam segments live in shared memory (default): only a "
                         "178-byte marker .ser lands on disk, so idle streaming stops grinding the "
@@ -391,7 +410,9 @@ def main(argv=None):
         mount = mount_mod.make_mount(
             args.mount, az0_rad=math.radians(args.start_az_deg), alt0_rad=math.radians(args.start_alt_deg),
             site=site, max_rate_rad_s=max_rate, accel_rad_s2=math.radians(args.mount_accel_deg_s2),
-            update_hz=args.mount_update_hz, url=args.mount_url, sidecar_path=sim_mount_path)
+            update_hz=args.mount_update_hz, url=args.mount_url, sidecar_path=sim_mount_path,
+            command_latency_s=args.sim_mount_latency_s,
+            rate_scale_az=args.sim_mount_rate_scale_az, rate_scale_alt=args.sim_mount_rate_scale_alt)
         mount_connected = True
     else:
         mount = mount_mod.NullMount(math.radians(args.start_az_deg),
@@ -423,7 +444,8 @@ def main(argv=None):
     sky_args = ['--sky-rate-az', str(args.sky_rate_az), '--sky-rate-alt', str(args.sky_rate_alt),
                 '--sky-substeps', str(args.sky_substeps), '--sky-exposure-s', str(args.sky_exposure_s),
                 '--sky-almanac', almanac_path,
-                '--sim-cam-bandwidth-limit', str(args.sim_cam_bandwidth_limit)] \
+                '--sim-cam-bandwidth-limit', str(args.sim_cam_bandwidth_limit),
+                '--sim-cam-stamp-lag-ms', str(args.sim_cam_stamp_lag_ms)] \
         + (['--sim-cam-noop'] if args.sim_cam_noop else [])
 
     def sky_follow_flag():
@@ -1139,7 +1161,9 @@ def main(argv=None):
                 new = mount_mod.make_mount(
                     'sim', az0_rad=st['az_rad'], alt0_rad=st['alt_rad'], site=site, max_rate_rad_s=max_rate,
                     accel_rad_s2=math.radians(args.mount_accel_deg_s2), update_hz=args.mount_update_hz,
-                    sidecar_path=sim_mount_path)
+                    sidecar_path=sim_mount_path, command_latency_s=args.sim_mount_latency_s,
+                    rate_scale_az=args.sim_mount_rate_scale_az,
+                    rate_scale_alt=args.sim_mount_rate_scale_alt)
             else:
                 new = mount_mod.make_mount('celestron', az0_rad=st['az_rad'], alt0_rad=st['alt_rad'],
                                            site=site, max_rate_rad_s=max_rate, url=url)
@@ -1314,6 +1338,18 @@ def main(argv=None):
             if tracker is not None and hasattr(tracker.model, 'smoothing_s'):
                 tracker.model.smoothing_s = v         # ...and applied to the running lock right now
             print(f"[backend] track rate smoothing = {v:.2f}s", flush=True)
+        elif t == 'set_track_latency':                # live tracker-tuning: assumed command latency (s)
+            # Negative is deliberately allowed: on the (ideal, zero-latency) sim mount it models an
+            # UNDER-estimated latency, so the field symptom can be reproduced and dialed at the desk.
+            v = max(-5.0, min(5.0, float(cmd.get('value', args.track_command_latency_s))))
+            args.track_command_latency_s = v          # remembered for the next lock...
+            if tracker is not None:
+                tracker.latency = v                   # ...and applied to the running lock right now
+            print(f"[backend] track command latency = {v:.2f}s", flush=True)
+        elif t == 'set_track_rate_scale':             # live tracker-tuning: commanded-rate trim
+            v = max(0.5, min(2.0, float(cmd.get('value', args.track_rate_scale))))
+            args.track_rate_scale = v                 # applied at the mount-forwarding point each tick
+            print(f"[backend] track rate scale = {v:.4f}", flush=True)
         elif t == 'set_track_model':                  # target motion model for the NEXT lock
             m = cmd.get('model')
             if m in ('ema', 'greatcircle'):
@@ -1664,7 +1700,12 @@ def main(argv=None):
                         # Drive only when following is on AND the post-lock learn delay has elapsed
                         # ("Stop Moving" / watch-only / delay all hold the mount but keep tracking).
                         if follow_enabled and (now - track_started_t) >= track_delay_s:
-                            mount.set_rates(raz, ralt)
+                            # --track-rate-scale: trim for a mount whose executed rates run
+                            # slightly off commanded (a constant-sign centering offset the P
+                            # term otherwise absorbs as a standing gap). Tracking only --
+                            # manual slews go through unscaled.
+                            mount.set_rates(raz * args.track_rate_scale,
+                                            ralt * args.track_rate_scale)
                         # On 'track' and 'coast' the target estimate keeps moving, so keep publishing it
                         # (the ROI follows, so detect keeps searching and can re-acquire during coast).
                         track_target = list(tpx) if track_status in ('track', 'coast') else None

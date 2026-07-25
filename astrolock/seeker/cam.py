@@ -456,6 +456,7 @@ def _open_sky(args, state_path=None, mount_path=None):
             _bw['last'] = time.perf_counter()
 
     _live = {'exp': args.sky_exposure_s, 'gain_cb': float(args.sky_gain_cb)}   # exposure (s) + gain (cB), live
+    stamp_lag_ns = int(args.sim_cam_stamp_lag_ms * 1e6)   # modeled readout+transfer timestamp bias
 
     if args.sim_cam_noop:
         # I/O-stress mode: keep ALL the pacing (exposure floors fps; the bandwidth model caps it;
@@ -474,7 +475,8 @@ def _open_sky(args, state_path=None, mount_path=None):
             now_ns = session_mod.mono_ns()
             exp = _live['exp']
             _bw_wait()
-            return noop_frame, int(now_ns + 0.5 * exp * 1e9), now_ns + int(exp * 1e9)
+            return (noop_frame, int(now_ns + 0.5 * exp * 1e9) + stamp_lag_ns,
+                    now_ns + int(exp * 1e9) + stamp_lag_ns)
 
         caps = [{'name': 'exposure', 'label': 'Exposure', 'kind': 'number', 'unit': 'ms', 'scale': 'log',
                  'min': 0.01, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True},
@@ -579,7 +581,10 @@ def _open_sky(args, state_path=None, mount_path=None):
         # deliver a frame until the exposure ends. Stamp at the exposure midpoint (best time to
         # associate the averaged light with), and tell the loop not to *commit* the frame until the
         # exposure-end wall-clock -- so consumers see the same latency, and a long exposure floors fps.
-        return frame, int(now_ns + 0.5 * exp * 1e9), now_ns + int(exp * 1e9)
+        # --sim-cam-stamp-lag-ms shifts BOTH (the pixels stay true to the earlier instant): a real
+        # ZWO frame is stamped at GetVideoData return, readout+transfer after the light arrived.
+        return (frame, int(now_ns + 0.5 * exp * 1e9) + stamp_lag_ns,
+                now_ns + int(exp * 1e9) + stamp_lag_ns)
 
     caps = [{'name': 'exposure', 'label': 'Exposure', 'kind': 'number', 'unit': 'ms', 'scale': 'log',
              'min': 0.01, 'max': 2000.0, 'value': _live['exp'] * 1000.0, 'live': True},
@@ -753,6 +758,11 @@ def main(argv=None):
                    help="sky: model the camera's data link (MB/s; default ~USB3): a frame can't be "
                         "delivered faster than the link carries its bytes, so full-res frames cap at "
                         "~24 fps like the real hardware. 0 = unlimited")
+    p.add_argument('--sim-cam-stamp-lag-ms', type=float, default=0.0,
+                   help="sky: model the real camera's timestamp bias -- the frame is STAMPED (and "
+                        "delivered) this many ms after the light actually arrived (readout + USB "
+                        "transfer; a real ZWO frame is stamped at GetVideoData return). The pixels "
+                        "stay true to the earlier instant; only the claimed time (and delivery) shift")
     p.add_argument('--sky-almanac', default=None,
                    help="sky: shared source-direction almanac (JSONL) published by sky_sim")
     p.add_argument('--state-shm', default=None,

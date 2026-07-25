@@ -22,6 +22,7 @@ interchangeable -- the backend treats both as "real":
 Pick one with make_mount(); --mount selects sim vs celestron.
 """
 
+import collections
 import datetime
 import math
 import threading
@@ -77,13 +78,23 @@ class SimMount(Mount):
     """
 
     def __init__(self, az0_rad, alt0_rad, site, max_rate_rad_s=math.radians(8.0),
-                 accel_rad_s2=math.radians(20.0), update_hz=10.0, sidecar_path=None):
+                 accel_rad_s2=math.radians(20.0), update_hz=10.0, sidecar_path=None,
+                 command_latency_s=0.0, rate_scale_az=1.0, rate_scale_alt=1.0):
         self._site = dict(site)
         self._az, self._alt = az0_rad, alt0_rad
         self._cmd = [0.0, 0.0]                    # commanded axis rates (rad/s)
         self._rate = [0.0, 0.0]                   # actual rates after accel limiting
         self._max = max_rate_rad_s
         self._accel = accel_rad_s2
+        # Imperfection knobs, for reproducing real-mount behavior the ideal sim hides:
+        #  - command latency: a set_rates() takes effect only this long after the call (serial
+        #    pickup + wire + controller processing on a real mount). Commands queue in order.
+        #  - per-axis rate scale: the EXECUTED rate is command * scale (firmware calibration /
+        #    load-dependent deficit). Encoders report the executed truth, like a real mount --
+        #    so the tracking loop sees the pose error, not the cause.
+        self._command_latency_s = command_latency_s
+        self._rate_scale = [rate_scale_az, rate_scale_alt]
+        self._pending_commands = collections.deque()   # (perf_counter deadline, [az, alt]) FIFO
         self._period = 1.0 / update_hz if update_hz > 0 else 0.1
         self._t0 = datetime.datetime.fromisoformat(site['epoch_utc'].replace('Z', '+00:00'))
         self._lock = threading.Lock()
@@ -126,9 +137,12 @@ class SimMount(Mount):
                 self._az = (self._az + self._rate[0] * dt) % (2 * math.pi)
                 self._alt = (self._alt + self._rate[1] * dt) % (2 * math.pi)
                 self._angle_t_ns = mono_ns()
+                while self._pending_commands and self._pending_commands[0][0] <= now:
+                    self._cmd = self._pending_commands.popleft()[1]    # delayed command lands now
                 changed = False
                 for ax in (0, 1):
-                    dv = _clamp(self._cmd[ax] - self._rate[ax], -self._accel * dt, self._accel * dt)
+                    executed = self._cmd[ax] * self._rate_scale[ax]    # what the firmware really does
+                    dv = _clamp(executed - self._rate[ax], -self._accel * dt, self._accel * dt)
                     nr = _clamp(self._rate[ax] + dv, -self._max, self._max)
                     if nr != self._rate[ax]:
                         self._rate[ax] = nr
@@ -138,9 +152,14 @@ class SimMount(Mount):
             time.sleep(self._period)
 
     def set_rates(self, az_rad_s, alt_rad_s):
+        command = [_clamp(az_rad_s, -self._max, self._max),
+                   _clamp(alt_rad_s, -self._max, self._max)]
         with self._lock:
-            self._cmd = [_clamp(az_rad_s, -self._max, self._max),
-                         _clamp(alt_rad_s, -self._max, self._max)]
+            if self._command_latency_s > 0.0:      # takes effect only after the modeled delay
+                self._pending_commands.append((time.perf_counter() + self._command_latency_s,
+                                               command))
+            else:
+                self._cmd = command
 
     def get_state(self):
         with self._lock:
@@ -312,10 +331,12 @@ def available_mount_urls():
 
 
 def make_mount(kind, az0_rad, alt0_rad, site, max_rate_rad_s=math.radians(8.0),
-               accel_rad_s2=math.radians(20.0), update_hz=10.0, url=None, sidecar_path=None):
+               accel_rad_s2=math.radians(20.0), update_hz=10.0, url=None, sidecar_path=None,
+               command_latency_s=0.0, rate_scale_az=1.0, rate_scale_alt=1.0):
     if kind == 'celestron':
         if not url:
             raise SystemExit("--mount celestron requires --mount-url celestron_nexstar_hc:COMx")
         return CelestronMount(url, az0_rad, alt0_rad, site, max_rate_rad_s)
     return SimMount(az0_rad, alt0_rad, site, max_rate_rad_s, accel_rad_s2, update_hz,
-                    sidecar_path=sidecar_path)
+                    sidecar_path=sidecar_path, command_latency_s=command_latency_s,
+                    rate_scale_az=rate_scale_az, rate_scale_alt=rate_scale_alt)
