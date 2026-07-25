@@ -69,8 +69,13 @@ def _compiled_fn(fn):
 
 def work_image(frame, color_id, device=None):
     """The grayscale image we analyze: Bayer -> sensitive half-res mono sum; else as-is. All torch
-    (device-parameterized). torch has no uint16, so cast the raw frame to int32 at this ingest."""
-    mosaic = torch.from_numpy(frame.astype('int32')).to(device or _DEVICE)
+    (device-parameterized). Ship the frame to the device RAW (uint8/uint16 -- torch handles both;
+    uint16 lacks only reduction kernels, and we widen immediately) and cast to int32 THERE:
+    inflating to int32 on the CPU first cost ~15 ms/frame at main-cam res on one thread and
+    pushed 4x the bytes over PCIe -- the detector's whole framerate problem was this one line."""
+    if not frame.flags.writeable:
+        frame = frame.copy()             # from_numpy needs a writable array (ring read()s are locked)
+    mosaic = torch.from_numpy(frame).to(device or _DEVICE).to(torch.int32)
     if bayer.is_bayer(color_id):
         return bayer.to_mono_sum(mosaic)
     return mosaic.float()

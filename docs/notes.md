@@ -256,3 +256,400 @@ Haha, another learning:  focus between even very distant trees and infinity is s
 OKAY I AM ANNOYED - got all set up, tracked ISS fine - but, Main cam was flashing 'not recording',
 and would not record with checking the Record now box, even tried disconnecting and reconnecting from it
 so I saw it even on my screen, bits on this PC, but it didn't save the darn thing.  Le sigh...
+
+2026-07-23
+
+Tonight had a 33 degree ISS pass (would be higher but passed into shadow), so, used it as a dress rehearsal of tomorrow's 82 degree pass, the last good one for awhile.  I only allowed myself ~15 minutes to setup, which was too tight (even with the scope mostly ready to go).  In the event - I thought it didn't work - but, it actually did work!  Just at really low exposure, to the point that I didn't see it well myself.  Some notes, and a checklist:
+
+Notes:
+- telescope overshoots a bit on initial fix, which the sim doesn't do - hmm.  No huge issue though.
+- tracking is a bit jiggly / noisy - smoothing to 2s helps a little bit, but maybe we just need more pixels
+- however, the 25mm is much nicer to use than 55mm would be in terms of catching the target when not perfectly aimed.  without that, I probably would have missed tonight's pass, since I didn't have time to aim well.
+- on dim targets, tracking can occasionally get stolen by nearby bright targets - we should have a tunable for this already, need to tweak it down and/or expose it
+- hrm, .SER file doesn't encode any camera settings - we used to have, but no longer have, json sidecar file with per-frame info.
+- I _think_ I was on default main camera settings, which is 1ms 190 gain.
+- I occasionally see the background level on the main cam oscillate between lower and higher - not sure if that's a real thing (light pollution, someone's security camera hitting me with IR, etc), or some weird software issue.
+
+Software TODO (after this pass, to avoid destabilizing...)
+- more stars in UI (now that performance is fine) - or even constellation lines/names?
+- change default lens to the 25mm one
+- .SER file metadata
+- expose tunable (and reduce it) for how much to trust target brightness vs distance from expected pos
+- do we expose slew time horizon?  tuning that down might help overshoot / oscillations
+- in the dark on this laptop, sometimes accidentally right click when I mean to click - perhaps ctrl-click or something would be better for unlocking
+- pipper cleanup pass
+- alignment settings should be higher up in the list to reflect settings order
+- still having issues hitting full main cam bandwidth - even with guide cam disconnected, main cam set to 8 bit, not recording, CPU usage very low, main cam isn't hitting its full ~48 fps framerate.  (also, main detector is skipping frames - why is that slow?)  Tried main cam on the supposedly separate USB-C port which in theory has its own adapter.
+- gamepad support (or arrow keys) for slewing would be useful, since trackpad slewing requires looking at the screen, so you can't also look at guidescope
+- for boresighting - spiral search mode, and set boresight from auto track
+- visual cue for overexposure - green, or maybe random colored, or maybe fixed pattern, highlights
+- alignment?
+- plate solving?
+
+
+Checklist:
+- telescope level, ideally pointing north, when turning it on
+- run software, connect cameras, confirm these settings:
+        - 25mm guide lens (todo: make default)
+        - boresight (load settings, or manual - try (-.8, 1.2) mrad)
+
+confirm main camera settings
+        - 8-bit for main camera (play for framerate, though it still doesn't saturate)
+        - 2 ms 400 gain (just a guess)
+        - histogram on
+
+- focus check on high star
+
+confirm settings that might get changed when focusing on stars:
+        - tracking to auto
+        - auto-record to on on for both cameras
+
+- tweak alignment to get stars to line up, confirm track, lock on star near track
+
+- adjust tripod to tilt ~5 degrees west
+
+2026-07-24
+
+did exposure 2ms 130 gain + 2 stops - it was actually too bright, I was late to fix it...
+also should maybe stop guide camera down a bit
+tracking seemed to lag a bit, got out of frame a bit
+but it mostly worked
+tilting the tripod towards the pass worked, but did lose the middle
+tomorrow night has a 55 degree pass, i'll try that for more sedate tracking and more fixes
+
+here's the log:
+
+
+(.venv) PS C:\projects\astrolock\.claude\worktrees\condescending-hofstadter-0b18b2> python -m astrolock.seeker.backend
+[backend] session sessions\20260725T044209Z roles=['guide', 'main'] source=sky cmd_port=61790
+[backend] TLE for 25544: downloaded (ISS (ZARYA), epoch 2026-07-24)
+[backend] guide: ZWO ASI678MC + 8mm CS f/1.4 -> 51.282x30.219 deg, 103.132 arcsec/px, render 1920x1080 (bin 2x2)
+[backend] main: ZWO ASI678MC + Celestron CPC 1100 -> 0.157x0.088 deg, 0.147 arcsec/px, render 3840x2160
+[backend] note: main is color (RGGB) and unbinned but feeds detection; it'll be binned to mono for detection anyway -- --main-bin 2 halves bandwidth
+[backend] reserved cores {'guide': [12, 13, 14, 15], 'main': [8, 9, 10, 11]}; backend+children on [0, 1, 2, 3, 4, 5, 6, 7]
+[backend] detect roles: ['guide', 'main']
+[backend] idle at startup: connect cams/mount in the GUI, or press Simulation -> Connect Simulated Cameras
+[backend] sky_sim -> sessions\20260725T044209Z\20260725T044209Z_almanac.jsonl
+[backend] sched: hero cam=- active tracker=-
+[sky_sim] 15537 stars + 68 sat points, nav feed 93 stars + 9 bodies -> sessions\20260725T044209Z\20260725T044209Z_navigation.jsonl, epoch 2026-07-25T04:42:09.565Z [ISS (ZARYA) TLE epoch 2026-07-24, 0.7 d older than sim time]
+[backend] mount selected: celestron_nexstar_hc:COM4 (press Connect)
+[backend] mount connected: celestron_nexstar_hc:COM4
+[backend] guide optics -> ['ZWO ASI678MM', '8mm CS f/1.4', None] (ok)
+[backend] guide source -> zwo (disconnected; press Connect)
+[backend] guide camera -> zwo:ZWO ASI678MM
+[backend] capture started on guide
+[backend] sched: hero cam=- active tracker=-
+[cam] process priority: above
+[cam] pinned to cores [12, 13, 14, 15]
+[detect:guide] compute device: cuda
+[cam] ZWO 'ZWO ASI678MM' 1920x1080 RAW16 12-bit auto-exposure WB=camera (MONO mosaic)
+[cam] ZWO 'ZWO ASI678MM' controls @ connect (img_type=RAW16):
+    AutoExpMaxExpMS        = 200   [1..60000]
+    AutoExpMaxGain         = 400   [0..600]
+    AutoExpTargetBrightness = 100   [50..160]
+    BandWidth              = 40   [40..100]
+    Exposure               = 2000   [32..2000000000]
+    Flip                   = 0   [0..3]
+    Gain                   = 190   [0..600]
+    HardwareBin            = 0   [0..1]
+    HighSpeedMode          = 0   [0..1]
+    Offset                 = 3   [0..350]
+    Temperature            = 149   (read-only)
+[cam:guide] zwo 1920x1080 MONO 12-bit frame_limit=-1 file_limit=1 control=sessions\20260725T044209Z\control_guide_1.jsonl -> sessions\20260725T044209Z
+W0724 21:42:48.567000 19164 Lib\site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
+[backend] record policy for guide: manual=False auto(while tracking)=False
+[cam:guide] done, 59 frames total
+[backend] guide bit depth = 8
+[backend] sched: hero cam=- active tracker=-
+[cam] process priority: above
+[cam] pinned to cores [12, 13, 14, 15]
+[cam] ZWO 'ZWO ASI678MM' 1920x1080 RAW8 auto-exposure WB=camera (MONO mosaic)
+[cam] ZWO 'ZWO ASI678MM' controls @ connect (img_type=RAW8):
+    AutoExpMaxExpMS        = 200   [1..60000]
+    AutoExpMaxGain         = 400   [0..600]
+    AutoExpTargetBrightness = 100   [50..160]
+    BandWidth              = 40   [40..100]
+    Exposure               = 2000   [32..2000000000]
+    Flip                   = 0   [0..3]
+    Gain                   = 190   [0..600]
+    HardwareBin            = 0   [0..1]
+    HighSpeedMode          = 0   [0..1]
+    Offset                 = 3   [0..350]
+    Temperature            = 158   (read-only)
+[cam:guide] zwo 1920x1080 MONO 8-bit frame_limit=-1 file_limit=1 control=sessions\20260725T044209Z\control_guide_2.jsonl -> sessions\20260725T044209Z
+[backend] main optics -> ['ZWO ASI678MC', 'Celestron CPC 1100', None] (ok)
+[backend] main source -> zwo (disconnected; press Connect)
+[backend] main camera -> zwo:ZWO ASI678MC
+[backend] capture started on main
+[backend] sched: hero cam=- active tracker=-
+[detect:main] compute device: cuda
+[cam] process priority: above
+[cam] pinned to cores [8, 9, 10, 11]
+[cam] ZWO 'ZWO ASI678MC' 3840x2160 RAW16 12-bit auto-exposure WB=neutral (BAYER_RGGB mosaic)
+[cam] ZWO 'ZWO ASI678MC' controls @ connect (img_type=RAW16):
+    AutoExpMaxExpMS        = 200   [1..60000]
+    AutoExpMaxGain         = 400   [0..600]
+    AutoExpTargetBrightness = 100   [50..160]
+    BandWidth              = 100  (auto)   [40..100]
+    Exposure               = 2000   [32..2000000000]
+    Flip                   = 0   [0..3]
+    Gain                   = 190   [0..600]
+    HardwareBin            = 0   [0..1]
+    HighSpeedMode          = 0   [0..1]
+    MonoBin                = 0   [0..1]
+    Offset                 = 3   [0..350]
+    Temperature            = 171   (read-only)
+    WB_B                   = 50   [1..99]
+    WB_R                   = 50   [1..99]
+[cam:main] zwo 3840x2160 BAYER_RGGB 12-bit frame_limit=-1 file_limit=1 control=sessions\20260725T044209Z\control_main_1.jsonl -> sessions\20260725T044209Z
+[cam:main] done, 204 frames total
+[backend] main bit depth = 8
+[backend] sched: hero cam=- active tracker=-
+[cam] process priority: above
+[cam] pinned to cores [8, 9, 10, 11]
+[cam] ZWO 'ZWO ASI678MC' 3840x2160 RAW8 auto-exposure WB=neutral (BAYER_RGGB mosaic)
+[cam] ZWO 'ZWO ASI678MC' controls @ connect (img_type=RAW8):
+    AutoExpMaxExpMS        = 200   [1..60000]
+    AutoExpMaxGain         = 400   [0..600]
+    AutoExpTargetBrightness = 100   [50..160]
+    BandWidth              = 100  (auto)   [40..100]
+    Exposure               = 2000   [32..2000000000]
+    Flip                   = 0   [0..3]
+    Gain                   = 190   [0..600]
+    HardwareBin            = 0   [0..1]
+    HighSpeedMode          = 0   [0..1]
+    MonoBin                = 0   [0..1]
+    Offset                 = 3   [0..350]
+    Temperature            = 183   (read-only)
+    WB_B                   = 50   [1..99]
+    WB_R                   = 50   [1..99]
+[cam:main] zwo 3840x2160 BAYER_RGGB 8-bit frame_limit=-1 file_limit=1 control=sessions\20260725T044209Z\control_main_2.jsonl -> sessions\20260725T044209Z
+[cam:main] done, 2 frames total
+[backend] main roi = 2048
+[backend] sched: hero cam=- active tracker=-
+[cam] process priority: above
+[cam] pinned to cores [8, 9, 10, 11]
+[cam] ZWO 'ZWO ASI678MC' 2048x2048 RAW8 auto-exposure WB=neutral (BAYER_RGGB mosaic)
+[cam] ZWO 'ZWO ASI678MC' controls @ connect (img_type=RAW8):
+    AutoExpMaxExpMS        = 200   [1..60000]
+    AutoExpMaxGain         = 400   [0..600]
+    AutoExpTargetBrightness = 100   [50..160]
+    BandWidth              = 100  (auto)   [40..100]
+    Exposure               = 2000   [32..2000000000]
+    Flip                   = 0   [0..3]
+    Gain                   = 190   [0..600]
+    HardwareBin            = 0   [0..1]
+    HighSpeedMode          = 0   [0..1]
+    MonoBin                = 0   [0..1]
+    Offset                 = 3   [0..350]
+    Temperature            = 181   (read-only)
+    WB_B                   = 50   [1..99]
+    WB_R                   = 50   [1..99]
+[cam:main] zwo 2048x2048 BAYER_RGGB 8-bit frame_limit=-1 file_limit=1 control=sessions\20260725T044209Z\control_main_3.jsonl -> sessions\20260725T044209Z
+[backend] main control gain = 250.0 (live)
+[backend] main control gain = 310.0 (live)
+[backend] main control gain = 250.0 (live)
+[backend] record policy for main: manual=False auto(while tracking)=False
+[backend] guide optics -> ['ZWO ASI678MM', '25mm CCTV f/1.4 C-mount', None] (ok)
+[backend] boresight -> (-0.100, 0.000) mrad
+[backend] boresight -> (-0.200, 0.000) mrad
+[backend] boresight -> (-0.300, 0.000) mrad
+[backend] boresight -> (-0.400, 0.000) mrad
+[backend] boresight -> (-0.500, 0.000) mrad
+[backend] boresight -> (-0.600, 0.000) mrad
+[backend] boresight -> (-0.700, 0.000) mrad
+[backend] boresight -> (-0.800, 0.000) mrad
+[backend] boresight -> (-0.800, -0.100) mrad
+[backend] boresight -> (-0.800, -0.200) mrad
+[backend] boresight -> (-0.800, -0.300) mrad
+[backend] boresight -> (-0.800, -0.400) mrad
+[backend] boresight -> (-0.800, -0.500) mrad
+[backend] boresight -> (-0.800, -0.600) mrad
+[backend] boresight -> (-0.800, -0.500) mrad
+[backend] boresight -> (-0.800, -0.400) mrad
+[backend] boresight -> (-0.800, -0.300) mrad
+[backend] boresight -> (-0.800, -0.200) mrad
+[backend] boresight -> (-0.800, -0.100) mrad
+[backend] boresight -> (-0.800, -0.000) mrad
+[backend] boresight -> (-0.800, 0.100) mrad
+[backend] boresight -> (-0.800, 0.200) mrad
+[backend] boresight -> (-0.800, 0.300) mrad
+[backend] boresight -> (-0.800, 0.400) mrad
+[backend] boresight -> (-0.800, 0.500) mrad
+[backend] boresight -> (-0.800, 0.600) mrad
+[backend] boresight -> (-0.800, 0.700) mrad
+[backend] boresight -> (-0.800, 0.800) mrad
+[backend] boresight -> (-0.800, 0.900) mrad
+[backend] boresight -> (-0.800, 1.000) mrad
+[backend] boresight -> (-0.800, 1.100) mrad
+[backend] boresight -> (-0.800, 1.200) mrad
+[backend] acquired target on guide at (951,483)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] sched: hero cam=guide active tracker=guide
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] alignment yaw -> -0.100 deg
+[backend] alignment yaw -> -0.200 deg
+[backend] alignment yaw -> -0.300 deg
+[backend] alignment yaw -> -0.400 deg
+[backend] alignment yaw -> -0.300 deg
+[backend] alignment yaw -> -0.200 deg
+[backend] alignment yaw -> -0.100 deg
+[backend] alignment yaw -> -0.000 deg
+[backend] alignment yaw -> +0.100 deg
+[backend] alignment yaw -> +0.200 deg
+[backend] alignment yaw -> +0.300 deg
+[backend] alignment yaw -> +0.400 deg
+[backend] alignment yaw -> +0.500 deg
+[backend] alignment yaw -> +0.600 deg
+[backend] alignment yaw -> +0.700 deg
+[backend] alignment yaw -> +0.800 deg
+[backend] alignment yaw -> +0.700 deg
+[backend] focus started on main
+[focus:main] compute device: cuda
+[backend] sched: hero cam=- active tracker=-
+[focus:main] processed 1228 frames
+[backend] focus stopped
+[backend] track source preference = guide
+[backend] acquired target on guide at (973,89)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] sched: hero cam=guide active tracker=guide
+[backend] lost target on guide
+[backend] sched: hero cam=- active tracker=-
+[backend] acquired target on guide at (970,435)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] sched: hero cam=guide active tracker=guide
+[backend] guide control exposure = 4.0 (live)
+[backend] guide control exposure = 8.0 (live)
+[backend] sched: hero cam=- active tracker=-
+[backend] acquired target on guide at (954,549)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] sched: hero cam=guide active tracker=guide
+[backend] lost target on guide
+[backend] sched: hero cam=- active tracker=-
+[backend] acquired target on guide at (483,356)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] sched: hero cam=guide active tracker=guide
+[backend] boresight -> (-0.800, 1.100) mrad
+[backend] boresight -> (-0.800, 1.200) mrad
+[backend] boresight -> (-0.800, 1.300) mrad
+[backend] focus started on main
+[focus:main] compute device: cuda
+[focus:main] processed 5464 frames
+[backend] focus stopped
+[backend] sched: hero cam=- active tracker=-
+[backend] track source preference = auto
+[backend] record policy for main: manual=False auto(while tracking)=True
+[backend] record policy for guide: manual=False auto(while tracking)=True
+[backend] acquired target on guide at (1329,600)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] recording ON for guide
+[backend] recording ON for main
+[backend] sched: hero cam=guide active tracker=guide
+[rec:main] -> recordings\20260725T045442664Z_main.ser
+[rec:guide] -> recordings\20260725T045442669Z_guide.ser
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] handoff: now tracking on guide
+[backend] sched: hero cam=guide active tracker=guide
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] handoff: now tracking on guide
+[backend] sched: hero cam=guide active tracker=guide
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] handoff: now tracking on guide
+[backend] sched: hero cam=guide active tracker=guide
+[backend] coasting on guide (settled lock lost; holding last rate to re-acquire -- e-stop to halt)
+[backend] recording off for guide
+[backend] recording off for main
+[rec:guide] done: 1768 frames written @ 19.2 fps (0 dropped: 0 lapped + 0 thinned; ~19.2 fps if none dropped) -> recordings\20260725T045442669Z_guide.ser
+[backend] sched: hero cam=- active tracker=-
+[rec:main] done: 5071 frames written @ 55.2 fps (0 dropped: 0 lapped + 0 thinned; ~55.2 fps if none dropped) -> recordings\20260725T045442664Z_main.ser
+[backend] acquired target on guide at (1535,896)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] recording ON for guide
+[backend] recording ON for main
+[backend] sched: hero cam=guide active tracker=guide
+[rec:main] -> recordings\20260725T045923860Z_main.ser
+[rec:guide] -> recordings\20260725T045923911Z_guide.ser
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] handoff: now tracking on guide
+[backend] sched: hero cam=guide active tracker=guide
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] handoff: now tracking on guide
+[backend] sched: hero cam=guide active tracker=guide
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] main control gain = 190.0 (live)
+[backend] main control gain = 130.0 (live)
+[backend] handoff: now tracking on guide
+[backend] sched: hero cam=guide active tracker=guide
+[backend] coasting on guide (settled lock lost; holding last rate to re-acquire -- e-stop to halt)
+[backend] recording off for guide
+[backend] recording off for main
+[backend] sched: hero cam=- active tracker=-
+[rec:guide] done: 2718 frames written @ 19.2 fps (0 dropped: 0 lapped + 0 thinned; ~19.2 fps if none dropped) -> recordings\20260725T045923911Z_guide.ser
+[rec:main] done: 7795 frames written @ 55.1 fps (0 dropped: 0 lapped + 0 thinned; ~55.1 fps if none dropped) -> recordings\20260725T045923860Z_main.ser
+[backend] acquired target on guide at (1520,737)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] recording ON for guide
+[backend] recording ON for main
+[backend] sched: hero cam=guide active tracker=guide
+[rec:main] -> recordings\20260725T050146005Z_main.ser
+[rec:guide] -> recordings\20260725T050146020Z_guide.ser
+[backend] lost target on guide
+[backend] sched: hero cam=guide active tracker=-
+[backend] recording off for guide
+[backend] recording off for main
+[rec:guide] done: 18 frames written @ 19.3 fps (0 dropped: 0 lapped + 0 thinned; ~19.3 fps if none dropped) -> recordings\20260725T050146020Z_guide.ser
+[rec:main] done: 53 frames written @ 55.1 fps (0 dropped: 0 lapped + 0 thinned; ~55.1 fps if none dropped) -> recordings\20260725T050146005Z_main.ser
+[backend] sched: hero cam=- active tracker=-
+[backend] acquired target on guide at (896,530)px; will promote to main when it locks
+[backend] track guide: sky: model GreatCircleModel, min-intercept 1.00s (position stiffness ~1.0/s), latency 0.00s, horizon 8.0s
+[backend] recording ON for guide
+[backend] recording ON for main
+[backend] sched: hero cam=guide active tracker=guide
+[rec:guide] -> recordings\20260725T050440969Z_guide.ser
+[rec:main] -> recordings\20260725T050440976Z_main.ser
+[backend] handoff: now tracking on main
+[backend] sched: hero cam=main active tracker=main
+[backend] recording off for guide
+[backend] recording off for main
+[rec:guide] done: 254 frames written @ 19.2 fps (0 dropped: 0 lapped + 0 thinned; ~19.2 fps if none dropped) -> recordings\20260725T050440969Z_guide.ser
+[backend] sched: hero cam=- active tracker=-
+[rec:main] done: 727 frames written @ 55.2 fps (0 dropped: 0 lapped + 0 thinned; ~55.2 fps if none dropped) -> recordings\20260725T050440976Z_main.ser
+[backend] gui requested shutdown; stopping
+[detect:guide] processed 27769 frames
+[cam:guide] done, 27770 frames total
+[cam:main] done, 77150 frames total
+[detect:main] processed 64757 frames
+[backend] removed session sessions\20260725T044209Z
+[backend] done
+(.venv) PS C:\projects\astrolock\.claude\worktrees\condescending-hofstadter-0b18b2> 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
