@@ -1143,7 +1143,8 @@ def main(argv=None):
             return None
         vals = cam_control_vals.get(role, {})
         ctrls = [{**c, 'value': vals.get(c['name'], c.get('value'))} for c in caps.get('controls', [])]
-        return {'source': caps.get('source'), 'controls': ctrls + geometry_caps(role)}
+        return {'source': caps.get('source'), 'camera': caps.get('camera_short_name'),
+                'controls': ctrls + geometry_caps(role)}
 
     def is_connected(role):
         """True if this role's cam process is currently running (its capture is live)."""
@@ -1969,6 +1970,8 @@ def main(argv=None):
                 'track_delay_left': round(delay_left, 1),
                 'track_role': track_role if tracking else None,
                 'track_pref': track_pref,               # GUI radio: guide / main / auto
+                'track_feedforward': bool(args.track_feedforward),   # controller enables (checklist)
+                'track_pid': bool(args.track_pid),
                 'track_model': args.track_model,        # target model at the next lock (+ alt)
                 'track_alt_km': args.track_alt_km,
                 'target_px': track_target if tracking else None,        # model prediction (blue pipper)

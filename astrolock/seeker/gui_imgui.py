@@ -481,6 +481,10 @@ def main(argv=None):
               'pip_map': {}, 'pip_slots': []}
     boresight_ui = {'x': 0.0, 'y': 0.0, 'roll': 0.0, 'step': 0.1}   # mrad; the Boresight panel's state
     align_ui = {'step': 0.1}                              # deg; manual mount alignment (Alignment panel)
+    # Checklist attestations: boxes the user must tick by hand each run (the software can't
+    # verify them). Deliberately NOT persisted -- re-confirm every session.
+    checklist_ui = {'guide_optics': False, 'main_optics': False, 'focus': False,
+                    'boresight': False}
     site_ui = {'lat': 0.0, 'lon': 0.0, 'elev': 0.0}       # observer location (Location panel)
     # Sky/navigation overlay state: the almanac reader attaches once its feed file exists.
     nav = {'alm': None}
@@ -3006,6 +3010,108 @@ def main(argv=None):
                 if name:
                     _settings_refresh(settings_store.save(name, gather_settings()))
                     ui['txt']['settings_name'] = ''
+            imgui.tree_pop()
+        imgui.separator()
+        if imgui.tree_node_ex("Checklist", OPEN):
+            _tip("Pre-capture checklist: every line states the truth right now -- green = go, "
+                 "orange = fix it in its own panel above (nothing here changes settings). "
+                 "Greyed checkboxes are automatic; live ones are things only YOU can verify, "
+                 "and they reset every GUI launch, so re-confirm each session.")
+            GOOD, FIX = C4(120, 220, 140), C4(255, 90, 25)
+
+            def _row(key, ok, text, manual=False):
+                """One checklist line: a checkbox (greyed automatic truth, or a live
+                attestation box) + status text that always states the current truth."""
+                if manual:
+                    ch, v = imgui.checkbox(f"##chk_{key}", checklist_ui[key])
+                    if ch:
+                        checklist_ui[key] = v
+                else:
+                    imgui.begin_disabled(True)
+                    imgui.checkbox(f"##chk_{key}", bool(ok))
+                    imgui.end_disabled()
+                imgui.same_line()
+                _ctext(GOOD if ok else FIX, text)
+
+            off_ns = st.get('utc_offset_ns')
+            if off_ns is None:
+                _row('time', False, "Time: waiting for backend!")
+            else:
+                drift_s = (off_ns + session_mod.mono_ns() - time.time_ns()) * 1e-9
+                _row('time', abs(drift_s) < 2.0,
+                     f"Time: {drift_s:+.1f} s vs system clock"
+                     + ("" if abs(drift_s) < 2.0 else " -- not real time!"))
+
+            mount_url = st.get('mount_url') or 'sim'
+            if not st.get('mount_connected'):
+                _row('mount', False, "Mount: not connected!")
+            elif mount_url == 'sim':
+                _row('mount', False, "Mount: connected but not real (sim)")
+            else:
+                _row('mount', True, f"Mount: connected ({mount_url})")
+
+            capturing = st.get('capturing') or {}
+            src = st.get('sources') or {}
+            cam_roles = [r for r in ('guide', 'main') if r in roles]
+            for role in cam_roles:
+                name = f"{role.capitalize()} cam"
+                if not capturing.get(role):
+                    _row(f'{role}_cam', False, f"{name}: not connected!")
+                elif src.get(role) != 'zwo':
+                    _row(f'{role}_cam', False,
+                         f"{name}: connected but not real ({src.get(role)})")
+                else:
+                    cc = (st.get('camera_caps') or {}).get(role) or {}
+                    vals = {c['name']: c.get('value') for c in cc.get('controls') or []}
+                    bits = [cc.get('camera') or 'zwo']
+                    if vals.get('exposure') is not None:
+                        bits.append(f"{float(vals['exposure']):g} ms")
+                    if vals.get('gain') is not None:
+                        bits.append(f"gain {float(vals['gain']):g}")
+                    _row(f'{role}_cam', True, f"{name}: connected ({'  '.join(bits)})")
+
+            opt_sel = st.get('optics_sel') or {}
+            for role in cam_roles:
+                sel = ' + '.join(n for n in (opt_sel.get(role) or []) if n)
+                if not sel:
+                    _row(f'{role}_optics', False,
+                         f"{role.capitalize()} optics: not set!", manual=True)
+                else:
+                    _row(f'{role}_optics', checklist_ui[f'{role}_optics'],
+                         f"{role.capitalize()} optics: {sel}", manual=True)
+            _row('focus', checklist_ui['focus'],
+                 "Focus: checked" if checklist_ui['focus'] else "Focus: not checked!",
+                 manual=True)
+            bm = (list(st.get('boresight_mrad') or []) + [0.0, 0.0, 0.0])[:3]
+            if not any(bm):
+                # A zero boresight is almost certainly "never measured" -- complain even if
+                # the box is ticked.
+                _row('boresight', False, "Boresight: still zero!", manual=True)
+            else:
+                _row('boresight', checklist_ui['boresight'],
+                     f"Boresight: ({bm[0]:g}, {bm[1]:g}, roll {bm[2]:g}) mrad", manual=True)
+
+            auto_record = bool((st.get('record_auto') or {}).get('main'))
+            _row('record', auto_record,
+                 "Main cam auto record: on (records while tracking)" if auto_record
+                 else "Main cam auto record: off!")
+            pref = st.get('track_pref') or '?'
+            _row('pref', pref == 'auto',
+                 "Tracking source: Auto" if pref == 'auto'
+                 else f"Tracking source: {pref} -- pinned, no handoff!")
+            _row('follow', bool(st.get('follow_enabled')),
+                 "Follow target: on" if st.get('follow_enabled')
+                 else "Follow target: off -- mount will not move!")
+            ff, pid = bool(st.get('track_feedforward')), bool(st.get('track_pid'))
+            enabled = [n for n, on in (('feedforward', ff), ('PID', pid)) if on]
+            _row('controller', bool(enabled),
+                 f"Controller: {' + '.join(enabled)}" if enabled
+                 else "Controller: feedforward and PID both off!")
+            detect_roles = set(st.get('detect_roles') or [])
+            missing = [r for r in cam_roles if r not in detect_roles]
+            _row('detectors', not missing,
+                 f"Detectors: {', '.join(sorted(detect_roles))}" if not missing
+                 else f"Detectors: missing {', '.join(missing)}!")
             imgui.tree_pop()
 
     # ---- main loop -----------------------------------------------------------------------------
