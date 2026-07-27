@@ -40,11 +40,66 @@ from astrolock.seeker import geometry as geo
 from astrolock.seeker.target_model import EmaAngularVelModel
 
 
+class SkyVectorPid:
+    """PID trim on the measured centering error, entirely in sky-vector space.
+
+    The error is the rotation vector carrying the hold-point direction onto the measured target
+    direction (their cross product; magnitude ~ the separation angle in radians). kp/ki/kd act on
+    that 3-vector, and the output is an angular-velocity vector (rad/s) -- the tracker converts it
+    to axis rates at the current pose. The integral's magnitude is clamped to integral_limit_rad_s
+    (the windup limit). Complements the feedforward servo: the servo chases the model's prediction,
+    this drives down whatever persistent offset survives it (rate execution error, model lag),
+    without either one knowing which it was.
+    """
+
+    def __init__(self, kp=0.0, ki=0.5, kd=0.0, integral_limit_rad_s=math.radians(0.02)):
+        self.kp, self.ki, self.kd = float(kp), float(ki), float(kd)
+        self.integral_limit = float(integral_limit_rad_s)
+        self.integral = torch.zeros(3, dtype=torch.float64)    # angular velocity (rad/s), sky space
+        self.output = torch.zeros(3, dtype=torch.float64)      # kp*e + integral + kd*de/dt
+        self._last_error = None                                # (t, error_vector) for dt and the D term
+
+    def ingest(self, t, hold_dir, measured_dir):
+        """One PID update, clocked by detections: dt is the time since the previous update."""
+        error = torch.linalg.cross(hold_dir, measured_dir)     # rotation hold -> target (small angle)
+        derivative = torch.zeros(3, dtype=torch.float64)
+        if self._last_error is not None:
+            t_prev, error_prev = self._last_error
+            dt = t - t_prev
+            if dt > 0.0:
+                self.integral = self.integral + error * (self.ki * dt)
+                norm = float(torch.linalg.norm(self.integral))
+                if norm > self.integral_limit:                 # windup limit: clamp the magnitude
+                    self.integral = self.integral * (self.integral_limit / norm)
+                derivative = (error - error_prev) / dt
+        self._last_error = (t, error)
+        self.output = error * self.kp + self.integral + derivative * self.kd
+
+    def reset(self):
+        """Zero everything (the tracker calls this whenever the trim isn't running --
+        disabled or not settled)."""
+        self.integral = torch.zeros(3, dtype=torch.float64)
+        self.output = torch.zeros(3, dtype=torch.float64)
+        self._last_error = None
+
+    def authority_used(self):
+        """Fraction of the windup limit the integral currently holds, 0..1."""
+        if self.integral_limit <= 0.0:
+            return 0.0
+        return float(torch.linalg.norm(self.integral)) / self.integral_limit
+
+
 class SkyTracker:
+    # PID settle dwell: the servo must intercept at the min horizon for this many consecutive
+    # min-horizons (= error-decay time constants) before the trim integrates -- lets the
+    # approach transient die out instead of winding the integral.
+    SETTLE_HORIZONS = 5.0
+
     def __init__(self, cx, cy, rad_per_px, max_rate_rad_s,
                  model=None, min_intercept_s=0.3, command_latency_s=0.15, max_horizon_s=8.0,
                  horizon_step_s=0.1, gate_px=80.0, lost_s=1.5, lock_min_time=1.0,
-                 sign_az=1.0, sign_alt=-1.0):
+                 sign_az=1.0, sign_alt=-1.0, feedforward_enabled=True, pid_enabled=True,
+                 pid=None):
         self.cx, self.cy = cx, cy
         self.rad_per_px = rad_per_px
         self.max_rate = max_rate_rad_s
@@ -57,6 +112,13 @@ class SkyTracker:
         self.lost_s = lost_s
         self.lock_min_time = lock_min_time
         self.sign_az, self.sign_alt = sign_az, sign_alt
+        self.feedforward_enabled = feedforward_enabled    # off: the intercept servo contributes no rates
+        self.pid_enabled = pid_enabled                    # off: the PID trim is zeroed and contributes nothing
+        self.pid = pid if pid is not None else SkyVectorPid()
+        self.intercept_at_min_horizon = False   # servo's last solve: soonest candidate was feasible
+        self._at_min_horizon_since = None       # when that first held, for the settle dwell
+        self._pid_pending = None                # (t, hold_dir, measured_dir) awaiting the settled check
+        self.pid_engaged = False                # trim currently integrating + contributing (for status)
         self.active = False
         self.single_target = False        # feed reports exactly the target (main extended cam) -> no association
         self.last_meas_px = None          # last ingested detection pixel (current role's frame), for the GUI
@@ -171,11 +233,14 @@ class SkyTracker:
 
     # ---- per-frame update ----
 
-    def update(self, st, blobs, new_data, obs_time, now):
+    def update(self, st, blobs, new_data, obs_time, now, driving=True):
         """Advance and return (rate_az, rate_alt, status, target_px).
 
         ``st`` is a fresh mount.get_state(); ``obs_time`` is the frame's capture time (for
-        reconstruction/ingest); ``now`` is the current time (the servo predicts into now + latency).
+        reconstruction/ingest); ``now`` is the current time (the servo predicts into now + latency);
+        ``driving`` says whether the backend is actually forwarding our rates to the mount
+        (False in watch-only mode and during the post-lock hold -- the PID must not integrate
+        an error it isn't being allowed to correct).
         status is 'track', 'coast' (settled lock lost -- keep intercepting the extrapolation), or
         'lost' (unsettled lock lost -- stop).
         """
@@ -194,8 +259,14 @@ class SkyTracker:
                 best = min(blobs, key=lambda b: math.hypot(b['px'][0] - epx, b['px'][1] - epy))
                 hit = math.hypot(best['px'][0] - epx, best['px'][1] - epy) <= self.gate_px
             if hit:
-                self.model.ingest(obs_time,
-                                  self._pixel_to_dir(best['px'][0], best['px'][1], oaz, oalt))
+                measured_dir = self._pixel_to_dir(best['px'][0], best['px'][1], oaz, oalt)
+                self.model.ingest(obs_time, measured_dir)
+                # PID trim error: hold-point direction vs the MEASURED target direction, both at
+                # the frame's capture time via the SAME interpolated pose -- ground truth as the
+                # detector sees it, no model. Held until _rates(), where THIS tick's servo solve
+                # decides whether we're settled enough to ingest it.
+                self._pid_pending = (obs_time,
+                                     self._pixel_to_dir(self.cx, self.cy, oaz, oalt), measured_dir)
                 self.last_meas_px = (best['px'][0], best['px'][1])
                 self.good_t = obs_time
                 if self.settled_since is None:
@@ -210,14 +281,72 @@ class SkyTracker:
 
         if (now - self.good_t) > self.lost_s:                   # lost the target
             if self.settled:                                    # PTO: keep intercepting the model
-                raz, ralt = self._servo(now)
+                raz, ralt = self._rates(now, driving)
                 self.last_rate = (raz, ralt)
                 return raz, ralt, 'coast', tpx
             return 0.0, 0.0, 'lost', tpx                        # RTLS: never settled -> stop
 
-        raz, ralt = self._servo(now)
+        raz, ralt = self._rates(now, driving)
         self.last_rate = (raz, ralt)
         return raz, ralt, 'track', tpx
+
+    def _rates(self, now, driving=True):
+        """Final commanded axis rates: the feedforward intercept servo plus the PID trim
+        (a disabled contributor adds zero).
+
+        Settled = the servo is off, or its solve has been intercepting at the MIN horizon
+        continuously for SETTLE_HORIZONS min-horizons. At the min horizon the position error
+        decays exponentially with the min horizon as its time constant, so the dwell waits
+        out ~5 decay constants of approach transient before the integral is allowed to see
+        any error. Whenever the PID is disabled or we are NOT settled -- the horizon had to
+        expand (pole tip-over, catch-up slew, near gimbal lock), nothing was reachable, the
+        dwell hasn't elapsed, or ``driving`` is False (our rates aren't reaching the mount:
+        watch-only, post-lock hold) -- the PID is zeroed and contributes nothing: a wound-up
+        integral parks a self-inflicted offset (clamp x 1/stiffness) that only unwinds at
+        1/(ki * min_horizon) per e-fold, and the near-pole axis-rate conversion blows up
+        exactly where the horizon expands. While running, the PID updates on each new
+        detection and its angular-velocity output is re-converted to axis rates every tick
+        at the pose where the command will land (cos(alt) drifts between updates)."""
+        raz, ralt = self._servo(now) if self.feedforward_enabled else (0.0, 0.0)
+        if not driving or (self.feedforward_enabled and not self.intercept_at_min_horizon):
+            # Our rates aren't reaching the mount (watch-only, post-lock hold) or the horizon
+            # expanded: not settled, and the dwell restarts from scratch.
+            self._at_min_horizon_since = None
+            settled = False
+        elif not self.feedforward_enabled:
+            settled = True                                # PID alone drives; no horizon to consult
+        else:
+            if self._at_min_horizon_since is None:
+                self._at_min_horizon_since = now
+            settled = (now - self._at_min_horizon_since) >= self.SETTLE_HORIZONS * self.min_intercept
+        self.pid_engaged = self.pid_enabled and settled
+        if not self.pid_engaged:
+            self._pid_pending = None
+            self.pid.reset()                              # disabled or unsettled: zero everything
+            return raz, ralt
+        if self._pid_pending is not None:
+            t, hold_dir, measured_dir = self._pid_pending
+            self._pid_pending = None
+            self.pid.ingest(t, hold_dir, measured_dir)
+        trim_az, trim_alt = self._trim_axis_rates(now + self.latency)
+        return raz + trim_az, ralt + trim_alt
+
+    def _trim_axis_rates(self, t):
+        """The PID's sky-space angular-velocity output as axis rates at the pose expected when
+        the command lands (t = now + latency). The output vector only changes at detection
+        updates, but this conversion runs every tick because cos(alt) drifts in between.
+
+        The demanded boresight velocity is output x forward; the az axis moves the boresight
+        along `side` at cos(alt) per radian of axis angle (d forward/d az = cos(alt) * side),
+        the alt axis along `up` at 1:1 -- signs stay correct through a pole tip-over because
+        cos(alt) goes negative with the pose."""
+        az, alt = self._pose_at(t)
+        R = geo.mount_matrix(az, alt)
+        velocity = torch.linalg.cross(self.pid.output, R[:, 0])
+        cos_alt = math.cos(alt)
+        if abs(cos_alt) < 1e-3:                        # at the pole az can't act; don't divide by ~0
+            cos_alt = math.copysign(1e-3, cos_alt if cos_alt != 0.0 else 1.0)
+        return float(torch.dot(velocity, R[:, 1])) / cos_alt, float(torch.dot(velocity, R[:, 2]))
 
     # ---- Layer B: minimum-time intercept ----
 
@@ -250,12 +379,14 @@ class SkyTracker:
         col = torch.nonzero(feas.any(dim=0))
         if len(col) > 0:
             j = int(col[0])                                     # soonest reachable arrival time
+            self.intercept_at_min_horizon = (j == 0)            # easy regime: no horizon expansion
             cost = torch.maximum(raz[:, j].abs(), ralt[:, j].abs())
             cost = torch.where(feas[:, j], cost, torch.full_like(cost, float('inf')))
             b = int(torch.argmin(cost))                         # gentler of the reachable poses
             return float(raz[b, j]), float(ralt[b, j])
 
         # Uncatchable within the horizon: least-infeasible pose, clamped to the motor limit.
+        self.intercept_at_min_horizon = False
         over = torch.maximum(raz.abs(), ralt.abs()) - m
         flat = int(torch.argmin(over))
         b, j = divmod(flat, n)

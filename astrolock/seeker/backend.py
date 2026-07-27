@@ -254,6 +254,34 @@ def main(argv=None):
                         "Live-adjustable in the GUI Tracking panel")
     p.add_argument('--track-max-horizon-s', type=float, default=8.0,
                    help="declare the target uncatchable if no intercept is reachable within this long")
+    p.add_argument('--track-position-smoothing-s', type=float, default=0.0,
+                   help="blend each position measurement into the model's extrapolated anchor with "
+                        "this EMA time constant (warmup-corrected: the first fix snaps). 0 = snap "
+                        "to every measurement (the original behavior). GUI: Tracking > Feedforward")
+    p.add_argument('--track-feedforward', dest='track_feedforward', action='store_true', default=True,
+                   help="feedforward intercept servo drives the mount (default on)")
+    p.add_argument('--no-track-feedforward', dest='track_feedforward', action='store_false',
+                   help="disable the feedforward servo -- only the PID trim (if enabled) drives")
+    p.add_argument('--track-pid', dest='track_pid', action='store_true', default=True,
+                   help="PID trim on the measured centering error, added to the servo rates "
+                        "(default on). Sky-vector space; see --track-pid-kp/-ki/-kd")
+    p.add_argument('--no-track-pid', dest='track_pid', action='store_false',
+                   help="disable the PID trim (its state is kept; re-enable live in the GUI)")
+    p.add_argument('--track-pid-kp', type=float, default=0.0,
+                   help="PID proportional gain (1/s) on the measured centering error. The servo "
+                        "already carries a P term (~1/min-intercept), so default 0")
+    p.add_argument('--track-pid-ki', type=float, default=0.5,
+                   help="PID integral gain (1/s^2): drives a persistent centering offset (rate "
+                        "execution error, model lag) to zero -- e-fold time is "
+                        "1/(ki * min-intercept), ~2 s at the defaults")
+    p.add_argument('--track-pid-kd', type=float, default=0.0,
+                   help="PID derivative gain (s * 1/s): damps on the measured error's rate of "
+                        "change; amplifies detection jitter, so default 0")
+    p.add_argument('--track-pid-integral-limit-deg-s', type=float, default=0.02,
+                   help="windup limit: clamp the magnitude of the PID's integral term to this "
+                        "rate (deg/s). Times the servo's 1/stiffness (= min intercept) this is "
+                        "also the max static offset a wound integral can park; keep it just "
+                        "above the largest genuine rate disturbance the trim must cancel")
     p.add_argument('--track-gate-px', type=float, default=80.0, help="max px to associate a blob to the target")
     p.add_argument('--track-lost-s', type=float, default=1.5, help="give up tracking after this long unmatched")
     p.add_argument('--track-lock-min-time', type=float, default=1.0,
@@ -1237,13 +1265,15 @@ def main(argv=None):
                     print(f"[backend] ignoring track on {role}: no detection with a capture "
                           f"time yet", flush=True)
                 if ft is not None:
-                    from astrolock.seeker.skytracker import SkyTracker
+                    from astrolock.seeker.skytracker import SkyTracker, SkyVectorPid
                     from astrolock.seeker.target_model import (EmaAngularVelModel,
                                                                GreatCircleModel)
                     model = (GreatCircleModel(smoothing_s=args.track_rate_smoothing_s,
+                                              position_smoothing_s=args.track_position_smoothing_s,
                                               altitude_m=args.track_alt_km * 1e3)
                              if args.track_model == 'greatcircle' else
-                             EmaAngularVelModel(smoothing_s=args.track_rate_smoothing_s))
+                             EmaAngularVelModel(smoothing_s=args.track_rate_smoothing_s,
+                                                position_smoothing_s=args.track_position_smoothing_s))
                     cx0, cy0 = hdr.image_width / 2.0, hdr.image_height / 2.0
                     track_center = (cx0, cy0)                 # true optical centre (for live re-offset)
                     if role == 'guide':                       # aim so the target lands in the main cam:
@@ -1257,7 +1287,14 @@ def main(argv=None):
                                          max_horizon_s=args.track_max_horizon_s,
                                          gate_px=args.track_gate_px, lost_s=args.track_lost_s,
                                          lock_min_time=args.track_lock_min_time,
-                                         sign_az=args.track_sign_az, sign_alt=args.track_sign_alt)
+                                         sign_az=args.track_sign_az, sign_alt=args.track_sign_alt,
+                                         feedforward_enabled=args.track_feedforward,
+                                         pid_enabled=args.track_pid,
+                                         pid=SkyVectorPid(
+                                             kp=args.track_pid_kp, ki=args.track_pid_ki,
+                                             kd=args.track_pid_kd,
+                                             integral_limit_rad_s=math.radians(
+                                                 args.track_pid_integral_limit_deg_s)))
                     tracker.start(float(px[0]), float(px[1]), ft, mount.get_state())
                     track_seen_det = latest_det_key[role]
                     tracking = True
@@ -1350,6 +1387,48 @@ def main(argv=None):
             v = max(0.5, min(2.0, float(cmd.get('value', args.track_rate_scale))))
             args.track_rate_scale = v                 # applied at the mount-forwarding point each tick
             print(f"[backend] track rate scale = {v:.4f}", flush=True)
+        elif t == 'set_track_position_smoothing':     # live tracker-tuning: anchor blend constant (s)
+            v = max(0.0, float(cmd.get('value', args.track_position_smoothing_s)))
+            args.track_position_smoothing_s = v       # remembered for the next lock...
+            if tracker is not None and hasattr(tracker.model, 'position_smoothing_s'):
+                tracker.model.position_smoothing_s = v    # ...and applied to the running lock now
+            print(f"[backend] track position smoothing = {v:.2f}s", flush=True)
+        elif t == 'set_track_horizons':               # live tracker-tuning: intercept time bounds (s)
+            if 'min_s' in cmd:
+                args.track_min_intercept_s = max(0.1, min(10.0, float(cmd['min_s'])))
+            if 'max_s' in cmd:
+                args.track_max_horizon_s = max(1.0, min(60.0, float(cmd['max_s'])))
+            args.track_max_horizon_s = max(args.track_max_horizon_s, args.track_min_intercept_s)
+            if tracker is not None:
+                tracker.min_intercept = args.track_min_intercept_s
+                tracker.max_horizon = args.track_max_horizon_s
+            print(f"[backend] track horizons: min intercept {args.track_min_intercept_s:.2f}s, "
+                  f"max {args.track_max_horizon_s:.1f}s", flush=True)
+        elif t == 'set_track_feedforward':            # enable/disable the intercept servo's rates
+            args.track_feedforward = bool(cmd.get('on', True))
+            if tracker is not None:
+                tracker.feedforward_enabled = args.track_feedforward
+            print(f"[backend] track feedforward {'ON' if args.track_feedforward else 'off'}", flush=True)
+        elif t == 'set_track_pid':                    # PID trim: enable + gains + windup limit, any subset
+            if 'on' in cmd:
+                args.track_pid = bool(cmd['on'])
+            if 'kp' in cmd:
+                args.track_pid_kp = float(cmd['kp'])
+            if 'ki' in cmd:
+                args.track_pid_ki = float(cmd['ki'])
+            if 'kd' in cmd:
+                args.track_pid_kd = float(cmd['kd'])
+            if 'integral_limit_deg_s' in cmd:
+                args.track_pid_integral_limit_deg_s = max(0.0, float(cmd['integral_limit_deg_s']))
+            if tracker is not None:                   # applied to the running lock right now
+                tracker.pid_enabled = args.track_pid
+                tracker.pid.kp = args.track_pid_kp
+                tracker.pid.ki = args.track_pid_ki
+                tracker.pid.kd = args.track_pid_kd
+                tracker.pid.integral_limit = math.radians(args.track_pid_integral_limit_deg_s)
+            print(f"[backend] track pid {'ON' if args.track_pid else 'off'}: "
+                  f"kp {args.track_pid_kp:g} ki {args.track_pid_ki:g} kd {args.track_pid_kd:g}, "
+                  f"integral limit {args.track_pid_integral_limit_deg_s:g} deg/s", flush=True)
         elif t == 'set_track_model':                  # target motion model for the NEXT lock
             m = cmd.get('model')
             if m in ('ema', 'greatcircle'):
@@ -1690,7 +1769,9 @@ def main(argv=None):
                         # SkyTracker returns final axis rates -- it owns the alt-az IK and its own pole
                         # handling (tips altitude over the top), given the mount-pose history + now.
                         raz, ralt, track_status, tpx = tracker.update(
-                            st, latest_blobs[role], True, ft, now)
+                            st, latest_blobs[role], True, ft, now,
+                            driving=(follow_enabled
+                                     and (now - track_started_t) >= track_delay_s))
                         if args.track_debug:
                             print(f"[track] cmd az {math.degrees(raz):+6.2f} alt {math.degrees(ralt):+6.2f} | "
                                   f"meas az {math.degrees(st['rate_az_rad_s']):+6.2f} "
@@ -1785,8 +1866,13 @@ def main(argv=None):
                 omega = math.degrees(tracker.target_speed_rad_s()) if tracker is not None else 0.0
                 hold = (" (watch-only: follow off)" if not follow_enabled
                         else (f" (mount holds {delay_left:.0f}s more)" if delay_left > 0 else ""))
+                pid_note = ""
+                if tracker is not None and tracker.pid_enabled:
+                    # Engaged: how much of the windup limit (= the trim's authority) is in use.
+                    pid_note = (f", pid {tracker.pid.authority_used() * 100:.0f}%"
+                                if tracker.pid_engaged else ", pid waiting")
                 backend_status = (f"{'following' if (follow_enabled and delay_left <= 0) else 'tracking'} "
-                                  f"{track_role}, target {omega:.2f} deg/s"
+                                  f"{track_role}, target {omega:.2f} deg/s{pid_note}"
                                   + (" (coasting)" if coasting else "") + hold)
             elif estop:
                 backend_status = "e-stopped"

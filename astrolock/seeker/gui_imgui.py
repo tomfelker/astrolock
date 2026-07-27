@@ -515,7 +515,13 @@ def main(argv=None):
                 'delay': 0.0,                                            # post-lock mount-hold (s)
                 'latency': 0.0,                                          # assumed command latency (s)
                 'rate_scale': 1.0,                                       # commanded-rate trim multiplier
-                'model': 'ema', 'alt_km': 250.0}                         # target model (next lock)
+                'model': 'ema', 'alt_km': 250.0,                         # target model (next lock)
+                'feedforward': True,                                     # intercept servo drives
+                'position_smoothing': 0.0,                               # model anchor blend constant (s)
+                'min_horizon': 1.0, 'max_horizon': 8.0,                  # intercept time bounds (s)
+                'pid_on': True,                                          # PID trim on the measured error
+                'pid_kp': 0.0, 'pid_ki': 0.5, 'pid_kd': 0.0,             # gains (sky-vector space)
+                'pid_integral_limit': 0.02}                              # windup limit (deg/s)
     sim_ui = {'r0': 0.0, 'bortle': 4}                     # Simulation panel: seeing r0 (m) + Bortle sky class
     focus_ui = {'role': roles[-1] if roles else 'main', 'want': False, 'fo': None,
                 't0': None, 'com_mult': 10.0,             # skew-arrow exaggeration on the star view
@@ -541,6 +547,13 @@ def main(argv=None):
                   'track_latency': f"{track_ui['latency']:g}",
                   'track_rate_scale': f"{track_ui['rate_scale']:g}",
                   'track_alt': f"{track_ui['alt_km']:g}",
+                  'track_position_smoothing': f"{track_ui['position_smoothing']:g}",
+                  'track_min_horizon': f"{track_ui['min_horizon']:g}",
+                  'track_max_horizon': f"{track_ui['max_horizon']:g}",
+                  'track_pid_kp': f"{track_ui['pid_kp']:g}",
+                  'track_pid_ki': f"{track_ui['pid_ki']:g}",
+                  'track_pid_kd': f"{track_ui['pid_kd']:g}",
+                  'track_pid_integral_limit': f"{track_ui['pid_integral_limit']:g}",
                   'focus_alpha': f"{focus_ui['alpha']:g}", 'focus_com_mult': f"{focus_ui['com_mult']:g}",
                   'focus_shape_gain': f"{focus_ui['shape_gain']:g}",
                   'sweep_start': f"{sweep_ui['start']:g}", 'sweep_end': f"{sweep_ui['end']:g}",
@@ -1560,6 +1573,13 @@ def main(argv=None):
                          'rate_scale': track_ui['rate_scale'], 'pref': track_ui['pref'],
                          'auto_switch': track_ui['auto_switch'], 'delay': track_ui['delay'],
                          'model': track_ui['model'], 'alt_km': track_ui['alt_km'],
+                         'feedforward': track_ui['feedforward'],
+                         'position_smoothing': track_ui['position_smoothing'],
+                         'min_horizon': track_ui['min_horizon'],
+                         'max_horizon': track_ui['max_horizon'],
+                         'pid_on': track_ui['pid_on'], 'pid_kp': track_ui['pid_kp'],
+                         'pid_ki': track_ui['pid_ki'], 'pid_kd': track_ui['pid_kd'],
+                         'pid_integral_limit': track_ui['pid_integral_limit'],
                          'follow': bool((ctrl['state'] or {}).get('follow_enabled', True))},
             'sim': {'r0': sim_ui['r0'], 'bortle': sim_ui['bortle']},   # per-cam defocus rides with the cam caps
             'focus': {'com_mult': focus_ui['com_mult'], 'shape_gain': focus_ui['shape_gain'],
@@ -1634,6 +1654,34 @@ def main(argv=None):
             ui['txt']['track_alt'] = f"{track_ui['alt_km']:g}"
             _send({'type': 'set_track_model', 'model': track_ui['model'],
                    'alt_km': track_ui['alt_km']})
+        if 'feedforward' in trk:
+            track_ui['feedforward'] = bool(trk['feedforward'])
+            _send({'type': 'set_track_feedforward', 'on': track_ui['feedforward']})
+        if 'position_smoothing' in trk:
+            track_ui['position_smoothing'] = max(0.0, float(trk['position_smoothing']))
+            ui['txt']['track_position_smoothing'] = f"{track_ui['position_smoothing']:g}"
+            _send({'type': 'set_track_position_smoothing',
+                   'value': track_ui['position_smoothing']})
+        if 'min_horizon' in trk or 'max_horizon' in trk:
+            track_ui['min_horizon'] = max(0.1, min(10.0, float(trk.get('min_horizon',
+                                                                       track_ui['min_horizon']))))
+            track_ui['max_horizon'] = max(1.0, min(60.0, float(trk.get('max_horizon',
+                                                                       track_ui['max_horizon']))))
+            track_ui['max_horizon'] = max(track_ui['max_horizon'], track_ui['min_horizon'])
+            ui['txt']['track_min_horizon'] = f"{track_ui['min_horizon']:g}"
+            ui['txt']['track_max_horizon'] = f"{track_ui['max_horizon']:g}"
+            _send({'type': 'set_track_horizons', 'min_s': track_ui['min_horizon'],
+                   'max_s': track_ui['max_horizon']})
+        if any(k in trk for k in ('pid_on', 'pid_kp', 'pid_ki', 'pid_kd', 'pid_integral_limit')):
+            track_ui['pid_on'] = bool(trk.get('pid_on', track_ui['pid_on']))
+            for k in ('pid_kp', 'pid_ki', 'pid_kd', 'pid_integral_limit'):
+                track_ui[k] = float(trk.get(k, track_ui[k]))
+                if k == 'pid_integral_limit':
+                    track_ui[k] = max(0.0, track_ui[k])
+                ui['txt'][f'track_{k}'] = f"{track_ui[k]:g}"
+            _send({'type': 'set_track_pid', 'on': track_ui['pid_on'],
+                   'kp': track_ui['pid_kp'], 'ki': track_ui['pid_ki'], 'kd': track_ui['pid_kd'],
+                   'integral_limit_deg_s': track_ui['pid_integral_limit']})
         if 'follow' in trk:
             _send({'type': 'follow', 'on': bool(trk['follow'])})
         sim = data.get('sim') or {}
@@ -2612,33 +2660,6 @@ def main(argv=None):
                 if imgui.button(('* ' if cur_pref == val else '  ') + lbl + f"##trk_pref_{val}", (S(56), 0)):
                     _set_track_pref(val)
                 imgui.end_disabled()
-            cur_model = st.get('track_model') or track_ui['model']
-            imgui.text("Model:")
-            _tip("Target motion model (applies at the NEXT lock). Sky: constant angular velocity "
-                 "across the sky -- right for anything far (stars, planes at range). Great "
-                 "Circle: a constant-altitude great circle about the Earth's centre -- right "
-                 "for LEO passes, where the zenith speed-up and horizon slow-down are "
-                 "perspective the Sky model has to chase but the orbit geometry produces for "
-                 "free.")
-            for val, lbl in (('ema', 'Sky'), ('greatcircle', 'Great Circle')):
-                imgui.same_line()
-                if imgui.button(('* ' if cur_model == val else '  ') + lbl + f"##trk_model_{val}"):
-                    track_ui['model'] = val
-                    _send({'type': 'set_track_model', 'model': val, 'alt_km': track_ui['alt_km']})
-            imgui.begin_disabled(cur_model != 'greatcircle')
-            imgui.text("Height:")
-            _tip("Assumed target altitude for the Great Circle model.")
-            imgui.same_line()
-
-            def _commit_alt(txt):
-                track_ui['alt_km'] = max(1.0, _flt(txt, track_ui['alt_km']))
-                _send({'type': 'set_track_model', 'model': track_ui['model'],
-                       'alt_km': track_ui['alt_km']})
-                return f"{track_ui['alt_km']:g}"
-            _input_commit('track_alt', S(48), _commit_alt)
-            imgui.same_line()
-            imgui.text_colored(C4(140, 145, 160), "km")
-            imgui.end_disabled()
             ch, v = imgui.checkbox("Auto switch to main pane##auto_switch", track_ui['auto_switch'])
             if ch:
                 track_ui['auto_switch'] = v
@@ -2669,45 +2690,6 @@ def main(argv=None):
                 _send({'type': 'untrack'})
             imgui.end_disabled()
             _tip("Drop the target lock entirely and halt the mount.")
-            imgui.text("Rate smoothing:")
-            _tip("EMA time constant for the target's angular-velocity estimate. Bigger = smoother "
-                 "(rides out sub-pixel detection jitter) but laggier on real acceleration; smaller = "
-                 "snappier but noisier. Applies live and to the next lock.")
-            imgui.same_line()
-
-            def _commit_smooth(txt):
-                track_ui['smoothing'] = max(0.0, _flt(txt, track_ui['smoothing']))
-                _send({'type': 'set_track_smoothing', 'value': track_ui['smoothing']})
-                return f"{track_ui['smoothing']:g}"
-            _input_commit('track_smooth', S(48), _commit_smooth)
-            imgui.same_line()
-            imgui.text_colored(C4(140, 145, 160), "s")
-            imgui.text("Command latency:")
-            _tip("Assumed delay before a mount rate command takes effect (serial pickup + wire + "
-                 "controller processing). The servo aims its intercept this far ahead; an "
-                 "under-modeled delay leaves the target trailing under acceleration. Try "
-                 "~0.05-0.3 s on the NexStar serial link; nudge while locked and watch the "
-                 "target re-centre. Negative is allowed: on the ideal sim mount it reproduces "
-                 "an UNDER-modeled latency. Applies live and to the next lock.")
-            imgui.same_line()
-
-            def _latency_set(v):
-                track_ui['latency'] = max(-5.0, min(5.0, v))
-                ui['txt']['track_latency'] = f"{track_ui['latency']:g}"
-                _send({'type': 'set_track_latency', 'value': track_ui['latency']})
-
-            def _commit_latency(txt):
-                _latency_set(_flt(txt, track_ui['latency']))
-                return ui['txt']['track_latency']
-            _input_commit('track_latency', S(48), _commit_latency)
-            imgui.same_line()
-            imgui.text_colored(C4(140, 145, 160), "s")
-            for label, delta in (('<<', -0.1), ('<', -0.02), ('>', +0.02), ('>>', +0.1)):
-                if label != '<<':
-                    imgui.same_line()
-                if imgui.button(f"  {label}  ##latency_nudge{delta}"):
-                    _latency_set(track_ui['latency'] + delta)
-                _tip(f"Nudge the assumed command latency by {delta:+g} s.")
             imgui.text("Rate scale:")
             _tip("Trim multiplier on the tracker's commanded rates, applied just before the mount "
                  "(manual slews are NOT scaled). If the mount executes rates slightly slow, the "
@@ -2732,6 +2714,183 @@ def main(argv=None):
                 if imgui.button(f"  {label}  ##rate_scale_nudge{delta}"):
                     _rate_scale_set(track_ui['rate_scale'] + delta)
                 _tip(f"Nudge the commanded-rate trim by {delta:+g} ({delta * 100:+g}%).")
+
+            def _send_horizons():
+                _send({'type': 'set_track_horizons', 'min_s': track_ui['min_horizon'],
+                       'max_s': track_ui['max_horizon']})
+
+            def _send_pid():
+                _send({'type': 'set_track_pid', 'on': track_ui['pid_on'],
+                       'kp': track_ui['pid_kp'], 'ki': track_ui['pid_ki'],
+                       'kd': track_ui['pid_kd'],
+                       'integral_limit_deg_s': track_ui['pid_integral_limit']})
+
+            if imgui.tree_node_ex("Feedforward", OPEN):
+                ch, v = imgui.checkbox("Enabled##feedforward_enable", track_ui['feedforward'])
+                if ch:
+                    track_ui['feedforward'] = v
+                    _send({'type': 'set_track_feedforward', 'on': v})
+                _tip("The feedforward intercept servo: aim at the model's predicted target position "
+                     "and command the rate that gets there. Off: it contributes no rates -- only "
+                     "the PID trim (if enabled) drives the mount. Applies live.")
+                cur_model = st.get('track_model') or track_ui['model']
+                imgui.text("Model:")
+                _tip("Target motion model (applies at the NEXT lock). Sky: constant angular velocity "
+                     "across the sky -- right for anything far (stars, planes at range). Great "
+                     "Circle: a constant-altitude great circle about the Earth's centre -- right "
+                     "for LEO passes, where the zenith speed-up and horizon slow-down are "
+                     "perspective the Sky model has to chase but the orbit geometry produces for "
+                     "free.")
+                for val, lbl in (('ema', 'Sky'), ('greatcircle', 'Great Circle')):
+                    imgui.same_line()
+                    if imgui.button(('* ' if cur_model == val else '  ') + lbl + f"##trk_model_{val}"):
+                        track_ui['model'] = val
+                        _send({'type': 'set_track_model', 'model': val, 'alt_km': track_ui['alt_km']})
+                imgui.begin_disabled(cur_model != 'greatcircle')
+                imgui.text("Height:")
+                _tip("Assumed target altitude for the Great Circle model.")
+                imgui.same_line()
+
+                def _commit_alt(txt):
+                    track_ui['alt_km'] = max(1.0, _flt(txt, track_ui['alt_km']))
+                    _send({'type': 'set_track_model', 'model': track_ui['model'],
+                           'alt_km': track_ui['alt_km']})
+                    return f"{track_ui['alt_km']:g}"
+                _input_commit('track_alt', S(48), _commit_alt)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "km")
+                imgui.end_disabled()
+                imgui.text("Rate smoothing:")
+                _tip("EMA time constant for the target's angular-velocity estimate. Bigger = smoother "
+                     "(rides out sub-pixel detection jitter) but laggier on real acceleration; smaller = "
+                     "snappier but noisier. Applies live and to the next lock.")
+                imgui.same_line()
+
+                def _commit_smooth(txt):
+                    track_ui['smoothing'] = max(0.0, _flt(txt, track_ui['smoothing']))
+                    _send({'type': 'set_track_smoothing', 'value': track_ui['smoothing']})
+                    return f"{track_ui['smoothing']:g}"
+                _input_commit('track_smooth', S(48), _commit_smooth)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "s")
+                imgui.text("Position smoothing:")
+                _tip("EMA time constant for blending each position measurement into the model's "
+                     "extrapolated position, instead of snapping the anchor to every measurement. "
+                     "Warmup-corrected: the first fix snaps, then the weight relaxes toward the "
+                     "steady EMA. 0 = always snap (the original behavior). Applies live and to "
+                     "the next lock.")
+                imgui.same_line()
+
+                def _commit_position_smoothing(txt):
+                    track_ui['position_smoothing'] = max(0.0, _flt(txt, track_ui['position_smoothing']))
+                    _send({'type': 'set_track_position_smoothing',
+                           'value': track_ui['position_smoothing']})
+                    return f"{track_ui['position_smoothing']:g}"
+                _input_commit('track_position_smoothing', S(48), _commit_position_smoothing)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "s")
+                imgui.text("Min horizon:")
+                _tip("Earliest allowed intercept time. Doubles as the servo's position stiffness "
+                     "(P ~ 1/this): smaller = stiffer chase, bigger = gentler. Applies live.")
+                imgui.same_line()
+
+                def _commit_min_horizon(txt):
+                    track_ui['min_horizon'] = max(0.1, min(10.0, _flt(txt, track_ui['min_horizon'])))
+                    if track_ui['max_horizon'] < track_ui['min_horizon']:
+                        track_ui['max_horizon'] = track_ui['min_horizon']
+                        ui['txt']['track_max_horizon'] = f"{track_ui['max_horizon']:g}"
+                    _send_horizons()
+                    return f"{track_ui['min_horizon']:g}"
+                _input_commit('track_min_horizon', S(48), _commit_min_horizon)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "s")
+                imgui.text("Max horizon:")
+                _tip("Declare the target uncatchable if no intercept is reachable within this long. "
+                     "Applies live.")
+                imgui.same_line()
+
+                def _commit_max_horizon(txt):
+                    track_ui['max_horizon'] = max(1.0, min(60.0, _flt(txt, track_ui['max_horizon'])))
+                    if track_ui['min_horizon'] > track_ui['max_horizon']:
+                        track_ui['min_horizon'] = track_ui['max_horizon']
+                        ui['txt']['track_min_horizon'] = f"{track_ui['min_horizon']:g}"
+                    _send_horizons()
+                    return f"{track_ui['max_horizon']:g}"
+                _input_commit('track_max_horizon', S(48), _commit_max_horizon)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "s")
+                imgui.text("Command latency:")
+                _tip("Assumed delay before a mount rate command takes effect (serial pickup + wire + "
+                     "controller processing). The servo aims its intercept this far ahead; an "
+                     "under-modeled delay leaves the target trailing under acceleration. Try "
+                     "~0.05-0.3 s on the NexStar serial link; nudge while locked and watch the "
+                     "target re-centre. Negative is allowed: on the ideal sim mount it reproduces "
+                     "an UNDER-modeled latency. Applies live and to the next lock.")
+                imgui.same_line()
+
+                def _latency_set(v):
+                    track_ui['latency'] = max(-5.0, min(5.0, v))
+                    ui['txt']['track_latency'] = f"{track_ui['latency']:g}"
+                    _send({'type': 'set_track_latency', 'value': track_ui['latency']})
+
+                def _commit_latency(txt):
+                    _latency_set(_flt(txt, track_ui['latency']))
+                    return ui['txt']['track_latency']
+                _input_commit('track_latency', S(48), _commit_latency)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "s")
+                for label, delta in (('<<', -0.1), ('<', -0.02), ('>', +0.02), ('>>', +0.1)):
+                    if label != '<<':
+                        imgui.same_line()
+                    if imgui.button(f"  {label}  ##latency_nudge{delta}"):
+                        _latency_set(track_ui['latency'] + delta)
+                    _tip(f"Nudge the assumed command latency by {delta:+g} s.")
+                imgui.tree_pop()
+            if imgui.tree_node_ex("PID", OPEN):
+                ch, v = imgui.checkbox("Enabled##pid_enable", track_ui['pid_on'])
+                if ch:
+                    track_ui['pid_on'] = v
+                    _send_pid()
+                _tip("PID trim on the MEASURED centering error -- the detected target direction vs "
+                     "the hold point, in sky-vector space -- added to the feedforward servo's "
+                     "rates. In practice a small I term: it grinds a persistent offset (mount "
+                     "rate execution error, model lag) to zero, e-fold time 1/(ki x min "
+                     "horizon). Runs only once settled: the servo must intercept at the min "
+                     "horizon for 5 consecutive min-horizons (waits out the approach transient "
+                     "-- not during catch-up slews or over the top); unsettled or disabled "
+                     "zeroes it. Applies live.")
+                for key, label, unit, tip in (
+                        ('pid_kp', 'kp:', '1/s',
+                         "Proportional gain on the measured centering error. The feedforward servo "
+                         "already carries a P term (~1/min-horizon), so usually 0."),
+                        ('pid_ki', 'ki:', '1/s^2',
+                         "Integral gain: drives a persistent centering offset to zero, e-fold "
+                         "time 1/(ki x min horizon) -- ~2 s at the defaults. The workhorse "
+                         "term. Applies only to NEW accumulation (the stored trim is not "
+                         "rescaled), so the clamp is the fast-acting knob, this is the slow one."),
+                        ('pid_kd', 'kd:', '',
+                         "Derivative gain on the measured error's rate of change. Amplifies "
+                         "detection jitter, so usually 0."),
+                        ('pid_integral_limit', 'Integral limit:', 'deg/s',
+                         "Windup limit: the integral term's magnitude is clamped to this rate. "
+                         "Times 1/stiffness (= min horizon) it is also the max static offset a "
+                         "wound integral can park us at; keep it just above the largest genuine "
+                         "rate disturbance the trim must cancel. Re-applied to the STORED trim "
+                         "on the next detection -- the fast-acting rescue knob.")):
+                    imgui.text(label)
+                    _tip(tip)
+                    imgui.same_line()
+
+                    def _commit_pid(txt, key=key):
+                        value = _flt(txt, track_ui[key])          # gains may be negative (sign tests)
+                        track_ui[key] = max(0.0, value) if key == 'pid_integral_limit' else value
+                        _send_pid()
+                        return f"{track_ui[key]:g}"
+                    _input_commit(f'track_{key}', S(48), _commit_pid)
+                    if unit:
+                        imgui.same_line()
+                        imgui.text_colored(C4(140, 145, 160), unit)
+                imgui.tree_pop()
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Settings"):

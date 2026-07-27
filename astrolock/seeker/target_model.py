@@ -35,6 +35,21 @@ class TargetModel:
         raise NotImplementedError
 
 
+def _position_blend_weight(dt, position_smoothing_s, norm):
+    """Warmup-corrected EMA weight for blending a new position measurement into the anchor.
+
+    Returns (effective_weight, updated_norm). The raw time-correct weight is
+    1 - exp(-dt/tau); ``norm`` accumulates total weight so early samples aren't biased
+    toward the (meaningless) initial anchor: the first blended sample gets weight 1
+    (snap), and the effective weight relaxes to the raw value as norm -> 1.
+    """
+    if position_smoothing_s <= 0.0:
+        return 1.0, 1.0                                    # smoothing off: snap (current behavior)
+    weight = 1.0 - math.exp(-dt / position_smoothing_s)
+    norm = norm * (1.0 - weight) + weight
+    return weight / norm, norm
+
+
 class GreatCircleModel(TargetModel):
     """Constant-ALTITUDE model: the target rides a great circle on a sphere of radius
     R_earth + altitude about the Earth's centre -- a blind circular-orbit LEO pass (no TLE).
@@ -51,14 +66,18 @@ class GreatCircleModel(TargetModel):
     below the boresight error budget -- deliberately ignored (blind model, not an ephemeris).
     """
 
-    def __init__(self, smoothing_s=0.5, altitude_m=250e3, earth_radius_m=6371e3):
+    def __init__(self, smoothing_s=0.5, position_smoothing_s=0.0, altitude_m=250e3,
+                 earth_radius_m=6371e3):
         self.smoothing_s = float(smoothing_s)                 # EMA time constant for the rate estimate (s)
+        self.position_smoothing_s = float(position_smoothing_s)   # anchor blend time constant (0 = snap)
         self.re = float(earth_radius_m)
         self.r = float(earth_radius_m) + float(altitude_m)    # sphere radius about the Earth's centre
         self._c = torch.tensor([0.0, 0.0, self.re], dtype=torch.float64)   # observer - Earth centre
         self.t = None
         self.u = None                                          # unit position about the Earth's centre
         self.ang_vel = torch.zeros(3, dtype=torch.float64)     # rad/s about the Earth's centre
+        self._measured_u = None                                # last RAW measurement (rate estimation)
+        self._position_weight_norm = 0.0                       # warmup-EMA weight accumulator
 
     def _project(self, d):
         """Observer-relative unit direction -> unit position on the sphere (about Earth centre).
@@ -76,15 +95,17 @@ class GreatCircleModel(TargetModel):
         u = self._project(d)
         t = float(t)
         if self.u is None:
-            self.u, self.t = u, t
+            self.u, self.t, self._measured_u = u, t, u
             return
         dt = t - self.t
         if dt <= 0.0:                                          # out-of-order / repeated frame: re-anchor
-            self.u, self.t = u, t
+            self.u, self.t, self._measured_u = u, t, u
             return
-        cross = torch.linalg.cross(self.u, u)
+        # Rate estimate from RAW consecutive measurements, not the blended anchor, so position
+        # smoothing can't leak a position correction into the angular-velocity estimate.
+        cross = torch.linalg.cross(self._measured_u, u)
         s = torch.linalg.norm(cross)
-        c = torch.dot(self.u, u)
+        c = torch.dot(self._measured_u, u)
         angle = torch.atan2(s, c)
         if float(s) > 1e-9:
             ang_vel_inst = cross / s * (angle / dt)            # axis * (angle/dt), about Earth centre
@@ -92,7 +113,19 @@ class GreatCircleModel(TargetModel):
             ang_vel_inst = torch.zeros(3, dtype=torch.float64)
         weight = 1.0 - math.exp(-dt / self.smoothing_s) if self.smoothing_s > 0.0 else 1.0
         self.ang_vel = self.ang_vel * (1.0 - weight) + ang_vel_inst * weight
-        self.u, self.t = u, t
+        self._measured_u = u
+        # Anchor: blend the measurement with the model's own extrapolation (warmup-EMA style --
+        # the first sample snaps, then the weight relaxes to 1 - exp(-dt/tau)). 0 = always snap.
+        blend, self._position_weight_norm = _position_blend_weight(
+            dt, self.position_smoothing_s, self._position_weight_norm)
+        if blend >= 1.0:
+            self.u = u
+        else:
+            rate = torch.linalg.norm(self.ang_vel)
+            extrapolated = (geo.normalize(geo.rodrigues(self.u, self.ang_vel / rate, rate * dt))
+                            if float(rate) > 1e-12 else self.u)
+            self.u = geo.normalize(extrapolated * (1.0 - blend) + u * blend)
+        self.t = t
 
     def predict(self, t):
         if self.u is None:
@@ -117,26 +150,30 @@ class EmaAngularVelModel(TargetModel):
     last direction about it (Rodrigues). Two observations are enough to predict motion; one holds still.
     """
 
-    def __init__(self, smoothing_s=0.5):
+    def __init__(self, smoothing_s=0.5, position_smoothing_s=0.0):
         self.smoothing_s = float(smoothing_s)                 # EMA time constant for the rate estimate (s)
+        self.position_smoothing_s = float(position_smoothing_s)   # anchor blend time constant (0 = snap)
         self.t = None                                          # time of the current direction anchor
         self.dir = None                                        # unit direction at self.t  (torch (3,))
         self.ang_vel = torch.zeros(3, dtype=torch.float64)     # angular velocity (rad/s): axis * rate
+        self._measured_dir = None                              # last RAW measurement (rate estimation)
+        self._position_weight_norm = 0.0                       # warmup-EMA weight accumulator
 
     def ingest(self, t, direction):
         d = geo.normalize(torch.as_tensor(direction, dtype=torch.float64))
         t = float(t)
         if self.dir is None:
-            self.dir, self.t = d, t
+            self.dir, self.t, self._measured_dir = d, t, d
             return
         dt = t - self.t
         if dt <= 0.0:                                          # out-of-order / repeated frame: re-anchor
-            self.dir, self.t = d, t
+            self.dir, self.t, self._measured_dir = d, t, d
             return
-        # Instantaneous angular velocity from the last direction to this one.
-        cross = torch.linalg.cross(self.dir, d)
+        # Instantaneous angular velocity from the last RAW measurement to this one (not the blended
+        # anchor, so position smoothing can't leak a position correction into the rate estimate).
+        cross = torch.linalg.cross(self._measured_dir, d)
         s = torch.linalg.norm(cross)
-        c = torch.dot(self.dir, d)
+        c = torch.dot(self._measured_dir, d)
         angle = torch.atan2(s, c)                              # unsigned angle between the two dirs
         if float(s) > 1e-9:
             ang_vel_inst = cross / s * (angle / dt)            # axis * (angle/dt)
@@ -144,7 +181,19 @@ class EmaAngularVelModel(TargetModel):
             ang_vel_inst = torch.zeros(3, dtype=torch.float64)
         weight = 1.0 - math.exp(-dt / self.smoothing_s) if self.smoothing_s > 0.0 else 1.0
         self.ang_vel = self.ang_vel * (1.0 - weight) + ang_vel_inst * weight
-        self.dir, self.t = d, t
+        self._measured_dir = d
+        # Anchor: blend the measurement with the model's own extrapolation (warmup-EMA style --
+        # the first sample snaps, then the weight relaxes to 1 - exp(-dt/tau)). 0 = always snap.
+        blend, self._position_weight_norm = _position_blend_weight(
+            dt, self.position_smoothing_s, self._position_weight_norm)
+        if blend >= 1.0:
+            self.dir = d
+        else:
+            rate = torch.linalg.norm(self.ang_vel)
+            extrapolated = (geo.normalize(geo.rodrigues(self.dir, self.ang_vel / rate, rate * dt))
+                            if float(rate) > 1e-12 else self.dir)
+            self.dir = geo.normalize(extrapolated * (1.0 - blend) + d * blend)
+        self.t = t
 
     def predict(self, t):
         if self.dir is None:
