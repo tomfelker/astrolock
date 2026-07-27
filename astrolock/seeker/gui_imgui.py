@@ -35,6 +35,7 @@ import threading
 import time
 
 import numpy as np
+import torch
 
 from astrolock.seeker import bayer, control, ser
 from astrolock.seeker import geometry as geo
@@ -42,6 +43,8 @@ from astrolock.seeker import optics as optics_db
 from astrolock.seeker import settings as settings_store
 from astrolock.seeker import framestream
 from astrolock.seeker import session as session_mod
+from astrolock.seeker import skysim
+from astrolock.seeker.almanac import SkyAlmanac
 from astrolock.seeker.follower import FrameRef, SerFollower
 from astrolock.seeker.sidecar import JsonlTailer
 
@@ -476,24 +479,11 @@ def main(argv=None):
     layout = {'panel_open': True, 'pip_open': True, 'pip_debug': False, 'panel_w': S(PANEL_W),
               'pip_h': S(200), 'big_role': roles[0] if roles else ROLES[0], 'big_stream': None,
               'pip_map': {}, 'pip_slots': []}
-    boresight_ui = {'x': 0.0, 'y': 0.0, 'step': 0.1}      # mrad; the Boresight panel's editor state
-    align_ui = {'yaw': 0.0}                               # deg; manual mount alignment (Alignment panel)
+    boresight_ui = {'x': 0.0, 'y': 0.0, 'roll': 0.0, 'step': 0.1}   # mrad; the Boresight panel's state
+    align_ui = {'step': 0.1}                              # deg; manual mount alignment (Alignment panel)
     site_ui = {'lat': 0.0, 'lon': 0.0, 'elev': 0.0}       # observer location (Location panel)
-    # Sky/navigation overlay: torch + the almanac reader are heavy imports, loaded on a
-    # background thread so GUI startup stays snappy ('no slow per-frame work' is the rule,
-    # not 'no torch'). nav['ready'] becomes (torch, SkyAlmanac, skysim) when loaded.
-    nav = {'ready': None, 'alm': None}
-
-    def _nav_loader():
-        try:
-            import torch as torch_
-            from astrolock.seeker.almanac import SkyAlmanac
-            from astrolock.seeker import skysim
-            nav['ready'] = (torch_, SkyAlmanac, skysim)
-        except Exception as e:
-            nav['ready'] = False
-            print(f"[gui] sky overlay unavailable ({e})", flush=True)
-    threading.Thread(target=_nav_loader, daemon=True).start()
+    # Sky/navigation overlay state: the almanac reader attaches once its feed file exists.
+    nav = {'alm': None}
 
     # Pose at the DISPLAYED frame's capture stamp, for the sky overlay -- the SAME solver the
     # tracker uses to place old detections on the sky (interpolate within the history,
@@ -501,14 +491,11 @@ def main(argv=None):
     pose_hist = geo.PoseHistory(maxlen=256)
 
     def _poll_navigation():
-        """Attach to the session's navigation feed once the imports are up, then tail it."""
-        if not nav['ready']:
-            return
+        """Attach to the session's navigation feed once it exists, then tail it."""
         if nav['alm'] is None:
             hits = glob.glob(os.path.join(args.session, '*_navigation.jsonl'))
             if not hits:
                 return
-            _, SkyAlmanac, _ = nav['ready']
             nav['alm'] = SkyAlmanac(max(hits, key=os.path.getmtime))
         nav['alm'].update()
     track_ui = {'smoothing': 1.0, 'pref': 'auto', 'auto_switch': True,   # Tracking panel state; backend defaults
@@ -541,7 +528,7 @@ def main(argv=None):
     FOCUS_MAX = 600                                       # rolling window of metric points kept in the graph
 
     # Immediate-mode UI state: text-input buffers + selections the panel reads/writes each frame.
-    ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'align_yaw': '0',
+    ui = {'txt': {'bore_x': '0', 'bore_y': '0', 'bore_roll': '0',
                   'track_delay': f"{track_ui['delay']:g}",
                   'sim_r0': f"{sim_ui['r0']:g}", 'track_smooth': f"{track_ui['smoothing']:g}",
                   'track_latency': f"{track_ui['latency']:g}",
@@ -872,6 +859,23 @@ def main(argv=None):
         for i, ln in enumerate(lines):
             _text(dl, A(SW / 2.0 - S(4) * len(ln), cy + i * S(22)), ln, S(18), (150, 155, 170, 255))
 
+    def _bore_guide_from_main():
+        """The guide_from_main boresight rotation from the backend's status (identity until it
+        arrives). All cross-camera pixel math goes through this matrix + the cameras'
+        perspective matrices -- unproject, rotate, reproject -- never per-axis trig."""
+        R9 = (ctrl['state'] or {}).get('boresight_rotation') or (1.0, 0.0, 0.0,
+                                                                 0.0, 1.0, 0.0,
+                                                                 0.0, 0.0, 1.0)
+        return torch.tensor([R9[0:3], R9[3:6], R9[6:9]], dtype=torch.float64)
+
+    def _cam_perspective(w, h, fv, cx=None, cy=None):
+        """Perspective matrix for a camera view (w, h) px spanning fv's FoV -- real frames and
+        display-scaled views alike (only the pixel unit changes)."""
+        fx = (w / 2.0) / math.tan(math.radians(fv['fov_x_deg'] / 2.0))
+        fy = (h / 2.0) / math.tan(math.radians(fv['fov_y_deg'] / 2.0))
+        return geo.perspective_matrix(fx, fy, w / 2.0 if cx is None else cx,
+                                      h / 2.0 if cy is None else cy)
+
     def _pane_geom(cam, stream, SW, SH):
         """(scale, offx, offy) of the letterboxed image in a pane -- shared by draw + click mapping.
 
@@ -898,11 +902,8 @@ def main(argv=None):
                         inner = fv2
                         break
             if inner is not None:
-                bmr = stt.get('boresight_mrad') or (0.0, 0.0)
-                fpx = (w / 2.0) / math.tan(math.radians(me['fov_x_deg'] / 2.0))
-                fpy = (h / 2.0) / math.tan(math.radians(me['fov_y_deg'] / 2.0))
-                mcx = w / 2.0 + fpx * math.tan(bmr[0] * 1e-3)   # main-FoV centre, frame px
-                mcy = h / 2.0 + fpy * math.tan(bmr[1] * 1e-3)
+                mcx, mcy = geo.project_pixel(_cam_perspective(w, h, me),   # main-FoV centre,
+                                             _bore_guide_from_main()[:, 0])   # frame px
                 offx, offy = SW / 2.0 - mcx * scale, SH / 2.0 - mcy * scale
         return scale, offx, offy
 
@@ -1011,8 +1012,6 @@ def main(argv=None):
         # --- Reticles = tracker inputs/info: crosshairs + main-cam FoV rect (red; pinhole tan-ratio) ---
         RED = COL_INPUT
         il, ir, it, ib = offx, offx + dw, offy, offy + dh   # image edges (not the letterbox bars)
-        bmr = stt.get('boresight_mrad') or (0.0, 0.0)       # main-vs-guide offset (mrad)
-        bore_x_rad, bore_y_rad = bmr[0] * 1e-3, bmr[1] * 1e-3
         if sset['reticles'] and role.endswith('_focus'):
             # Focus view is [EMA | instantaneous] side by side: one full crosshair PER HALF
             # (the plain single reticle would sit uselessly on the seam between them).
@@ -1032,27 +1031,45 @@ def main(argv=None):
                         inner = fv2
                         break
             if inner is not None:
-                # Main-cam FoV half-size (pinhole: a ray at half-angle th lands at focal_px*tan(th)).
-                hw = math.tan(math.radians(inner['fov_x_deg'] / 2)) / \
-                    math.tan(math.radians(me['fov_x_deg'] / 2)) * (dw / 2.0)
-                hh = math.tan(math.radians(inner['fov_y_deg'] / 2)) / \
-                    math.tan(math.radians(me['fov_y_deg'] / 2)) * (dh / 2.0)
-                fpx = (dw / 2.0) / math.tan(math.radians(me['fov_x_deg'] / 2.0))
-                fpy = (dh / 2.0) / math.tan(math.radians(me['fov_y_deg'] / 2.0))
-                mrcx, mrcy = cx + fpx * math.tan(bore_x_rad), cy + fpy * math.tan(bore_y_rad)
-                gh, gv = dw / 2.0 - hw, dh / 2.0 - hh   # image-edge -> centred-rect-edge gaps
-                # Centre crosshairs: from each image edge, 90% of the way to the *centred* rect edge.
-                dl.add_line(A(il, cy), A(il + 0.9 * gh, cy), C(RED), 1.0)
-                dl.add_line(A(ir, cy), A(ir - 0.9 * gh, cy), C(RED), 1.0)
-                dl.add_line(A(cx, it), A(cx, it + 0.9 * gv), C(RED), 1.0)
-                dl.add_line(A(cx, ib), A(cx, ib - 0.9 * gv), C(RED), 1.0)
-                # Main-cam rect + its own crosshair stubs (outside it) -- they meet the centre crosshairs
-                # iff the rect is centred, so a boresight offset shows as a visible break.
-                dl.add_rect(A(mrcx - hw, mrcy - hh), A(mrcx + hw, mrcy + hh), C(RED), 0.0, 1.0)
-                dl.add_line(A(mrcx - hw, mrcy), A(mrcx - hw - 0.1 * gh, mrcy), C(RED), 1.0)
-                dl.add_line(A(mrcx + hw, mrcy), A(mrcx + hw + 0.1 * gh, mrcy), C(RED), 1.0)
-                dl.add_line(A(mrcx, mrcy - hh), A(mrcx, mrcy - hh - 0.1 * gv), C(RED), 1.0)
-                dl.add_line(A(mrcx, mrcy + hh), A(mrcx, mrcy + hh + 0.1 * gv), C(RED), 1.0)
+                # Main-cam FoV: project the main frame's four CORNERS through guide_from_main
+                # into this view -- unproject, rotate, reproject. With a boresight roll the
+                # outline is a rotated quad, not an axis-aligned rect.
+                R = _bore_guide_from_main()
+                Kd = _cam_perspective(dw, dh, me, cx=cx, cy=cy)   # this (guide) view, display px
+                Km = _cam_perspective(2.0, 2.0, inner)            # main, a nominal 2x2-px frame
+
+                def _main_px_to_view(qx, qy):
+                    return geo.project_pixel(Kd, R @ torch.linalg.solve(
+                        Km, torch.tensor([qx, qy, 1.0], dtype=torch.float64)))
+
+                def _centred_view(qx, qy):
+                    """The same mapping with an identity boresight: where main-frame pixel
+                    (qx, qy) would sit if the quad were perfectly centred."""
+                    return geo.project_pixel(Kd, torch.linalg.solve(
+                        Km, torch.tensor([qx, qy, 1.0], dtype=torch.float64)))
+
+                quad = [_main_px_to_view(qx, qy)
+                        for qx, qy in ((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0))]
+                # Centre crosshairs: from each image edge inward, stopping exactly where the
+                # FoV stubs' TIPS sit when the quad is centred -- crosshair and stub meet iff
+                # the boresight is centred, so an offset shows as a visible break.
+                dl.add_line(A(il, cy), A(max(il, _centred_view(-1.0, 1.0)[0]), cy), C(RED), 1.0)
+                dl.add_line(A(ir, cy), A(min(ir, _centred_view(3.0, 1.0)[0]), cy), C(RED), 1.0)
+                dl.add_line(A(cx, it), A(cx, max(it, _centred_view(1.0, -1.0)[1])), C(RED), 1.0)
+                dl.add_line(A(cx, ib), A(cx, min(ib, _centred_view(1.0, 3.0)[1])), C(RED), 1.0)
+                # Main-cam quad + a stub off each side's midpoint. Stubs are MAIN-frame pixel
+                # segments (side midpoint, straight out of frame by half the frame size) mapped
+                # through the same unproject-rotate-reproject pipeline as the corners -- no
+                # screen-space geometry, so they stay correct under any roll. They line up with
+                # the centre crosshairs iff the quad is centred, so a boresight offset shows as
+                # a visible break (and a roll as a visible tilt).
+                for i in range(4):
+                    (x0q, y0q), (x1q, y1q) = quad[i], quad[(i + 1) % 4]
+                    dl.add_line(A(x0q, y0q), A(x1q, y1q), C(RED), 1.0)
+                for seg in (((1.0, 0.0), (1.0, -1.0)), ((2.0, 1.0), (3.0, 1.0)),
+                            ((1.0, 2.0), (1.0, 3.0)), ((0.0, 1.0), (-1.0, 1.0))):
+                    (x0q, y0q), (x1q, y1q) = (_main_px_to_view(*p) for p in seg)
+                    dl.add_line(A(x0q, y0q), A(x1q, y1q), C(RED), 1.0)
             else:
                 # Narrowest cam (main): crosshairs from each image edge to the pipper radius, so a
                 # centred target's pipper circle connects them.
@@ -1062,8 +1079,8 @@ def main(argv=None):
                 dl.add_line(A(cx, ib), A(cx, cy + PIPPER_R), C(RED), 1.0)
 
         # --- Sky overlay (navigation feed): five-pointed stars wherever the sky model puts
-        # things (stars, Sun/Moon/planets, the satellite), at the encoder pose + the manual
-        # Alignment yaw -- align by turning the yaw until they sit on the real sky. The star
+        # things (stars, Sun/Moon/planets, the satellite), at the encoder pose corrected by the
+        # manual Alignment matrix -- nudge until they sit on the real sky. The star
         # glyph MEANS 'drawn from alignment + sim time'; the satellite's upcoming pass adds a
         # line, and bodies with a real angular size get their disc at true scale. Projection =
         # skysim.project_dirs, the SAME pinhole math the sim renders with.
@@ -1074,7 +1091,6 @@ def main(argv=None):
             nav_names = nav['alm'].names
             nav_radius = nav['alm'].angular_radius_rad
             if fv_nav and nav_ids:
-                torch_, _, skysim_ = nav['ready']
                 # Everything evaluates AT THE DISPLAYED FRAME'S capture time: almanac query
                 # and pose alike, so the overlay can't lag the pixels it sits on.
                 t0 = int(cam.get('t_ns') or session_mod.mono_ns())
@@ -1083,8 +1099,8 @@ def main(argv=None):
                 else:                                     # no samples yet: latest state pose
                     az0 = math.radians(stt.get('enc_az_deg') or 0.0)
                     alt0 = math.radians(stt.get('enc_alt_deg') or 0.0)
-                az_nav = az0 + math.radians(stt.get('align_yaw_deg') or 0.0)
-                alt_nav = alt0
+                align9 = stt.get('align_matrix')          # sky_from_mount rotation (flat 3x3)
+                az_nav, alt_nav = az0, alt0
                 f_px_nav = (cam['w'] / 2.0) / math.tan(math.radians(fv_nav['fov_x_deg'] / 2.0))
                 cx_nav, cy_nav = cam['w'] / 2.0, cam['h'] / 2.0
                 # Two DIFFERENT kinds of thing, drawn differently:
@@ -1095,16 +1111,26 @@ def main(argv=None):
                 #    dir) fixes -- the fixes ARE the polyline, so just draw them, no lookup and no
                 #    resampling. Past fixes are already evicted at the query floor (~t0), so this
                 #    is now -> horizon. Not worth the complexity to also trim points behind us.
-                now_dirs, _mags = nav['alm'].dirs_at(torch_.tensor([t0], dtype=torch_.int64))
+                now_dirs, _mags = nav['alm'].dirs_at(torch.tensor([t0], dtype=torch.int64))
                 now_dirs = now_dirs[:, 0, :]                    # one current direction per target
                 track_index = nav_ids.index('sat:track') if 'sat:track' in nav_ids else -1
                 _track_times, track_dirs = nav['alm'].fixes('sat:track')   # raw pass fixes (points, 3)
                 # Project the glyphs (one per target) and the raw track fixes in ONE call, then split.
                 n_targets = len(nav_ids)
                 all_dirs = (now_dirs if track_dirs is None
-                            else torch_.cat([now_dirs, track_dirs], 0))
-                px, py, ok = skysim_.project_dirs(all_dirs, az_nav, alt_nav,
-                                                  f_px_nav, cx_nav, cy_nav)
+                            else torch.cat([now_dirs, track_dirs], 0))
+                if align9:
+                    # Apply the model rotation to the world dirs: dirs @ A applies A^T per row,
+                    # which projected at the raw encoder pose equals viewing through the aligned
+                    # orientation A @ M_enc. The backend's matrix is in geometry's (N,E,U) world
+                    # frame; the projector works in (E,N,U) -- same angles, x/y swapped -- so
+                    # permute the basis first.
+                    p = (1, 0, 2)
+                    all_dirs = all_dirs @ torch.tensor(
+                        [[align9[p[i] * 3 + p[j]] for j in range(3)] for i in range(3)],
+                        dtype=all_dirs.dtype)
+                px, py, ok = skysim.project_dirs(all_dirs, az_nav, alt_nav,
+                                                 f_px_nav, cx_nav, cy_nav)
                 px, py, ok = px.tolist(), py.tolist(), ok.tolist()
 
                 def to_pane(x, y):                # frame coords -> pane: +0.5 because a frame
@@ -1165,15 +1191,15 @@ def main(argv=None):
                 src, sf, mf = cams.get(active_src), optx.get(active_src), optx.get(role)
                 if src is not None and sf and mf:
                     gtx, gty = stt['target_px'][0] * src['ox'], stt['target_px'][1] * src['oy']
-                    sfx = (src['w'] / 2.0) / math.tan(math.radians(sf['fov_x_deg'] / 2.0))
-                    sfy = (src['h'] / 2.0) / math.tan(math.radians(sf['fov_y_deg'] / 2.0))
-                    mfx = (cam['w'] / 2.0) / math.tan(math.radians(mf['fov_x_deg'] / 2.0))
-                    mfy = (cam['h'] / 2.0) / math.tan(math.radians(mf['fov_y_deg'] / 2.0))
-                    # tan(angle) preserved across cams, shifted by the boresight: main = guide - boresight,
-                    # so guide->main subtracts it and main->guide adds it (keyed on which src is wider).
-                    bsign = -1.0 if sf['fov_x_deg'] >= mf['fov_x_deg'] else 1.0
-                    mtx = cam['w'] / 2.0 + ((gtx - src['w'] / 2.0) / sfx + bsign * math.tan(bore_x_rad)) * mfx
-                    mty = cam['h'] / 2.0 + ((gty - src['h'] / 2.0) / sfy + bsign * math.tan(bore_y_rad)) * mfy
+                    # Unproject from the source camera, rotate between the camera spaces
+                    # (guide_from_main; transposed when the source is the wider/guide side),
+                    # reproject through the destination camera. Matrices only -- exact across
+                    # the whole frame, not just on the boresight axis.
+                    R = _bore_guide_from_main()
+                    d = torch.linalg.solve(_cam_perspective(src['w'], src['h'], sf),
+                                           torch.tensor([gtx, gty, 1.0], dtype=torch.float64))
+                    d = (R.T if sf['fov_x_deg'] >= mf['fov_x_deg'] else R) @ d
+                    mtx, mty = geo.project_pixel(_cam_perspective(cam['w'], cam['h'], mf), d)
                     mpip = (offx + mtx * scale, offy + mty * scale)
         if mpip is not None:
             _draw_pipper(dl, A, mpip[0], mpip[1],
@@ -1333,7 +1359,7 @@ def main(argv=None):
         if cam is None:
             return
         if (ctrl['state'] or {}).get('tracking'):          # already locked -> a pane click doesn't re-target
-            return                                          # (right-click to unlock first, then pick a new one)
+            return                                          # (press Esc to unlock first, then pick a new one)
         mx, my = io.mouse_pos.x, io.mouse_pos.y
         scale, offx, offy = _pane_geom(cam, role, SW, SH)
         fx = ((mx - X0) - offx) / scale / cam['ox']         # pane screen -> texture px -> frame (detect) px
@@ -1378,7 +1404,6 @@ def main(argv=None):
         imgui.invisible_button(f"##pane_{name}", (max(1.0, w), max(1.0, h)),
                                imgui.ButtonFlags_.allow_overlap)
         clicked = imgui.is_item_clicked(0)
-        rclicked = imgui.is_item_clicked(1)
         draw_slot(name, X0, Y0, w, h, dl)
         imgui.set_cursor_pos((S(6), S(6)))                # toolbar: real buttons, over the image
         for label, action, checked in _toolbar_defs(name):
@@ -1394,8 +1419,6 @@ def main(argv=None):
         imgui.pop_style_color()
         if clicked:
             _pane_click(name, X0, Y0, w, h)
-        if rclicked:
-            _send({'type': 'untrack'})
 
     # ---- optics DB gear pickers ----------------------------------------------------------------
     _SENS, _OPT, _RED = optics_db.load_db()
@@ -1563,8 +1586,10 @@ def main(argv=None):
                               for role in roles},
             },
             'cameras': {role: ui['src'].get(role) for role in roles if ui['src'].get(role)},
-            'boresight': [boresight_ui['x'], boresight_ui['y']],
-            'alignment': {'yaw_deg': align_ui['yaw']},
+            'boresight': [boresight_ui['x'], boresight_ui['y'], boresight_ui['roll']],
+            # The alignment matrix lives on the backend; persist its latest published value.
+            'alignment': {'matrix': (ctrl['state'] or {}).get('align_matrix')
+                                    or [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]},
             # Location persists; TIME deliberately does not (a stale offset next session would be
             # worse than starting at the system clock).
             'location': {'lat_deg': site_ui['lat'], 'lon_deg': site_ui['lon'],
@@ -1616,12 +1641,11 @@ def main(argv=None):
                 _on_source_pick(role, val)              # push the loaded source (+ camera) to the backend
         b = data.get('boresight')
         if b and len(b) >= 2:
-            _bore_set(b[0], b[1])                       # updates the buffers + pushes to the backend
+            _bore_set(b[0], b[1], b[2] if len(b) > 2 else 0.0)   # update buffers + push to the backend
             ctrl['bore_init'] = True                    # ...and don't let the state-init clobber it
         al = data.get('alignment') or {}
-        if 'yaw_deg' in al:
-            _align_set(al['yaw_deg'])                   # push the saved alignment to the backend
-            ctrl['align_init'] = True
+        if al.get('matrix') and len(al['matrix']) == 9:   # push the saved alignment to the backend
+            _send({'type': 'set_alignment', 'matrix': [float(v) for v in al['matrix']]})
         loc = data.get('location') or {}
         if 'lat_deg' in loc:
             _site_set(loc['lat_deg'], loc.get('lon_deg', 0.0), loc.get('elev_m', 0.0))
@@ -1717,13 +1741,9 @@ def main(argv=None):
 
     # ---- Boresight / Tracking / Simulation setters ----------------------------------------------
     def _bore_send():
-        _send({'type': 'set_boresight', 'x_mrad': boresight_ui['x'], 'y_mrad': boresight_ui['y']})
+        _send({'type': 'set_boresight', 'x_mrad': boresight_ui['x'], 'y_mrad': boresight_ui['y'],
+               'roll_mrad': boresight_ui['roll']})
 
-    def _align_set(yaw_deg, send=True):
-        align_ui['yaw'] = float(yaw_deg)
-        ui['txt']['align_yaw'] = f"{align_ui['yaw']:.4g}"
-        if send:
-            _send({'type': 'set_alignment', 'yaw_deg': align_ui['yaw']})
 
     def _site_set(lat_deg, lon_deg, elev_m, send=True):
         site_ui['lat'], site_ui['lon'] = float(lat_deg), float(lon_deg)
@@ -1735,12 +1755,54 @@ def main(argv=None):
             _send({'type': 'set_site', 'lat_deg': site_ui['lat'], 'lon_deg': site_ui['lon'],
                    'elev_m': site_ui['elev']})
 
-    def _bore_set(x, y, send=True):
-        boresight_ui['x'], boresight_ui['y'] = float(x), float(y)
+    def _bore_set(x, y, roll, send=True):
+        boresight_ui['x'], boresight_ui['y'], boresight_ui['roll'] = float(x), float(y), float(roll)
         ui['txt']['bore_x'] = f"{boresight_ui['x']:.4g}"
         ui['txt']['bore_y'] = f"{boresight_ui['y']:.4g}"
+        ui['txt']['bore_roll'] = f"{boresight_ui['roll']:.4g}"
         if send:
             _bore_send()
+
+    def _euler_nudge_widget(wid, ui_state, unit, noun, on_nudge, on_reset, reset_tip):
+        """The 'accurately set some euler angles' widget shared by Boresight and Alignment:
+        a step-size combo, a 3x3 grid of screen-direction nudges, and a roll pair. Grid labels
+        say where `noun` MOVES on screen; on_nudge(dx, dy, droll) receives screen-convention
+        deltas (x right, y down, roll clockwise), already scaled by the step."""
+        imgui.text("step:")
+        imgui.same_line()
+        steps = ['0.01', '0.1', '1', '10']
+        cur = f"{ui_state['step']:g}"
+        sidx = steps.index(cur) if cur in steps else 1
+        imgui.set_next_item_width(S(64))
+        ch, nidx = imgui.combo(f"##{wid}_step", sidx, steps)
+        if ch:
+            ui_state['step'] = float(steps[nidx])
+        imgui.same_line()
+        imgui.text_colored(C4(140, 145, 160), unit)
+        _tip("Sensitivity for the nudge buttons below.")
+        s_ = ui_state['step']
+        for rowdefs in ((('NW', -1, -1), ('N', 0, -1), ('NE', +1, -1)),
+                        (('W', -1, 0), ('0', 0, 0), ('E', +1, 0)),
+                        (('SW', -1, +1), ('S', 0, +1), ('SE', +1, +1))):
+            for i, (lbl, dx, dy) in enumerate(rowdefs):
+                if i:
+                    imgui.same_line()
+                if imgui.button(f"{lbl}##{wid}_grid", (S(30), 0)):
+                    if (dx, dy) == (0, 0):
+                        on_reset()
+                    else:
+                        on_nudge(dx * s_, dy * s_, 0.0)
+                _tip(reset_tip if (dx, dy) == (0, 0) else
+                     f"Move {noun} {lbl} by {s_:g} {unit}.")
+        imgui.text("roll:")
+        imgui.same_line()
+        for lbl, sign in (('  <  ', -1.0), ('  >  ', +1.0)):
+            if sign > 0:
+                imgui.same_line()
+            if imgui.button(f"{lbl}##{wid}_roll{sign}"):
+                on_nudge(0.0, 0.0, sign * s_)
+            _tip(f"Rotate {noun} {'clockwise' if sign > 0 else 'counterclockwise'} "
+                 f"by {s_:g} {unit}.")
 
     def _set_track_pref(val):
         track_ui['pref'] = val
@@ -1948,6 +2010,12 @@ def main(argv=None):
         _poll_focus_metrics()                           # tail focus metrics into the graphs
         _poll_sweep()                                   # tail sweep prompts/result (if one ran)
         _poll_navigation()                              # tail the sparse sky feed (overlay)
+        # Esc drops the current lock -- same as the Unlock button, but reachable on a laptop
+        # in the dark without aiming at a pane. Not while a text field owns the keyboard
+        # (there Esc means 'cancel this edit').
+        if ((st or {}).get('tracking') and imgui.is_key_pressed(imgui.Key.escape)
+                and not imgui.get_io().want_text_input):
+            _send({'type': 'untrack'})
         # Auto-switch the main pane to follow the active tracking source (as if its ^ button were pressed):
         # only when the *previously* active cam is the one currently in the big pane, so manual choices hold.
         tr = (st or {}).get('track_role')
@@ -1955,6 +2023,8 @@ def main(argv=None):
         if (tr and prev and tr != prev and track_ui['auto_switch']
                 and layout['big_role'] == prev and tr in roles):
             layout['big_role'] = tr
+        elif prev and not tr and track_ui['auto_switch'] and 'guide' in roles:
+            layout['big_role'] = 'guide'    # lock ended: back to the wide view to pick a new target
         ctrl['prev_track_role'] = tr
 
         src_init = ctrl.setdefault('src_init', set())
@@ -1999,13 +2069,9 @@ def main(argv=None):
 
         # One-time init of the boresight editor from the backend's value (settings load may override).
         if 'bore_init' not in ctrl and st and st.get('boresight_mrad') is not None:
-            bx, by = (list(st['boresight_mrad']) + [0.0, 0.0])[:2]
-            _bore_set(bx, by, send=False)              # reflect the backend's value; don't echo it back
+            bx, by, br = (list(st['boresight_mrad']) + [0.0, 0.0, 0.0])[:3]
+            _bore_set(bx, by, br, send=False)          # reflect the backend's value; don't echo it back
             ctrl['bore_init'] = True
-
-        if 'align_init' not in ctrl and st and st.get('align_yaw_deg') is not None:
-            _align_set(st['align_yaw_deg'], send=False)
-            ctrl['align_init'] = True
 
         if 'site_init' not in ctrl and st and st.get('site') is not None:
             s = st['site']
@@ -2139,8 +2205,8 @@ def main(argv=None):
         if ch:
             sset['show_stars'] = v
         _tip("Overlay the sky model on this pane: five-pointed stars for everything it places "
-             "(stars, Sun/Moon/planets, the satellite + its pass line), at the encoder pose + "
-             "Alignment yaw.")
+             "(stars, Sun/Moon/planets, the satellite + its pass line), at the encoder pose "
+             "corrected by the Alignment matrix.")
         ch, v = imgui.checkbox(f"Show target names##tnames_{role}",
                                sset.get('show_target_names', True))
         if ch:
@@ -2400,7 +2466,7 @@ def main(argv=None):
             imgui.same_line()
 
             def _commit_bx(txt):
-                _bore_set(_flt(txt, boresight_ui['x']), boresight_ui['y'])
+                _bore_set(_flt(txt, boresight_ui['x']), boresight_ui['y'], boresight_ui['roll'])
                 return ui['txt']['bore_x']
             _input_commit('bore_x', S(56), _commit_bx)
             imgui.same_line()
@@ -2408,57 +2474,74 @@ def main(argv=None):
             imgui.same_line()
 
             def _commit_by(txt):
-                _bore_set(boresight_ui['x'], _flt(txt, boresight_ui['y']))
+                _bore_set(boresight_ui['x'], _flt(txt, boresight_ui['y']), boresight_ui['roll'])
                 return ui['txt']['bore_y']
             _input_commit('bore_y', S(56), _commit_by)
             imgui.same_line()
-            imgui.text_colored(C4(140, 145, 160), "mrad")
-            imgui.text("step:")
+            imgui.text("Roll:")
             imgui.same_line()
-            steps = ['0.01', '0.1', '1', '10']
-            cur = f"{boresight_ui['step']:g}"
-            sidx = steps.index(cur) if cur in steps else 1
-            imgui.set_next_item_width(S(64))
-            ch, nidx = imgui.combo("##bore_step", sidx, steps)
-            if ch:
-                boresight_ui['step'] = float(steps[nidx])
+
+            def _commit_broll(txt):
+                _bore_set(boresight_ui['x'], boresight_ui['y'], _flt(txt, boresight_ui['roll']))
+                return ui['txt']['bore_roll']
+            _input_commit('bore_roll', S(56), _commit_broll)
             imgui.same_line()
             imgui.text_colored(C4(140, 145, 160), "mrad")
-            # 3x3 nudge grid (image frame: N=up=-y, S=down=+y, E=right=+x, W=left=-x); centre resets to 0.
-            for rowdefs in ((('NW', -1, -1), ('N', 0, -1), ('NE', 1, -1)),
-                            (('W', -1, 0), ('0', 0, 0), ('E', 1, 0)),
-                            (('SW', -1, 1), ('S', 0, 1), ('SE', 1, 1))):
-                for i, (lbl, dx, dy) in enumerate(rowdefs):
-                    if i:
-                        imgui.same_line()
-                    if imgui.button(f"{lbl}##bore", (S(30), 0)):
-                        if (dx, dy) == (0, 0):
-                            _bore_set(0.0, 0.0)
-                        else:
-                            s_ = boresight_ui['step']
-                            _bore_set(boresight_ui['x'] + dx * s_, boresight_ui['y'] + dy * s_)
+            _euler_nudge_widget(
+                'bore', boresight_ui, 'mrad', "the main-cam FoV marker",
+                on_nudge=lambda dx, dy, dr: _bore_set(boresight_ui['x'] + dx,
+                                                      boresight_ui['y'] + dy,
+                                                      boresight_ui['roll'] + dr),
+                on_reset=lambda: _bore_set(0.0, 0.0, 0.0),
+                reset_tip="Reset the boresight (X, Y, and Roll) to 0.")
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Alignment"):
-            imgui.text("Yaw offset:")
-            _tip("Manual mount alignment: degrees added to the encoder azimuth when projecting "
-                 "the sky onto the cameras. Tweak until the gold star overlay sits on the real "
-                 "stars, then the satellite pass line is where the satellite will actually fly. "
-                 "(No plate solving yet -- this is the rudimentary version.)")
-            imgui.same_line()
+            _tip("Manual mount alignment: one rotation matrix correcting the encoder-derived "
+                 "pointing (azimuth zero, tripod tilt, roll). Nudge until the gold star overlay "
+                 "sits on the real stars, then the satellite pass line is where the satellite "
+                 "will actually fly. (No plate solving yet -- this is the manual version.)")
+            # Euler readout/editor of the matrix (yaw about sky up, pitch about east, roll
+            # about north -- geo.matrix_from_euler's convention). Refreshed from the backend
+            # whenever the matrix changes (nudges included); committing a value re-composes
+            # the matrix and sends it whole.
+            a9 = tuple((st or {}).get('align_matrix') or ())
+            if len(a9) == 9 and a9 != ctrl.get('align_euler_cache'):
+                ctrl['align_euler_cache'] = a9
+                yaw_rad, pitch_rad, roll_rad = geo.euler_from_matrix(
+                    torch.tensor([a9[0:3], a9[3:6], a9[6:9]], dtype=torch.float64))
+                ui['txt']['align_yaw'] = f"{math.degrees(yaw_rad):.4g}"
+                ui['txt']['align_pitch'] = f"{math.degrees(pitch_rad):.4g}"
+                ui['txt']['align_roll'] = f"{math.degrees(roll_rad):.4g}"
 
-            def _commit_align(txt):
-                _align_set(_flt(txt, align_ui['yaw']))
-                return ui['txt']['align_yaw']
-            _input_commit('align_yaw', S(64), _commit_align)
+            def _commit_align_euler(txt, key):
+                vals = [_flt(txt if k == key else ui['txt'].get(k, '0'), 0.0)
+                        for k in ('align_yaw', 'align_pitch', 'align_roll')]
+                matrix = geo.matrix_from_euler(*(math.radians(v) for v in vals))
+                _send({'type': 'set_alignment',
+                       'matrix': [float(v) for v in matrix.reshape(-1)]})
+                return f"{_flt(txt, 0.0):.4g}"
+
+            for label, key in (('Yaw:', 'align_yaw'), ('Pitch:', 'align_pitch'),
+                               ('Roll:', 'align_roll')):
+                if key != 'align_yaw':
+                    imgui.same_line()
+                imgui.text(label)
+                imgui.same_line()
+                _input_commit(key, S(56), lambda t, k=key: _commit_align_euler(t, k))
             imgui.same_line()
             imgui.text_colored(C4(140, 145, 160), "deg")
-            for label, delta in (('<<', -1.0), ('<', -0.1), ('>', +0.1), ('>>', +1.0)):
-                if label != '<<':
-                    imgui.same_line()
-                if imgui.button(f"  {label}  ##align_nudge{delta}"):
-                    _align_set(align_ui['yaw'] + delta)
-                _tip(f"Nudge the yaw offset by {delta:+g} deg.")
+            # The nudges are camera-local rotations evaluated on the modeled orientation
+            # (screen deltas: overlay up = camera pitched down about its side axis, overlay
+            # right = camera yawed left about its up axis, roll clockwise = +roll about the
+            # boresight), so a button's on-screen effect is the same no matter how much
+            # alignment is already dialed in.
+            _euler_nudge_widget(
+                'align', align_ui, 'deg', "the star overlay",
+                on_nudge=lambda dx, dy, dr: _send({'type': 'align_nudge', 'pitch_deg': -dy,
+                                                   'yaw_deg': -dx, 'roll_deg': dr}),
+                on_reset=lambda: _send({'type': 'align_nudge', 'reset': True}),
+                reset_tip="Reset the alignment matrix to identity.")
             imgui.tree_pop()
         imgui.separator()
         if imgui.tree_node_ex("Focus"):          # focus + collimation assist (see astrolock.seeker.focus)

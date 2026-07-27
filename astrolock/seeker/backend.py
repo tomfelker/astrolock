@@ -33,9 +33,12 @@ import sys
 import threading
 import time
 
+import torch
+
 from astrolock.seeker import cam as cam_mod
 from astrolock.seeker import control
 from astrolock.seeker import framestream
+from astrolock.seeker import geometry as geo
 from astrolock.seeker import mount as mount_mod
 from astrolock.seeker import session as session_mod
 from astrolock.seeker import sidecar
@@ -43,6 +46,8 @@ from astrolock.seeker import tles
 from astrolock.seeker import optics
 from astrolock.seeker.follower import SerFollower
 from astrolock.seeker.sidecar import JsonlWriter, JsonlTailer
+from astrolock.seeker.skytracker import SkyTracker, SkyVectorPid
+from astrolock.seeker.target_model import EmaAngularVelModel, GreatCircleModel
 
 
 def _spawn(module, args):
@@ -317,10 +322,9 @@ def main(argv=None):
                         "cam. Tune live in the GUI (Boresight).")
     p.add_argument('--boresight-y-mrad', type=float, default=0.0,
                    help="boresight Y offset (mrad, guide image down)")
-    p.add_argument('--align-yaw-deg', type=float, default=0.0,
-                   help="mount alignment: azimuth (yaw) offset added to the encoder azimuth when "
-                        "mapping sky to camera -- rudimentary manual alignment, tuned live in the "
-                        "GUI (Alignment) until the star overlay sits on the real stars")
+    p.add_argument('--boresight-roll-mrad', type=float, default=0.0,
+                   help="boresight roll (mrad, clockwise in the guide view): how the main "
+                        "camera is rotated about its own boresight relative to the guide")
     p.add_argument('--track-debug', action='store_true',
                    help="print per-frame commanded vs measured axis rates and target offset")
     p.add_argument('--sky-tle-file', default='data/iss_25544.tle',
@@ -581,10 +585,25 @@ def main(argv=None):
     handoff_fine = None       # the finer role to promote to (e.g. 'main'), or None if none is eligible
     handoff_conf = 0.0        # seconds-of-evidence accumulator, clamped to [0, --handoff-promote-s]
     track_pref = 'auto'       # GUI radio: 'guide' (pin), 'main' (prefer), or 'auto' (hysteresis handoff)
-    # Boresight: where the main cam points relative to the guide, as an image-frame angular offset
-    # (x right, y down), radians. Offsets the guide tracker's hold point so the target lands in the main.
-    boresight = {'x': args.boresight_x_mrad * 1e-3, 'y': args.boresight_y_mrad * 1e-3}
-    alignment = {'yaw_deg': args.align_yaw_deg}    # backend-owned so future pointing math inherits it
+    # Boresight: how the main cam sits relative to the guide -- three angles from the GUI
+    # (x = guide image right, y = down, roll = clockwise in the guide view; radians), applied
+    # everywhere as the guide_from_main ROTATION they define (never a raw pixel offset /
+    # projection skew).
+    boresight = {'x': args.boresight_x_mrad * 1e-3, 'y': args.boresight_y_mrad * 1e-3,
+                 'roll': args.boresight_roll_mrad * 1e-3}
+    bore_rotation = geo.boresight_rotation(boresight['x'], boresight['y'], boresight['roll'])
+
+    def boresight_pixel(rpp, cx, cy):
+        """Where the main boresight sits in a guide frame with centre (cx, cy): the rotation's
+        forward column projected through the guide's perspective matrix."""
+        return geo.project_pixel(geo.perspective_matrix(1.0 / rpp, 1.0 / rpp, cx, cy),
+                                 bore_rotation[:, 0])
+    # Mount alignment, backend-owned so future pointing math inherits it: ONE rotation matrix,
+    # sky_from_mount -- the modeled camera orientation is align_matrix @ geo.mount_matrix(enc),
+    # i.e. it corrects the encoder-derived orientation into true sky pointing (azimuth zero,
+    # tripod tilt, and roll all live in here). Built up from the GUI's camera-frame
+    # pitch/yaw/roll nudges (align_nudge) and restored whole from settings (set_alignment).
+    align_matrix = torch.eye(3, dtype=torch.float64)
     rad_per_px = (math.radians(args.arcsec_per_px / 3600.0) if args.arcsec_per_px > 0
                   else args.sky_pixel_um * 1e-3 / args.sky_focal_mm)
     # Per-role plate scale from the optics DB if a sensor+optic is named for that role; else the
@@ -1043,8 +1062,7 @@ def main(argv=None):
         rpp = rad_per_px_by_role.get(role, rad_per_px) * frame_binning(role)
         cx, cy = hdr.image_width / 2.0, hdr.image_height / 2.0
         if role == 'guide':
-            cx += boresight['x'] / rpp
-            cy += boresight['y'] / rpp
+            cx, cy = boresight_pixel(rpp, cx, cy)
         return cx, cy, rpp, args.track_sign_az, args.track_sign_alt
 
     def _fine_present():
@@ -1260,7 +1278,7 @@ def main(argv=None):
         nonlocal estop, tracking, coasting, track_role, tracker, track_seen_det, gui_quit
         nonlocal track_center, mount_desired_url, follow_enabled, track_primary, handoff_fine, handoff_conf
         nonlocal track_pref, focus_proc, focus_role, track_delay_s, track_started_t
-        nonlocal utc_offset_ns, gps_status
+        nonlocal utc_offset_ns, gps_status, align_matrix, bore_rotation
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -1295,9 +1313,6 @@ def main(argv=None):
                     print(f"[backend] ignoring track on {role}: no detection with a capture "
                           f"time yet", flush=True)
                 if ft is not None:
-                    from astrolock.seeker.skytracker import SkyTracker, SkyVectorPid
-                    from astrolock.seeker.target_model import (EmaAngularVelModel,
-                                                               GreatCircleModel)
                     model = (GreatCircleModel(smoothing_s=args.track_rate_smoothing_s,
                                               position_smoothing_s=args.track_position_smoothing_s,
                                               altitude_m=args.track_alt_km * 1e3)
@@ -1307,8 +1322,8 @@ def main(argv=None):
                     cx0, cy0 = hdr.image_width / 2.0, hdr.image_height / 2.0
                     track_center = (cx0, cy0)                 # true optical centre (for live re-offset)
                     if role == 'guide':                       # aim so the target lands in the main cam:
-                        cx0 += boresight['x'] / rpp           # hold it at the main's boresight pixel, not
-                        cy0 += boresight['y'] / rpp           # the guide centre (used for recon + setpoint)
+                        cx0, cy0 = boresight_pixel(rpp, cx0, cy0)   # hold at the main's boresight pixel,
+                                                              # not the guide centre (recon + setpoint)
                     tracker = SkyTracker(cx0, cy0, rpp,
                                          max_rate_rad_s=max_rate,
                                          model=model,
@@ -1349,9 +1364,31 @@ def main(argv=None):
                         print(f"[backend] track {role}: {ln}", flush=True)
                     for w in warns:
                         print(f"[backend] WARNING (track {role}): {w}", flush=True)
-        elif t == 'set_alignment':
-            alignment['yaw_deg'] = float(cmd.get('yaw_deg', 0.0))
-            print(f"[backend] alignment yaw -> {alignment['yaw_deg']:+.3f} deg", flush=True)
+        elif t == 'set_alignment':                    # settings restore: the whole matrix at once
+            align_matrix = geo.orthonormalized(
+                torch.tensor([float(v) for v in cmd['matrix']],
+                             dtype=torch.float64).reshape(3, 3))
+            print("[backend] alignment matrix set", flush=True)
+        elif t == 'align_nudge':
+            # A small rotation about the CAMERA's own axes (pitch = side, yaw = up, roll =
+            # forward), evaluated on the currently-MODELED orientation at the current pose --
+            # so the buttons always have the same on-screen effect regardless of how much
+            # alignment is already dialed in -- and folded in: align' = R_world @ align.
+            if cmd.get('reset'):
+                align_matrix = torch.eye(3, dtype=torch.float64)
+                print("[backend] alignment matrix reset", flush=True)
+            else:
+                mst = mount.get_state()
+                m_model = align_matrix @ geo.mount_matrix(mst['az_rad'], mst['alt_rad'])
+                r = torch.eye(3, dtype=torch.float64)
+                for column, key in ((1, 'pitch_deg'), (2, 'yaw_deg'), (0, 'roll_deg')):
+                    a = math.radians(float(cmd.get(key) or 0.0))
+                    if a:
+                        r = geo.rotation_matrix(m_model[:, column], a) @ r
+                align_matrix = geo.orthonormalized(r @ align_matrix)
+                print(f"[backend] alignment nudge pitch {float(cmd.get('pitch_deg') or 0.0):+g} "
+                      f"yaw {float(cmd.get('yaw_deg') or 0.0):+g} "
+                      f"roll {float(cmd.get('roll_deg') or 0.0):+g} deg", flush=True)
         elif t == 'set_time':
             # Move the backend's current time: an absolute offset, a relative skip, the system
             # clock, or (asynchronously) the mount's GPS. The sky follows via a sky_sim respawn.
@@ -1390,12 +1427,13 @@ def main(argv=None):
         elif t == 'set_boresight':
             boresight['x'] = float(cmd.get('x_mrad', 0.0)) * 1e-3
             boresight['y'] = float(cmd.get('y_mrad', 0.0)) * 1e-3
+            boresight['roll'] = float(cmd.get('roll_mrad', 0.0)) * 1e-3
+            bore_rotation = geo.boresight_rotation(boresight['x'], boresight['y'], boresight['roll'])
             if tracker is not None and track_center is not None and track_role == 'guide':
                 rpp = rad_per_px_by_role.get(track_role, rad_per_px) * frame_binning(track_role)
-                tracker.cx = track_center[0] + boresight['x'] / rpp   # re-aim the live hold point
-                tracker.cy = track_center[1] + boresight['y'] / rpp
-            print(f"[backend] boresight -> ({boresight['x'] * 1e3:.3f}, {boresight['y'] * 1e3:.3f}) mrad",
-                  flush=True)
+                tracker.cx, tracker.cy = boresight_pixel(rpp, *track_center)   # re-aim the live hold point
+            print(f"[backend] boresight -> ({boresight['x'] * 1e3:.3f}, {boresight['y'] * 1e3:.3f}, "
+                  f"roll {boresight['roll'] * 1e3:.3f}) mrad", flush=True)
         elif t == 'set_track_delay':                  # hold the mount this long after a new lock
             track_delay_s = max(0.0, float(cmd.get('value', 0.0)))
             print(f"[backend] track delay = {track_delay_s:.1f}s", flush=True)
@@ -1965,8 +2003,14 @@ def main(argv=None):
                 'optics_sel': {r: list(sel) for r, sel in optics_sel.items()},   # for the GUI Optics tab
                 'detectors': {r: {'detector': detector_sel[r], 'track': track_det_sel[r]}
                               for r in roles},               # for the GUI Detection tab
-                'boresight_mrad': [round(boresight['x'] * 1e3, 4), round(boresight['y'] * 1e3, 4)],
-                'align_yaw_deg': round(alignment['yaw_deg'], 4),   # manual alignment (GUI overlay)
+                'boresight_mrad': [round(boresight['x'] * 1e3, 4), round(boresight['y'] * 1e3, 4),
+                                   round(boresight['roll'] * 1e3, 4)],
+                # ...and the guide_from_main rotation those angles define (flat row-major 3x3,
+                # camera frame = forward/side/up), for the GUI's cross-camera mapping.
+                'boresight_rotation': [round(float(v), 8) for v in bore_rotation.reshape(-1)],
+                # Manual alignment (sky_from_mount rotation): flat row-major 3x3 in geometry's
+                # sky frame (x north, y east, z up). Overlay projection + settings persistence.
+                'align_matrix': [round(float(v), 8) for v in align_matrix.reshape(-1)],
                 'utc_offset_ns': utc_offset_ns,     # current UTC = mono_ns() + this (Time tab)
                 'site': {k: site[k] for k in ('lat_deg', 'lon_deg', 'elev_m')},   # Location tab
                 'gps_status': gps_status,           # last mount-GPS outcome (or in-flight note)
