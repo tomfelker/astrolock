@@ -204,9 +204,14 @@ class SerWriter:
                 self._file.write(struct.pack(f'<{len(self._timestamps)}q', *self._timestamps))
             self._file.seek(FRAME_COUNT_OFFSET)         # patch the real frame count
             self._file.write(struct.pack('<l', self.frame_count))
-            if self._timestamps:                        # capture start time (UTC ticks) in the header
+            if self._timestamps:
+                # Capture start time in the header: the spec's date_time is LOCAL wall-clock
+                # (players display it as-is), date_time_utc is UTC.
+                utc0 = self._timestamps[0]
+                offset = dt.datetime.now().astimezone().utcoffset() or dt.timedelta(0)
+                local0 = utc0 + int(offset.total_seconds()) * 10_000_000
                 self._file.seek(DATETIME_OFFSET)
-                self._file.write(struct.pack('<qq', self._timestamps[0], self._timestamps[0]))
+                self._file.write(struct.pack('<qq', local0, utc0))
             self._file.flush()
         finally:
             self._file.close()

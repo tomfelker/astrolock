@@ -46,6 +46,12 @@ def main(argv=None):
     p.add_argument('--session', required=True, help="session directory of the live stream")
     p.add_argument('--role', default='main', help="stream to record (guide/main)")
     p.add_argument('--out-dir', default='recordings', help="archive directory (never cleaned up)")
+    # SER header identity strings (each stored as 40 ASCII bytes), composed by the backend:
+    # Observer = recording software, Instrument = camera + capture settings,
+    # Telescope = configured optics.
+    p.add_argument('--observer', default='')
+    p.add_argument('--instrument', default='')
+    p.add_argument('--telescope', default='')
     p.add_argument('--resume', action='store_true',
                    help="a reconcile RELAUNCH (predecessor died mid-recording): start from the "
                         "ring's oldest available frame instead of 'now', so the ring bridges "
@@ -113,10 +119,13 @@ def main(argv=None):
                     t0 = _utc_of(rec) or dt.datetime.now(dt.timezone.utc)
                     stamp = t0.strftime('%Y%m%dT%H%M%S') + f"{t0.microsecond // 1000:03d}Z"
                     out_path = os.path.join(args.out_dir, f"{stamp}_{args.role}.ser")
-                    print(f"[rec:{args.role}] -> {out_path}", flush=True)
+                    print(f"[rec:{args.role}] -> {out_path} "
+                          f"[{args.instrument} | {args.telescope}]", flush=True)
                     out = ser_mod.SerWriter(out_path, frame.shape[1], frame.shape[0],
                                             color_id=rd.header.color_id,
-                                            pixel_depth_per_plane=rd.header.pixel_depth_per_plane)
+                                            pixel_depth_per_plane=rd.header.pixel_depth_per_plane,
+                                            observer=args.observer, instrument=args.instrument,
+                                            telescope=args.telescope)
                 out.write_frame(frame, t_utc=_utc_of(rec))   # trailer gets CAPTURE time
                 t_ns = int(rec['t_mono_ns'])
                 wrote = True

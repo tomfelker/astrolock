@@ -403,7 +403,12 @@ def _open_zwo(camera_index, exposure_us, gain, force_mono=False,
                 if c.get('IsWritable', True) else "(read-only)")
         print(f"    {nm:22s} = {val}{'  (auto)' if is_auto else ''}   {span}", flush=True)
 
-    controls = {'source': 'zwo', 'controls': caps, 'set': set_control}
+    # Full device name plus a short form for space-limited metadata (the SDK's names are
+    # 'ZWO <model>', so the short name is the model).
+    cam_name = info.get('Name') or 'ZWO'
+    controls = {'source': 'zwo', 'camera': cam_name,
+                'camera_short_name': cam_name[4:] if cam_name.startswith('ZWO ') else cam_name,
+                'controls': caps, 'set': set_control}
     # Sensor->frame mapping for this capture (constant); the backend uses it to map detection
     # pixels back to sensor angles. We capture full-frame, so roi origin is (0,0).
     meta = {'bin': [bins, bins], 'roi': [0, 0, width, height]}
@@ -491,7 +496,8 @@ def _open_sky(args, state_path=None, mount_path=None):
                 _live['gain_cb'] = max(0.0, value)
                 return _live['gain_cb']
             return None
-        controls = {'source': 'sky', 'controls': caps, 'set': set_control_noop}
+        controls = {'source': 'sky', 'camera': 'sky sim', 'camera_short_name': 'sky sim',
+                    'controls': caps, 'set': set_control_noop}
         meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, pub_w, pub_h]}
         return capture_noop, pub_w, pub_h, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
 
@@ -600,7 +606,8 @@ def _open_sky(args, state_path=None, mount_path=None):
             sim.gain_mult = 10.0 ** (_live['gain_cb'] / 200.0)   # +60 cB (=6 dB) doubles the signal
             return _live['gain_cb']
         return None
-    controls = {'source': 'sky', 'controls': caps, 'set': set_control}
+    controls = {'source': 'sky', 'camera': 'sky sim', 'camera_short_name': 'sky sim',
+                'controls': caps, 'set': set_control}
     meta = {'bin': [args.bin, args.bin], 'roi': [0, 0, pub_w, pub_h]}
     return capture, pub_w, pub_h, ser_mod.ColorId.MONO, adc_bits, None, meta, controls
 
@@ -855,7 +862,10 @@ def main(argv=None):
     # Publish the camera's live controls (name/kind/range/value) so the backend + GUI can render them.
     caps_path = os.path.join(out_dir, f'caps_{args.role}.json')
     with open(caps_path, 'w', encoding='utf-8') as _cf:
-        json.dump({'source': args.source, 'controls': (controls['controls'] if controls else [])}, _cf)
+        json.dump({'source': args.source,
+                   'camera': (controls or {}).get('camera') or args.source,
+                   'camera_short_name': (controls or {}).get('camera_short_name') or args.source,
+                   'controls': (controls['controls'] if controls else [])}, _cf)
     applied = {c['name']: c.get('value') for c in controls['controls']} if controls else {}   # live values in effect
 
     control = control_mod.ControlReader(args.control_file) if args.control_file else None

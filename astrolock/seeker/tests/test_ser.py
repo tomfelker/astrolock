@@ -140,9 +140,29 @@ def test_ser_timestamp_trailer():
     r = ser.SerReader(path)
     assert r.frames_on_disk() == N                          # trailer not miscounted as frames
     assert r.header.frame_count == N
-    assert r.header.date_time == ticks[0] and r.header.date_time_utc == ticks[0]
+    # date_time is LOCAL wall-clock (spec), date_time_utc is UTC; both from the first frame.
+    offset = dt.datetime.now().astimezone().utcoffset() or dt.timedelta(0)
+    assert r.header.date_time_utc == ticks[0]
+    assert r.header.date_time == ticks[0] + int(offset.total_seconds()) * 10_000_000
     np.testing.assert_array_equal(r.read_frame(N - 1), frames[N - 1])
     r.close()
+
+
+def test_ser_header_strings():
+    # Observer/Instrument/Telescope survive the round trip; each is a fixed 40-byte field,
+    # so long strings truncate and short ones zero-pad.
+    out = fresh_dir('ser_hdr')
+    path = os.path.join(out, 'hdr.ser')
+    long = 'X' * 60
+    with ser.SerWriter(path, 8, 6, color_id=ser.ColorId.MONO, pixel_depth_per_plane=16,
+                       observer='AstroLock Seeker',
+                       instrument='Gain:190cB,Exp:2ms,Bin:1,HS,ASI678MC',
+                       telescope=long) as w:
+        w.write_frame(np.zeros((6, 8), np.uint16))
+    h = ser.SerReader(path).header
+    assert h.observer.rstrip(b'\x00') == b'AstroLock Seeker'
+    assert h.instrument.rstrip(b'\x00') == b'Gain:190cB,Exp:2ms,Bin:1,HS,ASI678MC'
+    assert h.telescope == long.encode()[:40]
 
 
 if __name__ == '__main__':
@@ -151,4 +171,5 @@ if __name__ == '__main__':
     test_ser_mmap_matches_io()
     test_ser_mmap_color_and_growing()
     test_ser_timestamp_trailer()
+    test_ser_header_strings()
     print("test_ser: OK")

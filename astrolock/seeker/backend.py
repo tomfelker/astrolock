@@ -508,6 +508,35 @@ def main(argv=None):
         process = recorder_processes.get(role)
         return process is not None and process.poll() is None
 
+    # Recording software identity for the .ser header's Observer field (its only natural home:
+    # the SER header has no software field, and file_id must stay 'LUCAM-RECORDER' for readers).
+    recorded_by = 'AstroLock Seeker'
+
+    def recorder_header_args(role):
+        """The .ser header identity strings for a recorder spawn: Observer = the recording
+        software, Instrument = the camera + capture settings in effect at the click,
+        Telescope = the configured optics. Each SER field is 40 ASCII bytes (truncated by
+        the writer), hence the compact settings forms."""
+        read_caps(role)                                    # freshest cam-reported launch values
+        caps = cam_caps.get(role) or {}
+        vals = {c['name']: c.get('value') for c in caps.get('controls', [])}
+        vals.update(cam_control_vals.get(role) or {})      # live user changes override
+        # Settings first: the field truncates at 40 bytes, so only the camera-name tail can
+        # ever be lost. Bit depth is omitted -- the header's pixel_depth_per_plane records it.
+        parts = []
+        if vals.get('gain') is not None:
+            parts.append(f"Gain:{float(vals['gain']):g}cB")    # ZWO gain unit = 0.1 dB steps
+        if vals.get('exposure') is not None:
+            parts.append(f"Exp:{float(vals['exposure']):g}ms")
+        parts.append(f"Bin:{bin_by_role.get(role, 1)}")
+        if vals.get('highspeed'):
+            parts.append('HS')
+        parts.append(caps.get('camera_short_name') or caps.get('camera') or sources.get(role) or '')
+        _sname, oname, rname = (optics_sel.get(role) or [None, None, None])
+        return ['--observer', recorded_by,
+                '--instrument', ','.join(p for p in parts if p),
+                '--telescope', ' + '.join(n for n in (oname, rname) if n)]
+
     def start_recorder(role, resume=False):
         """Spawn a recorder for `role`. We hold its stdin: 'stop' is a line on it, and if WE
         die the pipe closes and the recorder freezes+flushes+exits on its own. Nobody is ever
@@ -524,7 +553,8 @@ def main(argv=None):
         recorder_processes[role] = subprocess.Popen(
             [sys.executable, '-m', 'astrolock.seeker.recorder',
              '--session', session_dir, '--role', role,
-             '--out-dir', args.recordings_dir] + (['--resume'] if resume else []),
+             '--out-dir', args.recordings_dir]
+            + recorder_header_args(role) + (['--resume'] if resume else []),
             stdin=subprocess.PIPE)
     gui_quit = False        # set when the GUI tells us it's closing (faster than watching it exit)
 
