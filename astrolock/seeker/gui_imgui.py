@@ -525,7 +525,8 @@ def main(argv=None):
                 'shape_ema': None,                        # latest (e1, e2, skew_x, skew_y) of the EMA image
                 'shape_instant': None,                    # same for the instantaneous crop
                 'series': {k: [] for k in ('t', 'peak', 'peakf', 'hfd', 'strehl')}}
-    sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0, 'frames': 40,  # focus sweep (human actuator)
+    sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0, 'frames': 40,  # focus sweep (human-actuator units)
+                'range': 1000.0, 'buckets': 9,                        # EAF-actuator units: +- steps + positions
                 'role': None, 'fo': None, 'state': None,              # prompt/result stream tail
                 'confirmed': None,                                    # last position we OK'd
                 'writer': None, 'writer_role': None}                  # our position-report stream
@@ -549,10 +550,13 @@ def main(argv=None):
                   'focus_shape_gain': f"{focus_ui['shape_gain']:g}",
                   'sweep_start': f"{sweep_ui['start']:g}", 'sweep_end': f"{sweep_ui['end']:g}",
                   'sweep_step': f"{sweep_ui['step']:g}",
+                  'sweep_range': f"{sweep_ui['range']:g}", 'sweep_buckets': str(sweep_ui['buckets']),
+                  'focuser_step': '100', 'focuser_goto': '0',
                   'settings_name': ''},
           'src': {},                                      # role -> unified source dropdown value
           'pb_loop': {r: True for r in roles}, 'pb_dlg': None,     # (role, pfd.open_file) in flight
           'mount_sel': 'sim',
+          'focuser_sel': 0,                               # EAF dropdown index (backend enumeration order)
           'opt': {r: {'sensor': '', 'optic': '', 'reducer': '(none)'} for r in roles},
           'settings_sel': '', 'settings_items': settings_store.list_settings()}
 
@@ -1845,10 +1849,13 @@ def main(argv=None):
         else:
             focus_ui['role'] = role                       # just remember the selection until Start
 
-    # ---- Focus sweep: the GUI plays actuator (see astrolock.seeker.focus_sweep) ------------------
-    # The sweep process publishes position REQUESTS on {role}_sweep; we render the prompt and the
-    # human's OK publishes a position REPORT on {role}_focuser. A hardware focuser process would
-    # answer the same requests -- the sweep can't tell the difference.
+    # ---- Focus sweep: someone plays actuator (see astrolock.seeker.focus_sweep) ------------------
+    # The sweep process publishes position REQUESTS on {role}_sweep. With an EAF connected the
+    # BACKEND answers them (moves the motor, reports on {role}_focuser); otherwise we render the
+    # prompt and the human's OK publishes the report -- the sweep can't tell the difference.
+    def _focuser_connected():
+        return bool(((ctrl.get('state') or {}).get('focuser') or {}).get('connected'))
+
     def _sweep_start():
         role = focus_ui['role']
         sweep_ui['role'], sweep_ui['state'], sweep_ui['confirmed'] = role, None, None
@@ -1857,6 +1864,21 @@ def main(argv=None):
         sweep_ui['fo'] = framestream.StreamFollower(args.session, f'{role}_sweep')
         if not focus_ui['want']:
             _focus_start(role)                            # the sweep feeds on the focus stream
+        if _focuser_connected():
+            # EAF actuator: the range is +- steps around the CURRENT position (rel to pos0 at
+            # connect), sampled at 'buckets' positions. The backend refuses it up front if it
+            # would poke outside the device's window.
+            sweep_ui['range'] = abs(_flt(ui['txt']['sweep_range'], sweep_ui['range']))
+            sweep_ui['buckets'] = max(3, min(201, int(_flt(ui['txt']['sweep_buckets'],
+                                                           sweep_ui['buckets']))))
+            ui['txt']['sweep_range'] = f"{sweep_ui['range']:g}"
+            ui['txt']['sweep_buckets'] = str(sweep_ui['buckets'])
+            foc = (ctrl.get('state') or {}).get('focuser') or {}
+            rel_now = (foc.get('pos') or 0) - (foc.get('pos0') or 0)
+            _send({'type': 'sweep', 'on': True, 'role': role,
+                   'start': rel_now - sweep_ui['range'], 'end': rel_now + sweep_ui['range'],
+                   'steps': sweep_ui['buckets'], 'frames': sweep_ui['frames']})
+            return
         sweep_ui['start'] = _flt(ui['txt']['sweep_start'], sweep_ui['start'])   # parsed only here
         sweep_ui['end'] = _flt(ui['txt']['sweep_end'], sweep_ui['end'])
         sweep_ui['step'] = abs(_flt(ui['txt']['sweep_step'], sweep_ui['step']))
@@ -2633,44 +2655,127 @@ def main(argv=None):
             if ch:
                 focus_ui['invert_y'] = v
             imgui.separator()
+            # --- EAF focuser: backend-owned; the sweep below runs unattended when one is connected.
+            foc = st.get('focuser') or {}
+            focs = st.get('focusers_available') or []
+            imgui.text("Focuser:")
+            _tip("ZWO EAF electronic focuser (USB, via the EAF SDK -- not a COM port). Positions "
+                 "are device steps, shown relative to where it sat at Connect (rel 0). The "
+                 "absolute count and the max-step limit are configured by ZWO's own tools and "
+                 "persist in the device's flash; AstroLock only reads and moves within them.")
+            imgui.same_line()
+            if focs:
+                fidx = min(ui['focuser_sel'], len(focs) - 1)
+                imgui.set_next_item_width(S(150))
+                ch, nidx = imgui.combo("##focuser_combo", fidx, focs)
+                if ch and 0 <= nidx < len(focs):
+                    ui['focuser_sel'] = nidx
+                    _send({'type': 'set_focuser', 'index': nidx})
+                imgui.same_line()
+                if imgui.button("Disconnect##focuser" if foc.get('connected') else "Connect##focuser"):
+                    _send({'type': 'focuser_connect', 'on': not foc.get('connected')})
+            else:
+                _grey("none detected")
+            imgui.same_line()
+            if imgui.button("Rescan##focuser"):
+                _send({'type': 'rescan_focusers'})
+            if foc.get('connected') and foc.get('pos') is not None:
+                pos, pos0 = foc['pos'], foc.get('pos0') or 0
+                line = f"rel {pos - pos0:+d}  (abs {pos} / {foc.get('max_step')})"
+                if foc.get('temp_c') is not None:
+                    line += f"  {foc['temp_c']:.1f} °C"
+                imgui.text(line)
+                if foc.get('moving') or foc.get('moving_manual'):
+                    imgui.same_line()
+                    imgui.text_colored(C4(235, 180, 90),
+                                       "moving (hand controller)" if foc.get('moving_manual')
+                                       else "moving")
+                imgui.text("Step:")
+                _tip("Steps per +/- button press.")
+                imgui.same_line()
+                imgui.set_next_item_width(S(56))
+                _ch, ui['txt']['focuser_step'] = imgui.input_text('##focuser_step',
+                                                                  ui['txt']['focuser_step'])
+                stp = abs(int(_flt(ui['txt']['focuser_step'], 100)))
+                imgui.same_line()
+                if imgui.button("-##focuser_minus", (S(28), 0)):
+                    _send({'type': 'focuser_move', 'rel': pos - pos0 - stp})
+                imgui.same_line()
+                if imgui.button("+##focuser_plus", (S(28), 0)):
+                    _send({'type': 'focuser_move', 'rel': pos - pos0 + stp})
+                imgui.same_line()
+                imgui.text("Go to rel:")
+                imgui.same_line()
+                imgui.set_next_item_width(S(56))
+                _ch, ui['txt']['focuser_goto'] = imgui.input_text('##focuser_goto',
+                                                                  ui['txt']['focuser_goto'])
+                imgui.same_line()
+                if imgui.button("Go##focuser_go"):
+                    _send({'type': 'focuser_move', 'rel': int(_flt(ui['txt']['focuser_goto'], 0))})
+                imgui.same_line()
+                if imgui.button("Stop##focuser_stop"):
+                    _send({'type': 'focuser_stop'})
+            imgui.separator()
             # --- Focus sweep: walk a focuser range, fit the HFD V-curve, report best focus.
             imgui.text("Sweep:")
-            _tip("Focus sweep with YOU as the actuator: give it a focuser range (any units -- knob "
-                 "marks, mm, motor steps) and it prompts for each position; press OK once the "
-                 "focuser is there. Every unsaturated frame's peak brightness is least-squares "
-                 "fit (1/peak is quadratic in focuser position); the vertex is best focus. Keep "
-                 "the star UNSATURATED (50-80% full well) -- clipped frames are excluded. "
-                 "An electronic focuser will later answer the same prompts unattended.")
+            _tip("Focus sweep: every unsaturated frame's peak brightness is least-squares fit "
+                 "(1/peak is quadratic in focuser position); the vertex is best focus. Keep the "
+                 "star UNSATURATED (50-80% full well) -- clipped frames are excluded. With an EAF "
+                 "connected it walks +- range steps around the current position unattended; "
+                 "otherwise give it a range in any units (knob marks, mm) and press OK as you set "
+                 "each prompted position by hand.")
             # Plain text boxes: nothing reads them until Start Sweep, which parses them then.
             imgui.same_line()
-            imgui.set_next_item_width(S(56))
-            _ch, ui['txt']['sweep_start'] = imgui.input_text('##sweep_start', ui['txt']['sweep_start'])
-            imgui.same_line()
-            imgui.text_colored(C4(140, 145, 160), "to")
-            imgui.same_line()
-            imgui.set_next_item_width(S(56))
-            _ch, ui['txt']['sweep_end'] = imgui.input_text('##sweep_end', ui['txt']['sweep_end'])
-            imgui.same_line()
-            imgui.text_colored(C4(140, 145, 160), "step")
-            imgui.same_line()
-            imgui.set_next_item_width(S(56))
-            _ch, ui['txt']['sweep_step'] = imgui.input_text('##sweep_step', ui['txt']['sweep_step'])
+            if foc.get('connected'):
+                imgui.text_colored(C4(140, 145, 160), "±")
+                imgui.same_line()
+                imgui.set_next_item_width(S(56))
+                _ch, ui['txt']['sweep_range'] = imgui.input_text('##sweep_range',
+                                                                 ui['txt']['sweep_range'])
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "steps in")
+                imgui.same_line()
+                imgui.set_next_item_width(S(56))
+                _ch, ui['txt']['sweep_buckets'] = imgui.input_text('##sweep_buckets',
+                                                                   ui['txt']['sweep_buckets'])
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "buckets")
+            else:
+                imgui.set_next_item_width(S(56))
+                _ch, ui['txt']['sweep_start'] = imgui.input_text('##sweep_start', ui['txt']['sweep_start'])
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "to")
+                imgui.same_line()
+                imgui.set_next_item_width(S(56))
+                _ch, ui['txt']['sweep_end'] = imgui.input_text('##sweep_end', ui['txt']['sweep_end'])
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "step")
+                imgui.same_line()
+                imgui.set_next_item_width(S(56))
+                _ch, ui['txt']['sweep_step'] = imgui.input_text('##sweep_step', ui['txt']['sweep_step'])
             sw_running = bool((st.get('sweep') or {}).get('running'))
             if imgui.button('Abort Sweep' if sw_running else 'Start Sweep', (S(200), 0)):
                 _sweep_abort() if sw_running else _sweep_start()
+            if not sw_running and (st.get('sweep') or {}).get('error'):
+                imgui.text_colored(C4(235, 120, 120), st['sweep']['error'])
             stt = sweep_ui['state'] or {}
             if sw_running and stt and not stt.get('done'):
-                # Fixed three-line layout -- the OK button is ALWAYS present (disabled while
-                # collecting) so nothing reflows as the sweep advances.
                 awaiting = stt.get('awaiting') == 'position'
-                conf = sweep_ui.get('confirmed')
-                imgui.text(f"Current focus: {'--' if conf is None else f'{conf:g}'}")
-                imgui.text(f"Commanded focus: {stt.get('want_pos', 0):g}")
-                imgui.same_line()
-                imgui.begin_disabled(not awaiting)
-                if imgui.button("OK##sweep_ok", (S(64), 0)):
-                    _sweep_ok(stt.get('want_pos', 0.0))
-                imgui.end_disabled()
+                if foc.get('connected'):
+                    # The backend is the actuator; just narrate.
+                    imgui.text(f"Commanded focus: {stt.get('want_pos', 0):g}"
+                               + (" -- focuser moving" if awaiting else ""))
+                else:
+                    # Fixed three-line layout -- the OK button is ALWAYS present (disabled while
+                    # collecting) so nothing reflows as the sweep advances.
+                    conf = sweep_ui.get('confirmed')
+                    imgui.text(f"Current focus: {'--' if conf is None else f'{conf:g}'}")
+                    imgui.text(f"Commanded focus: {stt.get('want_pos', 0):g}")
+                    imgui.same_line()
+                    imgui.begin_disabled(not awaiting)
+                    if imgui.button("OK##sweep_ok", (S(64), 0)):
+                        _sweep_ok(stt.get('want_pos', 0.0))
+                    imgui.end_disabled()
                 imgui.text(f"Step {stt.get('step', '?')}/{stt.get('of', '?')}"
                            + ("" if awaiting else
                               f" -- collecting {stt.get('collected', 0)}/{stt.get('need', 0)}"))

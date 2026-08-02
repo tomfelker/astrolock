@@ -33,10 +33,12 @@ import sys
 import threading
 import time
 
+import numpy as np
 import torch
 
 from astrolock.seeker import cam as cam_mod
 from astrolock.seeker import control
+from astrolock.seeker import eaf as eaf_mod
 from astrolock.seeker import framestream
 from astrolock.seeker import geometry as geo
 from astrolock.seeker import mount as mount_mod
@@ -454,6 +456,20 @@ def main(argv=None):
     # `site` above) -- a mount's GPS is just a SOURCE the GUI can grab either from, on request.
     mount_desired_url = 'sim' if args.mount == 'sim' else (args.mount_url or 'sim')
     mounts_available = mount_mod.available_mount_urls()     # detected Celestron COM ports (GUI chooser)
+
+    # ZWO EAF focuser (astrolock.seeker.eaf): backend-owned like the mount. The device's step
+    # count and max-step limit are driver-configured and flash-persisted -- we only read/move.
+    # Sweeps and the GUI work in steps RELATIVE to the position at connect (focuser_pos0);
+    # rel -> abs is pos0 + rel, refused up front if it would poke outside [0, max_step].
+    focusers_available = eaf_mod.list_focuser_names()
+    focuser = None                     # open eaf_mod.Focuser, or None
+    focuser_index = 0                  # GUI dropdown selection
+    focuser_pos0 = 0                   # absolute position at connect: the session's relative zero
+    focuser_status = {}                # published every tick while connected: pos/moving/temp
+    # Sweep actuator plumbing (service_focuser): follower on {role}_sweep for position requests,
+    # writer on {role}_focuser for reports, and the request currently being served.
+    focuser_serve = {'role': None, 'fo': None, 'writer': None,
+                     'want': None, 'target': None, 'served': None}
 
     almanac_path = os.path.join(session_dir, f"{ts}_almanac.jsonl")       # sky_sim publishes here
     navigation_path = os.path.join(session_dir, f"{ts}_navigation.jsonl")  # sparse feed (GUI overlay)
@@ -926,10 +942,11 @@ def main(argv=None):
 
     # Focus sweep: an optional actuator-agnostic sweep process (focus_sweep.py). It watches the
     # focus stream's per-frame HFD, publishes position requests on {role}_sweep, and whoever can
-    # move the focuser (GUI human, or a future electronic-focuser process) answers on
+    # move the focuser (a connected EAF via service_focuser, else the GUI human) answers on
     # {role}_focuser. We hold its stdin: closing the pipe = abort (recorder pattern).
     sweep_proc = None
     sweep_role = None
+    sweep_error = None                             # why the last Start Sweep was refused (GUI)
 
     def stop_sweep():
         nonlocal sweep_proc, sweep_role
@@ -940,10 +957,24 @@ def main(argv=None):
                 pass
             _reap([sweep_proc])
         sweep_proc, sweep_role = None, None
+        end_focuser_serve()                        # a later re-sweep starts with fresh actuator state
 
     def launch_sweep(role, cmd):
-        nonlocal sweep_proc, sweep_role
+        nonlocal sweep_proc, sweep_role, sweep_error
         stop_sweep()
+        sweep_error = None
+        if focuser is not None:
+            # Positions are relative to focuser_pos0; refuse up front if any part of the range
+            # falls outside the device's driver-configured window -- silently clamping would
+            # corrupt the V-curve's spacing.
+            lo = focuser_pos0 + min(float(cmd['start']), float(cmd['end']))
+            hi = focuser_pos0 + max(float(cmd['start']), float(cmd['end']))
+            if lo < 0 or hi > focuser.max_step:
+                sweep_error = (f"sweep range abs {int(lo)}..{int(hi)} exceeds the focuser's "
+                               f"0..{focuser.max_step} window (at {focuser_pos0}) -- "
+                               "reduce the range or re-position in ASIStudio")
+                print(f"[backend] sweep refused: {sweep_error}", flush=True)
+                return
         if focus_role != role or focus_proc is None or focus_proc.poll() is not None:
             launch_focus(role)                     # the sweep feeds on the focus stream's HFD
         sweep_proc = subprocess.Popen(
@@ -1275,11 +1306,101 @@ def main(argv=None):
                 restart_cam(r, stop_first=True)
         print("[backend] mount disconnected", flush=True)
 
+    def connect_focuser():
+        """Open the selected EAF and take the current step count as the session's relative zero.
+        On failure, stay disconnected (loudly)."""
+        nonlocal focuser, focuser_pos0, focuser_status
+        disconnect_focuser()
+        try:
+            new = eaf_mod.Focuser(focuser_index)
+        except Exception as e:
+            print(f"[backend] focuser connect failed (#{focuser_index}): {e}", flush=True)
+            return
+        focuser = new
+        focuser_pos0 = focuser.position()
+        focuser_status = {}
+        print(f"[backend] focuser connected: {focuser.name} at {focuser_pos0} "
+              f"(max {focuser.max_step}); this position is rel 0", flush=True)
+
+    def disconnect_focuser():
+        nonlocal focuser, focuser_status
+        end_focuser_serve()
+        if focuser is not None:
+            try:
+                focuser.close()
+            except Exception as e:
+                print(f"[backend] focuser close failed: {e}", flush=True)
+            focuser = None
+            focuser_status = {}
+            print("[backend] focuser disconnected", flush=True)
+
+    def focuser_move_rel(rel):
+        """Manual GUI move to a relative position; clamped to the device's window (the firmware
+        would clamp anyway -- clamping here keeps our printout honest about where it's going)."""
+        want = focuser_pos0 + int(round(float(rel)))
+        target = max(0, min(focuser.max_step, want))
+        if target != want:
+            print(f"[backend] focuser move clamped to the device limit: "
+                  f"abs {want} -> {target} (max {focuser.max_step})", flush=True)
+        focuser.move_to(target)
+
+    def end_focuser_serve():
+        fs = focuser_serve
+        if fs['fo'] is not None:
+            fs['fo'].close()
+        if fs['writer'] is not None:
+            fs['writer'].close()
+        fs.update(role=None, fo=None, writer=None, want=None, target=None, served=None)
+
+    def service_focuser():
+        """Per-tick focuser duties while connected: refresh the published pos/moving/temp
+        snapshot, and play sweep actuator -- follow {role}_sweep for position requests, move,
+        and report {'pos': rel} on {role}_focuser once the motor stops (the sweep's settle
+        window starts at our report, so ringing after the stop is already covered)."""
+        nonlocal focuser_status
+        pos = focuser.position()
+        moving, moving_manual = focuser.is_moving()
+        if focuser_status.get('temp_t', 0.0) + 2.0 <= now:     # temperature is slow-moving; 0.5 Hz
+            focuser_status['temp_c'] = focuser.temperature_c()
+            focuser_status['temp_t'] = now
+        focuser_status.update(pos=pos, moving=moving, moving_manual=moving_manual)
+
+        fs = focuser_serve
+        sweep_alive = sweep_proc is not None and sweep_proc.poll() is None
+        if not sweep_alive:
+            if fs['role'] is not None:
+                end_focuser_serve()
+            return
+        if fs['role'] != sweep_role:
+            end_focuser_serve()
+            fs['role'] = sweep_role
+            fs['fo'] = framestream.StreamFollower(session_dir, f'{sweep_role}_sweep')
+            fs['writer'] = framestream.FrameStream(session_dir, f'{sweep_role}_focuser')
+        fs['fo'].poll()
+        got = fs['fo'].latest()                             # latest wins; never lappable
+        if got is None:
+            return
+        stt = json.loads(bytes(got[0].read(got[1])).decode('utf-8'))
+        want = stt.get('want_pos')
+        if stt.get('awaiting') != 'position' or want is None or want == fs['served']:
+            return
+        if want != fs['want']:                              # a new request: command the move once
+            fs['want'] = want
+            fs['target'] = int(round(focuser_pos0 + want))
+            focuser.move_to(fs['target'])
+            print(f"[backend] focuser -> rel {want:g} (abs {fs['target']})", flush=True)
+        elif not moving and pos == fs['target']:            # arrived (count AND motor agree): report
+            if not fs['writer'].configured:
+                fs['writer'].configure(1 << 12, 1, pixel_depth=8, frames=256, raw=True)
+            payload = json.dumps({'pos': want}, separators=(',', ':')).encode('utf-8')
+            fs['writer'].write(np.frombuffer(payload, np.uint8), t_mono_ns=session_mod.mono_ns())
+            fs['served'] = want
+
     def apply_command(cmd):
         nonlocal estop, tracking, coasting, track_role, tracker, track_seen_det, gui_quit
         nonlocal track_center, mount_desired_url, follow_enabled, track_primary, handoff_fine, handoff_conf
         nonlocal track_pref, focus_proc, focus_role, track_delay_s, track_started_t
-        nonlocal utc_offset_ns, gps_status, align_matrix, bore_rotation
+        nonlocal utc_offset_ns, gps_status, align_matrix, bore_rotation, focuser_index
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -1673,6 +1794,28 @@ def main(argv=None):
         elif t == 'rescan_mounts':
             mounts_available[:] = mount_mod.available_mount_urls()
             print(f"[backend] mounts: {mounts_available}", flush=True)
+        elif t == 'set_focuser':
+            focuser_index = int(cmd.get('index', 0))
+            if focuser is not None:            # reselect -> disconnect, then Connect (mount pattern)
+                disconnect_focuser()
+            print(f"[backend] focuser selected: #{focuser_index} (press Connect)", flush=True)
+        elif t == 'focuser_connect':
+            if cmd.get('on', True):
+                connect_focuser()
+            else:
+                disconnect_focuser()
+        elif t == 'focuser_move':
+            if focuser is not None:
+                focuser_move_rel(cmd.get('rel', 0))
+            else:
+                print("[backend] ignoring focuser_move (not connected)", flush=True)
+        elif t == 'focuser_stop':
+            if focuser is not None:
+                focuser.stop()
+                print("[backend] focuser stopped", flush=True)
+        elif t == 'rescan_focusers':
+            focusers_available[:] = eaf_mod.list_focuser_names()
+            print(f"[backend] focusers: {focusers_available}", flush=True)
         elif t == 'set_cam_control':
             role, name, value = cmd.get('role'), cmd.get('name'), cmd.get('value')
             if role in roles and name == 'bin':                        # geometry: recompute render (+ relaunch)
@@ -1785,6 +1928,8 @@ def main(argv=None):
                     print(f"[backend] fresh TLE ({_ti['name']}, epoch "
                           f"{_ti['epoch_utc']:%Y-%m-%d}); respawning sky_sim", flush=True)
                     ensure_sky_sim(restart=True)
+            if focuser is not None:
+                service_focuser()                  # publish pos/moving/temp + play sweep actuator
             update_detections()
             # Recording reconciliation (policy lives at record_manual/_auto): every tick, per
             # camera: want recording and no recorder -> start one; don't want it but have one
@@ -1986,7 +2131,18 @@ def main(argv=None):
                           'role': focus_role},
                 # Focus sweep process (the GUI follows <role>_sweep for its prompts/result).
                 'sweep': {'running': sweep_proc is not None and sweep_proc.poll() is None,
-                          'role': sweep_role},
+                          'role': sweep_role, 'error': sweep_error},
+                # EAF focuser: positions are absolute device steps; pos0 = the abs position at
+                # connect, the session's relative zero (the GUI displays pos - pos0).
+                'focusers_available': list(focusers_available),
+                'focuser': ({'connected': True, 'index': focuser_index, 'name': focuser.name,
+                             'pos': focuser_status.get('pos'), 'pos0': focuser_pos0,
+                             'max_step': focuser.max_step,
+                             'moving': bool(focuser_status.get('moving')),
+                             'moving_manual': bool(focuser_status.get('moving_manual')),
+                             'temp_c': focuser_status.get('temp_c')}
+                            if focuser is not None else
+                            {'connected': False, 'index': focuser_index}),
                 # ROI (cx, cy, size px) around the predicted target, for detect to clamp its work to.
                 'track_roi': track_rois or None,        # {role: [cx, cy, size]} -- active source + guide fallback
                 'sources': dict(sources),
@@ -2076,6 +2232,7 @@ def main(argv=None):
         _step('command server', cmd_server.close)
         _step('state slot', state_slot.close)
         _step('mount', lambda: mount.close())
+        _step('focuser', disconnect_focuser)
         _step('followers', lambda: [fo.close() for fo in followers.values()])
         _step('detection followers', lambda: [fo_.close() for fo_ in det_fos.values()])
 
