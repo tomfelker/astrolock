@@ -1242,7 +1242,7 @@ def main(argv=None):
             clip_frac = (sum(recent) / len(recent)) if recent else 0.0
             if clip_frac > 0:
                 dl.add_rect(A(S(2), S(2)), A(SW - S(2), SH - S(2)), C((235, 60, 45, 230)),
-                            0.0, 0, S(3))
+                            0.0, S(3))                     # (rounding, thickness) -- no flags arg here
                 _text(dl, A(S(10), S(8)), f"CLIP {clip_frac:.0%}", S(16), (235, 60, 45, 255))
             GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
             gx1, gy1 = SW - mgn, SH - mgn
