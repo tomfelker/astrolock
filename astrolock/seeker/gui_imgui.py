@@ -524,9 +524,10 @@ def main(argv=None):
                 'skew_rad': (0.0, 0.0),                   # latest skew (radians) for the screw dial
                 'shape_ema': None,                        # latest (e1, e2, skew_x, skew_y) of the EMA image
                 'shape_instant': None,                    # same for the instantaneous crop
-                'series': {k: [] for k in ('t', 'peak', 'peakf', 'hfd', 'strehl')}}
-    sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0, 'frames': 40,  # focus sweep (human-actuator units)
+                'series': {k: [] for k in ('t', 'peak', 'hfd', 'strehl', 'clip')}}
+    sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0,                # human-actuator units
                 'range': 1000.0, 'buckets': 9,                        # EAF-actuator units: +- steps + positions
+                'seconds': 5.0,                                       # integrated exposure per bucket
                 'role': None, 'fo': None, 'state': None,              # prompt/result stream tail
                 'confirmed': None,                                    # last position we OK'd
                 'writer': None, 'writer_role': None}                  # our position-report stream
@@ -551,6 +552,7 @@ def main(argv=None):
                   'sweep_start': f"{sweep_ui['start']:g}", 'sweep_end': f"{sweep_ui['end']:g}",
                   'sweep_step': f"{sweep_ui['step']:g}",
                   'sweep_range': f"{sweep_ui['range']:g}", 'sweep_buckets': str(sweep_ui['buckets']),
+                  'sweep_seconds': f"{sweep_ui['seconds']:g}",
                   'focuser_step': '100', 'focuser_goto': '0',
                   'settings_name': ''},
           'src': {},                                      # role -> unified source dropdown value
@@ -826,16 +828,16 @@ def main(argv=None):
             _text(dl, A(sx - S(11), sy + S(13)), f"{t:+.2f}", S(12), _SCREW_COL)
 
     def _draw_sweep_curve(dl, A, gx0, gy1, W, stt):
-        """Sweep peak-vs-position curve on the STAR PANE, stacked under the focus graph: every
-        collected frame as a dot (red = saturated, excluded from the fit), the fitted best-focus
-        position as a vertical line. Returns the vertical space consumed (0 = nothing drawn)."""
+        """Sweep Strehl-vs-position curve on the STAR PANE, stacked under the focus graph: one
+        dot per bucket (each = one stacked image; red = that bucket saw clipped frames), the
+        fitted best-focus position as a vertical line. Returns the vertical space consumed."""
         pts = stt.get('points') or []
         if len(pts) < 3:
             return 0
         H = S(80)
         gy0 = gy1 - H
-        xs = [p_ for p_, _h in pts]
-        ys = [h_ for _p, h_ in pts]
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
         pl, ph = min(xs), max(xs)
         if ph <= pl:                                       # first step: one position so far
             pl, ph = pl - 0.5, ph + 0.5
@@ -847,10 +849,9 @@ def main(argv=None):
         def PY(h_):
             return gy1 - S(4) - (H - S(8)) * min(h_, hh) / hh
         dl.add_rect_filled(A(gx0 - S(4), gy0 - S(4)), A(gx0 + W + S(4), gy1 + S(4)), C((0, 0, 0, 150)))
-        for p_, h_ in pts:
-            sat_ = h_ >= 0.98                              # clipped: excluded from the fit
-            dl.add_circle_filled(A(PX(p_), PY(h_)), S(1.5),
-                                 C((235, 100, 100, 200) if sat_ else (120, 220, 255, 180)))
+        for p_, h_, cf_ in pts:
+            dl.add_circle_filled(A(PX(p_), PY(h_)), S(2.5),
+                                 C((235, 100, 100, 220) if cf_ > 0.05 else (120, 220, 255, 200)))
         p0 = stt.get('p0')
         if p0 is not None and pl <= p0 <= ph:
             dl.add_line(A(PX(p0), gy0 + S(2)), A(PX(p0), gy1 - S(2)), C((255, 190, 90, 220)), 1.2)
@@ -1234,6 +1235,15 @@ def main(argv=None):
         # above it, and the collimation trail (last ~10 EMA CoM offsets, exaggerated) on the star.
         if role.endswith('_focus') and role == focus_ui['role'] + '_focus':
             sc = focus_ui['series']
+            # CLIP warning: fraction of the last ~100 frames with clipped star pixels. Loud on
+            # purpose -- a red border + percentage; per-pixel flashing alone proved too subtle
+            # (the 2026-07-11 sweep clipped 60% of its frames unnoticed).
+            recent = sc['clip'][-100:]
+            clip_frac = (sum(recent) / len(recent)) if recent else 0.0
+            if clip_frac > 0:
+                dl.add_rect(A(S(2), S(2)), A(SW - S(2), SH - S(2)), C((235, 60, 45, 230)),
+                            0.0, 0, S(3))
+                _text(dl, A(S(10), S(8)), f"CLIP {clip_frac:.0%}", S(16), (235, 60, 45, 255))
             GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
             gx1, gy1 = SW - mgn, SH - mgn
             gx0 = gx1 - GW
@@ -1864,6 +1874,8 @@ def main(argv=None):
         sweep_ui['fo'] = framestream.StreamFollower(args.session, f'{role}_sweep')
         if not focus_ui['want']:
             _focus_start(role)                            # the sweep feeds on the focus stream
+        sweep_ui['seconds'] = max(0.1, _flt(ui['txt']['sweep_seconds'], sweep_ui['seconds']))
+        ui['txt']['sweep_seconds'] = f"{sweep_ui['seconds']:g}"
         if _focuser_connected():
             # EAF actuator: the range is +- steps around the CURRENT position (rel to pos0 at
             # connect), sampled at 'buckets' positions. The backend refuses it up front if it
@@ -1877,7 +1889,7 @@ def main(argv=None):
             rel_now = (foc.get('pos') or 0) - (foc.get('pos0') or 0)
             _send({'type': 'sweep', 'on': True, 'role': role,
                    'start': rel_now - sweep_ui['range'], 'end': rel_now + sweep_ui['range'],
-                   'steps': sweep_ui['buckets'], 'frames': sweep_ui['frames']})
+                   'steps': sweep_ui['buckets'], 'seconds': sweep_ui['seconds']})
             return
         sweep_ui['start'] = _flt(ui['txt']['sweep_start'], sweep_ui['start'])   # parsed only here
         sweep_ui['end'] = _flt(ui['txt']['sweep_end'], sweep_ui['end'])
@@ -1886,7 +1898,7 @@ def main(argv=None):
         step = sweep_ui['step'] or 1.0                     # UI takes a step SIZE; the process wants a count
         steps = max(3, min(201, int(round(span / step)) + 1))
         _send({'type': 'sweep', 'on': True, 'role': role, 'start': sweep_ui['start'],
-               'end': sweep_ui['end'], 'steps': steps, 'frames': sweep_ui['frames']})
+               'end': sweep_ui['end'], 'steps': steps, 'seconds': sweep_ui['seconds']})
 
     def _sweep_abort():
         _send({'type': 'sweep', 'on': False})
@@ -1918,8 +1930,8 @@ def main(argv=None):
             sweep_ui['state'] = json.loads(bytes(got[0].read(got[1])).decode('utf-8'))
 
     def _poll_focus_metrics():
-        """Read the star stream's binary record extras (peak/strehl/com...) into the rolling
-        series feeding the on-pane focus graph + collimation trail. Sequential across the
+        """Read the star stream's binary record extras (STACK quality + shape) into the rolling
+        series feeding the on-pane focus graph + shape glyphs. Sequential across the
         segment chain; NaN extras decode back to None/absent (unknown aperture/plate scale)."""
         if not focus_ui['want']:
             return
@@ -1937,11 +1949,11 @@ def main(argv=None):
             if focus_ui['t0'] is None:
                 focus_ui['t0'] = t * 1e-9
             s['t'].append(round(t * 1e-9 - focus_ui['t0'], 3))
-            s['peak'].append(rec['peak'])
-            s['peakf'].append(rec.get('peak_frame', rec['peak']))
-            h = rec.get('hfd')
+            s['peak'].append(rec['stack_peak'])
+            h = rec.get('stack_hfd')
             s['hfd'].append(None if h is None or math.isnan(h) else h)
-            s['strehl'].append(None if math.isnan(rec['strehl']) else rec['strehl'])
+            s['strehl'].append(None if math.isnan(rec['stack_strehl']) else rec['stack_strehl'])
+            s['clip'].append(1 if rec['clip_px'] > 0 else 0)     # this FRAME clipped the star
             # Latest shape per half image: (e1, e2, skew_x, skew_y); absent on old recordings.
             if rec.get('ellipse_1') is not None:
                 focus_ui['shape_ema'] = (rec['ellipse_1'], rec['ellipse_2'],
@@ -2600,6 +2612,25 @@ def main(argv=None):
                     _send({'type': 'focus', 'on': True, 'role': focus_ui['role'], 'alpha': focus_ui['alpha']})
                 return f"{focus_ui['alpha']:g}"
             _input_commit('focus_alpha', S(48), _commit_alpha)
+            imgui.same_line()
+            imgui.text("Crop:")
+            _tip("Star crop size (px, 2^k - 1): the displayed star view AND the region every "
+                 "quality metric integrates over. It must comfortably hold the star's WHOLE "
+                 "energy at any focus you'll visit -- if the star spills out, widen it "
+                 "(relaunches the focus helper).")
+            imgui.same_line()
+            _crops = ['63', '127', '255', '511']
+            _cur_crop = str((st.get('focus') or {}).get('crop') or 127)
+            _cidx = _crops.index(_cur_crop) if _cur_crop in _crops else 1
+            imgui.set_next_item_width(S(64))
+            ch, nidx = imgui.combo("##focus_crop", _cidx, _crops)
+            if ch and 0 <= nidx < len(_crops):
+                _send({'type': 'set_focus_crop', 'size': int(_crops[nidx])})
+            imgui.same_line()
+            if imgui.button("Reset stack##focus_reset"):
+                _send({'type': 'focus_reset'})
+            _tip("Restart the star stack (hot-start EMA) -- after re-pointing, or once a new "
+                 "focus position is confirmed.")
             imgui.text("Skew ×:")
             _tip("Exaggeration for the skew (coma) arrows drawn on the star view -- higher magnifies "
                  "smaller miscollimation. The arrow points from each crosshair to where the halo's "
@@ -2716,14 +2747,15 @@ def main(argv=None):
                 if imgui.button("Stop##focuser_stop"):
                     _send({'type': 'focuser_stop'})
             imgui.separator()
-            # --- Focus sweep: walk a focuser range, fit the HFD V-curve, report best focus.
+            # --- Focus sweep: one stacked image + one Strehl per bucket, fit the V-curve.
             imgui.text("Sweep:")
-            _tip("Focus sweep: every unsaturated frame's peak brightness is least-squares fit "
-                 "(1/peak is quadratic in focuser position); the vertex is best focus. Keep the "
-                 "star UNSATURATED (50-80% full well) -- clipped frames are excluded. With an EAF "
-                 "connected it walks +- range steps around the current position unattended; "
-                 "otherwise give it a range in any units (knob marks, mm) and press OK as you set "
-                 "each prompted position by hand.")
+            _tip("Focus sweep: each position integrates one pure-average stacked star and reads "
+                 "its Strehl; 1/Strehl is least-squares fit as a parabola of position and the "
+                 "vertex is best focus. Positions are visited alternating sides (extremes first) "
+                 "so slow seeing drift cancels. With an EAF connected it runs unattended and "
+                 "moves to the apex when done; otherwise press OK as you set each prompted "
+                 "position by hand. Keep the star at 50-80% full well -- clipping dulls the "
+                 "metric (red buckets / CLIP border).")
             # Plain text boxes: nothing reads them until Start Sweep, which parses them then.
             imgui.same_line()
             if foc.get('connected'):
@@ -2753,6 +2785,15 @@ def main(argv=None):
                 imgui.same_line()
                 imgui.set_next_item_width(S(56))
                 _ch, ui['txt']['sweep_step'] = imgui.input_text('##sweep_step', ui['txt']['sweep_step'])
+            imgui.same_line()
+            imgui.set_next_item_width(S(40))
+            _ch, ui['txt']['sweep_seconds'] = imgui.input_text('##sweep_seconds',
+                                                               ui['txt']['sweep_seconds'])
+            imgui.same_line()
+            imgui.text_colored(C4(140, 145, 160), "s/bucket")
+            _tip("Integrated EXPOSURE per bucket, in seconds: the backend converts to a frame "
+                 "count at the camera's current exposure time, so a throttled framerate "
+                 "stretches wall time but never shortens integration.")
             sw_running = bool((st.get('sweep') or {}).get('running'))
             if imgui.button('Abort Sweep' if sw_running else 'Start Sweep', (S(200), 0)):
                 _sweep_abort() if sw_running else _sweep_start()
@@ -2783,13 +2824,13 @@ def main(argv=None):
                 if stt.get('aborted'):
                     _grey("Sweep aborted.")
                 elif 'p0' in stt:
-                    imgui.text(f"Best focus: {stt['p0']:g}  (peak {stt.get('peak0', 0):.2f})")
+                    imgui.text(f"Best focus: {stt['p0']:g}  (Strehl {stt.get('strehl0', 0):.3f})")
                     if not stt.get('bracketed', True):
                         imgui.text_colored(C4(235, 180, 90),
                                            "best focus is OUTSIDE the swept range -- re-sweep around it")
-                    if stt.get('sat_frac', 0) > 0.2:
+                    if stt.get('clip_frac', 0) > 0.2:
                         imgui.text_colored(C4(235, 180, 90),
-                                           f"{stt['sat_frac']:.0%} of frames saturated -- "
+                                           f"{stt['clip_frac']:.0%} of frames clipped -- "
                                            "reduce exposure and re-sweep")
                 elif stt.get('error'):
                     imgui.text_colored(C4(235, 120, 120), stt['error'])

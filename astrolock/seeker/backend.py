@@ -149,12 +149,14 @@ def main(argv=None):
                         "(noise p ~ e^-Z/axis; real targets Z=60..8000, black sky <=4)")
     # Focus/collimation process (one optional, toggled live from the GUI Focus tab).
     p.add_argument('--focus-crop', type=int, default=127,
-                   help="focus: star crop size (px, forced odd) -- the EMA star image "
-                        "(big enough for a defocused donut, not just the in-focus core)")
-    p.add_argument('--focus-search', type=int, default=256,
-                   help="focus: search ROI around the target to find the peak in (px)")
+                   help="focus: star crop size (px, snapped to 2^k - 1) -- the stacked star image; "
+                        "must hold the star's WHOLE energy at any reasonably-close focus")
+    p.add_argument('--focus-roi', type=int, default=0,
+                   help="focus: star-FINDING region, a centered square this many work px across "
+                        "(0 = whole frame). The toroidal CoM of it is the star -- size it (or the "
+                        "camera ROI) so the star dominates")
     p.add_argument('--focus-alpha', type=float, default=0.05,
-                   help="focus: EMA rate for the star crop (bigger = faster to settle, noisier)")
+                   help="focus: EMA rate for the star stack (bigger = faster to settle, noisier)")
     p.add_argument('--device', default='auto',
                    help="torch device for detect + gui: 'auto' (default) = cuda if present else cpu, "
                         "or force 'cpu' / 'cuda' (passed through to both child processes)")
@@ -466,10 +468,12 @@ def main(argv=None):
     focuser_index = 0                  # GUI dropdown selection
     focuser_pos0 = 0                   # absolute position at connect: the session's relative zero
     focuser_status = {}                # published every tick while connected: pos/moving/temp
-    # Sweep actuator plumbing (service_focuser): follower on {role}_sweep for position requests,
-    # writer on {role}_focuser for reports, and the request currently being served.
-    focuser_serve = {'role': None, 'fo': None, 'writer': None,
-                     'want': None, 'target': None, 'served': None}
+    # Sweep servicing (service_sweep): a follower on {role}_sweep drives three duties while a
+    # sweep runs -- resetting the focus stack at each bucket ('frames'), playing EAF actuator
+    # for position requests, and the go-to-apex move on a successful fit.
+    sweep_watch = {'role': None, 'fo': None, 'writer': None,
+                   'want': None, 'target': None, 'served': None,      # EAF actuator state
+                   'reset_step': None, 'apex_done': False, 'ema_restored': True}
 
     almanac_path = os.path.join(session_dir, f"{ts}_almanac.jsonl")       # sky_sim publishes here
     navigation_path = os.path.join(session_dir, f"{ts}_navigation.jsonl")  # sparse feed (GUI overlay)
@@ -928,7 +932,7 @@ def main(argv=None):
                             ['--session', session_dir, '--role', role, '--follow',
                              '--stop-file', focus_stop, '--device', args.device,
                              *(['--shm-ser'] if args.shm_ser else []),
-                             '--crop', str(args.focus_crop), '--search', str(args.focus_search),
+                             '--crop', str(args.focus_crop), '--roi', str(args.focus_roi),
                              '--alpha', str(args.focus_alpha),
                              # Optics for the Strehl reference (aperture 0 = unknown -> delta ideal).
                              '--aperture-mm', str(aperture_by_role.get(role, 0.0)),
@@ -940,10 +944,32 @@ def main(argv=None):
         focus_role = role
         print(f"[backend] focus started on {role}", flush=True)
 
-    # Focus sweep: an optional actuator-agnostic sweep process (focus_sweep.py). It watches the
-    # focus stream's per-frame HFD, publishes position requests on {role}_sweep, and whoever can
-    # move the focuser (a connected EAF via service_focuser, else the GUI human) answers on
-    # {role}_focuser. We hold its stdin: closing the pipe = abort (recorder pattern).
+    # Focus stack control: the focus process tails control_focus_<role>.jsonl for
+    # {'reset', 'average', 'seq'} records. WE are the only writer (the GUI's reset button and
+    # the sweep's bucket boundaries both route through here), so there's no append race.
+    focus_ctl = {'path': None, 'writer': None, 'seq': 0}
+
+    def focus_ctl_reset(average):
+        """Restart the focus stack (average=True: pure running mean for a sweep bucket;
+        False: the display's hot-start EMA). Returns the seq the focus process will echo."""
+        if focus_role is None:
+            return None
+        path = os.path.join(session_dir, f'control_focus_{focus_role}.jsonl')
+        if focus_ctl['path'] != path:
+            if focus_ctl['writer'] is not None:
+                focus_ctl['writer'].close()
+            focus_ctl['writer'] = JsonlWriter(path)
+            focus_ctl['path'] = path
+        focus_ctl['seq'] += 1
+        focus_ctl['writer'].append({'reset': 1, 'average': int(bool(average)),
+                                    'seq': focus_ctl['seq']})
+        return focus_ctl['seq']
+
+    # Focus sweep: an optional actuator-agnostic sweep process (focus_sweep.py). It publishes
+    # position requests on {role}_sweep; whoever can move the focuser (a connected EAF via
+    # service_sweep, else the GUI human) answers on {role}_focuser. Each bucket = one
+    # pure-average stack in the focus process (service_sweep resets it) and one Strehl.
+    # We hold its stdin: closing the pipe = abort (recorder pattern).
     sweep_proc = None
     sweep_role = None
     sweep_error = None                             # why the last Start Sweep was refused (GUI)
@@ -957,7 +983,7 @@ def main(argv=None):
                 pass
             _reap([sweep_proc])
         sweep_proc, sweep_role = None, None
-        end_focuser_serve()                        # a later re-sweep starts with fresh actuator state
+        end_sweep_watch()                          # restores the display EMA if a bucket was live
 
     def launch_sweep(role, cmd):
         nonlocal sweep_proc, sweep_role, sweep_error
@@ -976,18 +1002,33 @@ def main(argv=None):
                 print(f"[backend] sweep refused: {sweep_error}", flush=True)
                 return
         if focus_role != role or focus_proc is None or focus_proc.poll() is not None:
-            launch_focus(role)                     # the sweep feeds on the focus stream's HFD
+            launch_focus(role)                     # the sweep feeds on the focus stream's stack
+        # Bucket depth is given in SECONDS OF INTEGRATED EXPOSURE; the sweep wants a frame
+        # count, so convert at the camera's current exposure time. A throttled framerate
+        # stretches wall time but never shortens integration.
+        exposure_ms = (cam_control_vals.get(role) or {}).get('exposure')
+        if exposure_ms is not None:
+            exposure_s = max(1e-6, float(exposure_ms) / 1e3)
+        elif sources.get(role) == 'sky':
+            exposure_s = args.sky_exposure_s
+        else:
+            exposure_s = 1.0 / 30.0
+            print(f"[backend] sweep: exposure for {role} unknown; assuming "
+                  f"{exposure_s * 1e3:.0f} ms/frame", flush=True)
+        seconds = float(cmd.get('seconds', 5.0))
+        frames = max(1, int(round(seconds / exposure_s)))
         sweep_proc = subprocess.Popen(
             [sys.executable, '-m', 'astrolock.seeker.focus_sweep',
              '--session', session_dir, '--role', role,
              '--start', str(float(cmd['start'])), '--end', str(float(cmd['end'])),
              '--steps', str(int(cmd.get('steps', 9))),
-             '--frames-per-step', str(int(cmd.get('frames', 40))),
+             '--frames-per-step', str(frames),
              '--settle-s', str(float(cmd.get('settle', 1.0)))],
             stdin=subprocess.PIPE)
         sweep_role = role
-        print(f"[backend] focus sweep started on {role}: "
-              f"{cmd['start']} .. {cmd['end']} x{cmd.get('steps', 9)}", flush=True)
+        print(f"[backend] focus sweep started on {role}: {cmd['start']} .. {cmd['end']} "
+              f"x{cmd.get('steps', 9)}, {seconds:g}s of exposure = {frames} frames/bucket",
+              flush=True)
 
     sky_sim_proc = None
 
@@ -1324,7 +1365,6 @@ def main(argv=None):
 
     def disconnect_focuser():
         nonlocal focuser, focuser_status
-        end_focuser_serve()
         if focuser is not None:
             try:
                 focuser.close()
@@ -1344,20 +1384,19 @@ def main(argv=None):
                   f"abs {want} -> {target} (max {focuser.max_step})", flush=True)
         focuser.move_to(target)
 
-    def end_focuser_serve():
-        fs = focuser_serve
-        if fs['fo'] is not None:
-            fs['fo'].close()
-        if fs['writer'] is not None:
-            fs['writer'].close()
-        fs.update(role=None, fo=None, writer=None, want=None, target=None, served=None)
+    def end_sweep_watch():
+        sw = sweep_watch
+        if sw['fo'] is not None:
+            sw['fo'].close()
+        if sw['writer'] is not None:
+            sw['writer'].close()
+        if not sw['ema_restored']:                 # mid-bucket teardown: back to the display EMA
+            focus_ctl_reset(average=False)
+        sw.update(role=None, fo=None, writer=None, want=None, target=None, served=None,
+                  reset_step=None, apex_done=False, ema_restored=True)
 
     def service_focuser():
-        """Per-tick focuser duties while connected: refresh the published pos/moving/temp
-        snapshot, and play sweep actuator -- follow {role}_sweep for position requests, move,
-        and report {'pos': rel} on {role}_focuser once the motor stops (the sweep's settle
-        window starts at our report, so ringing after the stop is already covered)."""
-        nonlocal focuser_status
+        """Per-tick focuser status while connected: the published pos/moving/temp snapshot."""
         pos = focuser.position()
         moving, moving_manual = focuser.is_moving()
         if focuser_status.get('temp_t', 0.0) + 2.0 <= now:     # temperature is slow-moving; 0.5 Hz
@@ -1365,36 +1404,54 @@ def main(argv=None):
             focuser_status['temp_t'] = now
         focuser_status.update(pos=pos, moving=moving, moving_manual=moving_manual)
 
-        fs = focuser_serve
-        sweep_alive = sweep_proc is not None and sweep_proc.poll() is None
-        if not sweep_alive:
-            if fs['role'] is not None:
-                end_focuser_serve()
-            return
-        if fs['role'] != sweep_role:
-            end_focuser_serve()
-            fs['role'] = sweep_role
-            fs['fo'] = framestream.StreamFollower(session_dir, f'{sweep_role}_sweep')
-            fs['writer'] = framestream.FrameStream(session_dir, f'{sweep_role}_focuser')
-        fs['fo'].poll()
-        got = fs['fo'].latest()                             # latest wins; never lappable
-        if got is None:
-            return
-        stt = json.loads(bytes(got[0].read(got[1])).decode('utf-8'))
-        want = stt.get('want_pos')
-        if stt.get('awaiting') != 'position' or want is None or want == fs['served']:
-            return
-        if want != fs['want']:                              # a new request: command the move once
-            fs['want'] = want
-            fs['target'] = int(round(focuser_pos0 + want))
-            focuser.move_to(fs['target'])
-            print(f"[backend] focuser -> rel {want:g} (abs {fs['target']})", flush=True)
-        elif not moving and pos == fs['target']:            # arrived (count AND motor agree): report
-            if not fs['writer'].configured:
-                fs['writer'].configure(1 << 12, 1, pixel_depth=8, frames=256, raw=True)
-            payload = json.dumps({'pos': want}, separators=(',', ':')).encode('utf-8')
-            fs['writer'].write(np.frombuffer(payload, np.uint8), t_mono_ns=session_mod.mono_ns())
-            fs['served'] = want
+    def service_sweep():
+        """Per-tick sweep duties while one runs (either actuator): reset the focus stack into
+        pure-average mode at each bucket's 'frames' entry; with an EAF connected, answer the
+        sweep's position requests (move, then report {'pos': rel} on {role}_focuser once the
+        motor has stopped AND the count matches) and drive to the fitted apex at the end."""
+        sw = sweep_watch
+        alive = sweep_proc is not None and sweep_proc.poll() is None
+        if sw['role'] is None:
+            if not alive:
+                return
+            sw.update(role=sweep_role, fo=framestream.StreamFollower(session_dir,
+                                                                     f'{sweep_role}_sweep'),
+                      writer=None, want=None, target=None, served=None,
+                      reset_step=None, apex_done=False, ema_restored=True)
+        sw['fo'].poll()
+        got = sw['fo'].latest()                             # latest wins; never lappable
+        stt = json.loads(bytes(got[0].read(got[1])).decode('utf-8')) if got is not None else {}
+        if stt.get('awaiting') == 'frames' and stt.get('step') != sw['reset_step']:
+            sw['reset_step'] = stt.get('step')              # new bucket: fresh pure-average stack
+            focus_ctl_reset(average=True)
+            sw['ema_restored'] = False
+        if stt.get('done') and not sw['apex_done']:
+            sw['apex_done'] = True
+            if focuser is not None and stt.get('p0') is not None and stt.get('bracketed'):
+                focuser_move_rel(stt['p0'])                 # the whole point: go to best focus
+                print(f"[backend] focuser -> best focus rel {stt['p0']:g} "
+                      f"(strehl {stt.get('strehl0')})", flush=True)
+        if focuser is not None and stt.get('awaiting') == 'position':
+            want = stt.get('want_pos')
+            if want is not None and want != sw['served']:
+                if want != sw['want']:                      # a new request: command the move once
+                    sw['want'] = want
+                    sw['target'] = int(round(focuser_pos0 + want))
+                    focuser.move_to(sw['target'])
+                    print(f"[backend] focuser -> rel {want:g} (abs {sw['target']})", flush=True)
+                elif (not focuser_status.get('moving')      # arrived (count AND motor agree)
+                        and focuser_status.get('pos') == sw['target']):
+                    if sw['writer'] is None:
+                        sw['writer'] = framestream.FrameStream(session_dir,
+                                                               f"{sw['role']}_focuser")
+                    if not sw['writer'].configured:
+                        sw['writer'].configure(1 << 12, 1, pixel_depth=8, frames=256, raw=True)
+                    payload = json.dumps({'pos': want}, separators=(',', ':')).encode('utf-8')
+                    sw['writer'].write(np.frombuffer(payload, np.uint8),
+                                       t_mono_ns=session_mod.mono_ns())
+                    sw['served'] = want
+        if not alive:                                       # final blob handled above; wrap up
+            end_sweep_watch()
 
     def apply_command(cmd):
         nonlocal estop, tracking, coasting, track_role, tracker, track_seen_det, gui_quit
@@ -1659,6 +1716,15 @@ def main(argv=None):
             else:
                 stop_focus()
                 print("[backend] focus stopped", flush=True)
+        elif t == 'focus_reset':                      # GUI: restart the star stack (hot-start EMA)
+            if focus_proc is not None and focus_proc.poll() is None:
+                focus_ctl_reset(average=False)
+                print("[backend] focus stack reset", flush=True)
+        elif t == 'set_focus_crop':                   # GUI: star crop size (relaunch-tier)
+            args.focus_crop = max(31, int(cmd.get('size', args.focus_crop)))
+            print(f"[backend] focus crop = {args.focus_crop}", flush=True)
+            if focus_proc is not None and focus_proc.poll() is None:
+                launch_focus(focus_role)
         elif t == 'sweep':                            # GUI Focus tab: start/abort a focus sweep
             role = cmd.get('role')
             if cmd.get('on', True):
@@ -1929,7 +1995,8 @@ def main(argv=None):
                           f"{_ti['epoch_utc']:%Y-%m-%d}); respawning sky_sim", flush=True)
                     ensure_sky_sim(restart=True)
             if focuser is not None:
-                service_focuser()                  # publish pos/moving/temp + play sweep actuator
+                service_focuser()                  # publish the pos/moving/temp snapshot
+            service_sweep()                        # bucket stack resets + EAF actuator + apex
             update_detections()
             # Recording reconciliation (policy lives at record_manual/_auto): every tick, per
             # camera: want recording and no recorder -> start one; don't want it but have one
@@ -2128,7 +2195,7 @@ def main(argv=None):
                             if tracking and handoff_fine else None),
                 # Focus process: which role it's running on (the GUI follows <role>_focus + its metrics).
                 'focus': {'running': focus_proc is not None and focus_proc.poll() is None,
-                          'role': focus_role},
+                          'role': focus_role, 'crop': args.focus_crop},
                 # Focus sweep process (the GUI follows <role>_sweep for its prompts/result).
                 'sweep': {'running': sweep_proc is not None and sweep_proc.poll() is None,
                           'role': sweep_role, 'error': sweep_error},
@@ -2233,6 +2300,8 @@ def main(argv=None):
         _step('state slot', state_slot.close)
         _step('mount', lambda: mount.close())
         _step('focuser', disconnect_focuser)
+        _step('focus control', lambda: focus_ctl['writer'].close()
+              if focus_ctl['writer'] is not None else None)
         _step('followers', lambda: [fo.close() for fo in followers.values()])
         _step('detection followers', lambda: [fo_.close() for fo_ in det_fos.values()])
 

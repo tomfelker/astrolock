@@ -1,28 +1,36 @@
 """
-astrolock_seeker_focus: star-crop EMA + focus/collimation metrics -- a pure image->(ser+json) filter.
+astrolock_seeker_focus: star stacking + stack-quality metrics -- a pure image->(ser+json) filter.
 
-Follows one camera's .ser (live or finalized, exactly like detect) and that role's
-<seg>_<role>.detections.jsonl (to know where the target is), and for each frame:
-  - crops a search ROI around the target (the detector's strongest blob; else the frame's
-    global brightest pixel, so it locks a star even before any detection),
-  - finds the peak in that ROI and re-crops a small star window centred there,
-  - EMA-stacks those star crops into a "lucky" average star.
-This is the core of the standalone focus.py, lifted into the seeker pipeline.
+Follows one camera's stream (live or finalized, exactly like detect), and for each frame:
+  - finds the star: argmax of a small separable-Gaussian matched filter (just big enough that
+    a dead pixel can't out-shine a real star), over a centered ROI (--roi) or the whole work
+    image. NOT a raw-flux CoM -- over a full frame the sky's total flux and its vignette
+    gradient swamp a flux-weighted mean (2026-08-02 offline run), while an argmax doesn't
+    care how much sky surrounds the star.
+  - crops (2^k - 1) around that INTEGER peak -- perfectly centered with no resampling. That
+    one crop is both the display frame and the stacking input.
+  - stacks it: hot-start EMA (display; resettable via the control file), or a pure running
+    mean (sweep buckets).
 
-It writes two files per segment (both discovered by SerFollower / the sidecar helpers, so the
-GUI can PIP the star image and graph the metrics -- same naming convention as the _debug streams):
-  - <seg>_<role>_focus.ser          : the EMA star image (mono 16-bit; auto-normalized so the
-                                      shape is always visible -- the quantitative peak is a metric)
-  - <seg>_<role>_focus.frames.jsonl : the commit spine; per-frame metrics ride as binary record
-                                      extras (see the FrameStream extras schema below): peak,
-                                      peak_frame, hfd, strehl, per-image ellipse (astigmatism)
-                                      and skew (coma -> collimation screws), and skew in radians
-                                      for the screw dial. 'present' is record flags bit 0
-                                      (True = locked a real detection, not the global-max
-                                      fallback).
+Quality is ONLY ever evaluated on the stacked image, never on individual frames (2026-08-02
+field data: every reasonable metric reads the same story off the stack; per-frame values are
+seeing-speckle draws). The quality procedure: subtract the edge-pixel mean, normalize by the
+remaining sum, read the peak; Strehl = that / the ideal optics PSF's normalized peak. HFD of
+the stack rides along as the clip-immune companion metric.
 
-No mount, no sky model, no sockets -- files in, files out, so it runs identically on a live capture
-or a recording (where you'd tune it offline).
+Control: 'control_focus_<role>.jsonl' in the session dir; {'reset': 1, 'average': 0|1,
+'seq': n} restarts the stack in the given mode. The applied seq echoes in the 'ctl_seq'
+extra so the sweep can gate 'this stack is MY bucket'.
+
+It writes the star stream (both halves discovered by SerFollower, same naming as _debug):
+  - <seg>_<role>_focus.ser          : [stack | this frame] side by side, mono 16-bit at
+                                      ABSOLUTE brightness; clipped pixels flash
+  - <seg>_<role>_focus.frames.jsonl : commit spine; per-frame extras carry the STACK metrics
+                                      (stack_peak/stack_strehl/stack_hfd/stack_n/ctl_seq/
+                                      clip_px) + shape fits (astigmatism ellipse, coma skew)
+
+No mount, no sky model, no sockets -- files in, files out, so it runs identically on a live
+capture or a recording (where you'd tune it offline).
 
     python -m astrolock.seeker.focus --session sessions/<ts> --role main
 """
@@ -44,12 +52,15 @@ from astrolock.seeker.sidecar import JsonlTailer
 
 
 def _effective_crop(header, crop):
-    """The star crop actually used: the requested size, clamped odd to fit the (maybe Bayer-halved)
-    analysis image, so the EMA and the output .ser always agree on dimensions even for tiny frames."""
+    """The star crop actually used: the largest (2^k - 1) size that fits both the request and
+    the (maybe Bayer-halved) analysis image. Power-of-two-minus-one = an exact center pixel at
+    integer coordinates, so the CoM-rounded crop is perfectly centered with no resampling."""
     d = 2 if bayer.is_bayer(header.color_id) else 1
-    h, w = header.image_height // d, header.image_width // d
-    c = min(crop, h if h % 2 else h - 1, w if w % 2 else w - 1)
-    return max(1, c)
+    c = min(crop, header.image_height // d, header.image_width // d)
+    p = 1
+    while p * 2 + 1 <= c:
+        p = p * 2 + 1
+    return p
 
 
 def _crop(work, cx, cy, size):
@@ -145,10 +156,11 @@ def _weighted_shape(img, sigma_seed, passes=2):
 
 
 def _find_blur(img, sigma):
-    """Gaussian low-pass for FINDING the star (matched filter for the best-focus PSF): a single
-    hot pixel averages down by ~the kernel norm while a real star keeps most of its amplitude,
-    so a dim star always beats a hot pixel at the argmax. Stacking and the peak metric use the
-    RAW pixels -- only localization looks through this."""
+    """Gaussian low-pass for FINDING the star (separable, cheap): a single hot pixel averages
+    down by ~the kernel norm while a real star keeps most of its amplitude, so a dim star
+    always beats a hot pixel at the argmax. Works full-frame -- unlike a raw-flux CoM, the
+    argmax doesn't care how much sky surrounds the star. Stacking and every metric use the
+    RAW pixels; only localization looks through this."""
     from astrolock.seeker.detect import gaussian_deriv_kernels, _conv1d_axis
     if sigma <= 0:
         return img
@@ -194,61 +206,75 @@ def _normalized_peak(crop):
 
 
 class FocusEma:
-    """The running star average + the metrics read off it. update(work, target) each frame returns
-    (ema_crop, metrics). ``scale`` (full_scale) normalizes brightness to 0..1 so metrics are
-    comparable across cameras / bit depths."""
+    """The running star stack + the metrics read off it. Finding is the argmax of a small
+    separable-Gaussian matched filter (hot-pixel-immune, full-frame-capable) -- an INTEGER
+    pixel, so the (2^k - 1) crop is perfectly centered on it with no resampling. Two stack
+    modes: hot-start EMA (display; reset() on star loss / a confirmed new focus), or a pure
+    running mean for sweep buckets -- mean += (frame - mean)/n, NOT a tiny-alpha lerp (which
+    numerically stalls in float32 once the mean is established). Quality is ONLY ever read
+    off the stack; individual frames are seeing-speckle draws (2026-08-02 field data)."""
 
-    def __init__(self, crop, search, alpha, scale, peak_decay=0.9, find_sigma=2.0):
-        self.crop, self.search, self.alpha, self.scale = crop, search, alpha, scale
+    def __init__(self, crop, alpha, scale, roi=0, peak_decay=0.9, find_sigma=2.0):
+        self.crop, self.alpha, self.scale, self.roi = crop, alpha, scale, roi
         self.peak_decay = peak_decay
-        self.find_sigma = find_sigma   # PSF-matched blur for LOCALIZATION only (hot-pixel immunity)
-        self.ema = None
-        self.peak_meter = None      # per-pixel decaying peak-hold of the RAW star crop, for saturation
-        self.peak_norm_ema = None   # scalar EMA of per-frame normalized peaks -> Strehl numerator
-                                    # (registration-free: measures typical FRAME quality, which a
-                                    # peak-registered lucky stack could preserve)
+        self.find_sigma = find_sigma  # finder blur sigma; also seeds the shape fits (optics-set)
+        self.stack = None
+        self.average = False        # True: pure running mean (sweep bucket); False: EMA
+        self.n = 0                  # frames since the last reset (the mean's divisor)
+        self.peak_meter = None      # per-pixel decaying peak-hold of the RAW star crop (clip flash)
 
-    def update(self, work, target):
-        # Phases: 1) search ROI around the target; 2) COARSE find: matched-filtered argmax (a
-        # hot pixel can't win); 3) sub-pixel refine: toroidal CoM of a crop-sized window there
-        # (background-immune; a donut's centre, not a rim point); 4) star crop REGISTERED on
-        # the refined CoM -- well-defined across the whole focus range, where the peak is a
-        # noise-picked rim point on a defocused SCT; 5) weighted-moment shape fit per image.
-        tx, ty = target
-        region, rx0, ry0 = _crop(work, tx, ty, self.search)
-        pk = int(torch.argmax(_find_blur(region, self.find_sigma)))
-        py, px = pk // region.shape[1], pk % region.shape[1]
-        refine, fx0, fy0 = _crop(work, rx0 + px, ry0 + py, self.crop)
-        rcx, rcy = _toroidal_com(refine)
-        star, _, _ = _crop(work, fx0 + rcx, fy0 + rcy, self.crop)
-        # NEVER clear a live EMA (user 2026-07-13): a finder hiccup blending through the average
-        # beats restarting it -- the crop is target-locked, so a wrong frame fades in ~1/alpha.
-        if self.ema is None or self.ema.shape != star.shape:
-            self.ema = star.clone()
-            self.peak_meter = star.clone()
+    def reset(self, average):
+        """Restart the stack: star lost, a confirmed new focus position, or a sweep bucket."""
+        self.average = bool(average)
+        self.stack = None
+        self.n = 0
+
+    def update(self, work):
+        # Find: matched-filtered argmax over the (optionally bounded) region. The blur is just
+        # big enough that a dead/hot pixel can't out-shine a real star; the argmax is already
+        # integer, so the power-of-two-minus-one crop centers on it exactly, no resampling.
+        H, W = work.shape
+        if self.roi and self.roi < min(H, W):
+            region, x0, y0 = _crop(work, W / 2.0, H / 2.0, self.roi)
         else:
-            self.ema = torch.lerp(self.ema, star, self.alpha)          # EMA of the star crop
-            # Decaying per-pixel peak-hold of the RAW crop: catches a saturating core even between the
-            # EMA's slow settle, and holds the warning a moment after it stops clipping.
+            region, x0, y0 = work, 0, 0
+        pk = int(torch.argmax(_find_blur(region, self.find_sigma)))
+        px, py = x0 + pk % region.shape[1], y0 + pk // region.shape[1]
+        star, _, _ = _crop(work, px, py, self.crop)
+        self.n += 1
+        if self.stack is None or self.stack.shape != star.shape:
+            self.stack = star.clone()
+            self.peak_meter = star.clone()
+            self.n = 1
+        else:
+            if self.average:
+                self.stack += (star - self.stack) / self.n             # exact running mean
+            else:
+                self.stack = torch.lerp(self.stack, star, self.alpha)  # hot-start EMA
+            # Decaying per-pixel peak-hold of the RAW crop: catches a clipping core between the
+            # stack's slow settle, and holds the warning a moment after it stops clipping.
             self.peak_meter = torch.maximum(self.peak_meter * self.peak_decay, star)
-        ema = self.ema
-        shape = _weighted_shape(ema, self.find_sigma)                  # EMA image shape
+        stack = self.stack
+        # Stack quality: edge-mean pedestal off, sum normalizes, peak on top.
+        edge = torch.cat([stack[0], stack[-1], stack[:, 0], stack[:, -1]])
+        net = stack - edge.mean()
+        total = float(net.sum())
+        norm_peak = float(net.max()) / total if total > 0 else 0.0
+        shape = _weighted_shape(stack, self.find_sigma)                # stack shape
         shape_instant = _weighted_shape(star, self.find_sigma)         # same fit, this frame
-        peak_norm = _normalized_peak(star)                             # per-frame quality scalar
-        self.peak_norm_ema = (peak_norm if self.peak_norm_ema is None
-                              else self.peak_norm_ema + self.alpha * (peak_norm - self.peak_norm_ema))
         metrics = {
-            'peak': round(float(ema.max()) / self.scale, 6),          # EMA-stack brightness proxy
-            'peak_frame': round(float(star.max()) / self.scale, 6),   # per-frame; blinds when saturated
-            'hfd': round(_hfd(star), 3),                              # per-frame; coarse-approach aid
-            'peak_norm_ema': self.peak_norm_ema,                      # Strehl numerator (scalar EMA)
+            'stack_peak': round(float(stack.max()) / self.scale, 6),  # raw stack top (exposure aid)
+            'norm_peak': norm_peak,                                   # Strehl numerator (of the stack)
+            'stack_hfd': round(_hfd(stack), 3),                       # clip-immune focus metric
+            'stack_n': self.n,
+            'clip_px': int((star >= 0.98 * self.scale).sum()),        # THIS frame's clipped pixels
             'ellipse': [round(shape['e1'], 4), round(shape['e2'], 4)],           # astigmatism
             'skew': [round(shape['sx'], 3), round(shape['sy'], 3)],              # coma -> screws
             'instant_ellipse': [round(shape_instant['e1'], 4), round(shape_instant['e2'], 4)],
             'instant_skew': [round(shape_instant['sx'], 3), round(shape_instant['sy'], 3)],
         }
-        sat = self.peak_meter > (0.9 * self.scale)                    # near full well -> peak unreliable
-        return ema, star, metrics, sat
+        sat = self.peak_meter > (0.9 * self.scale)                    # near full well -> flash
+        return stack, star, metrics, sat
 
 
 def _ema_frame_u16(ema, scale, blank=None):
@@ -269,10 +295,13 @@ def main(argv=None):
     p.add_argument('--follow', action='store_true',
                    help="live mode: track the newest segment and never exit (default: offline, process "
                         "each segment in order then exit)")
-    p.add_argument('--crop', type=int, default=63, help="star crop size (px, forced odd); the EMA image")
-    p.add_argument('--search', type=int, default=128,
-                   help="search ROI around the target to find the peak in (px)")
-    p.add_argument('--alpha', type=float, default=0.05, help="EMA rate for the star crop (bigger = faster)")
+    p.add_argument('--crop', type=int, default=127,
+                   help="star crop size (px; snapped down to 2^k - 1 so the center is exact)")
+    p.add_argument('--roi', type=int, default=0,
+                   help="star-FINDING region: a centered square this many work px across "
+                        "(0 = the whole work image). The toroidal CoM of this region is the star; "
+                        "set the camera ROI (or this) so the star dominates it")
+    p.add_argument('--alpha', type=float, default=0.05, help="EMA rate for the star stack (bigger = faster)")
     # Optics -> the ideal diffraction PSF for the Strehl ratio. Strehl is emitted only when aperture > 0.
     p.add_argument('--aperture-mm', type=float, default=0.0,
                    help="objective aperture (mm); >0 enables the Strehl-ratio metric (measured vs ideal Airy peak)")
@@ -288,10 +317,6 @@ def main(argv=None):
     p.add_argument('--stop-file', default=None, help="stop cleanly when this file appears")
     p.add_argument('--shm-ser', action='store_true',
                    help="write the star stream to shared-memory segments instead of disk (matches the cams)")
-    p.add_argument('--find-blur-px', type=float, default=0.0,
-                   help="star-FINDING low-pass sigma (px): the matched filter that stops a hot "
-                        "pixel from stealing the lock at dim exposures. 0 = auto (from the "
-                        "optics' diffraction size when known, else 2.0). Stacking uses raw pixels")
     p.add_argument('--shm-frames', type=int, default=256,
                    help="shm star segments: frames per segment (the star crop is tiny)")
     p.add_argument('--device', default='auto',
@@ -312,16 +337,16 @@ def main(argv=None):
     # Follow the cam stream; the star OUTPUT ring reconfigures only when the input ring does
     # (a geometry change -- the only roll left anywhere).
     fo = framestream.StreamFollower(args.session, args.role)
-
-    def find_sigma0():
-        """Star-finding blur sigma: explicit --find-blur-px, else 2.0 until the optics-derived
-        value takes over (set in process() once the plate scale is known)."""
-        return args.find_blur_px if args.find_blur_px > 0 else 2.0
-    det_fo = framestream.StreamFollower(args.session, f'{args.role}_det')   # latest target blobs
-    # Star stream: per-frame focus metrics ride as binary record extras (strehl None -> NaN;
-    # 'present' is record flags bit 0). The GUI reads them straight from the section.
+    # Stack control: {'reset': 1, 'average': 0|1, 'seq': n} restarts the stack in the given
+    # mode. Written by the backend (GUI reset button; sweep bucket boundaries). The applied
+    # seq echoes in the 'ctl_seq' extra so the sweep can gate on 'this stack is MY bucket'.
+    ctl = JsonlTailer(os.path.join(args.session, f'control_focus_{args.role}.jsonl'))
+    ctl_seq = 0
+    ctl_average = False
+    # Star stream: per-frame STACK metrics ride as binary record extras (strehl None -> NaN).
     out = framestream.FrameStream(args.session, f'{args.role}_focus',
-                                  extras=('<14f', ['peak', 'peak_frame', 'hfd', 'strehl',
+                                  extras=('<16f', ['stack_peak', 'stack_strehl', 'stack_hfd',
+                                                   'stack_n', 'ctl_seq', 'clip_px',
                                                    'ellipse_1', 'ellipse_2', 'skew_x', 'skew_y',
                                                    'instant_ellipse_1', 'instant_ellipse_2',
                                                    'instant_skew_x', 'instant_skew_y',
@@ -333,21 +358,19 @@ def main(argv=None):
         nonlocal cur, ema, scale, strehl_done
         cur = rd
         crop = _effective_crop(rd.header, args.crop)        # fits the analysis image; writer + EMA agree
-        out.configure(crop * 2, crop,                       # [EMA | this frame's star]
+        out.configure(crop * 2, crop,                       # [stack | this frame's star]
                       color_id=ser_mod.ColorId.MONO, pixel_depth=16,
                       shm=args.shm_ser, frames=args.shm_frames,
                       # src_seg + each record's ABSOLUTE src_index fully names the source frame.
                       meta={'src_seg': rd.ident})
-        # The EMA survives everything except an actual geometry change (never cleared otherwise).
+        # The stack survives everything except an actual geometry change (and explicit resets).
         if ema is None or ema.crop != crop:
-            fs = ema.find_sigma if ema is not None else find_sigma0()
-            ema = FocusEma(crop, args.search, args.alpha, scale=None, find_sigma=fs)
+            fs = ema.find_sigma if ema is not None else 2.0
+            ema = FocusEma(crop, args.alpha, scale=None, roi=args.roi, find_sigma=fs)
+            ema.average = ctl_average
             strehl_done = False                             # the ideal PSF is crop-sized: rebuild
         scale = None
 
-    latest_blobs = []
-    latest_tracking = False        # blobs are only trusted when they answer a tracker lock
-    last_det = None                # (det ring ident, index) of the last-applied detection
     last_done = None               # (cam ring ident, index) of the last frame processed
     scale = None
     total = 0
@@ -357,7 +380,6 @@ def main(argv=None):
 
     def close_all():
         fo.close()
-        det_fo.close()
         out.close()
 
     def process(i):
@@ -384,38 +406,25 @@ def main(argv=None):
             if args.aperture_mm > 0 and args.focal_mm > 0 and args.pixel_um > 0:
                 r_null = skysim.airy_r_null_px(args.focal_mm, args.aperture_mm, args.wavelength_nm,
                                                args.pixel_um * coord_scale)
-                if args.find_blur_px <= 0:             # auto: match the finder to the Airy core
-                    ema.find_sigma = max(1.0, 0.35 * r_null)   # gaussian sigma ~ the Airy core width
+                ema.find_sigma = max(1.0, 0.35 * r_null)    # match the finder to the Airy core
                 ideal = skysim.aperture_psf(ema.crop, r_null, obstruction=args.obstruction,
                                             vanes=args.vanes, vane_width_frac=args.vane_width, device=device)
             else:
                 ideal = torch.zeros((ema.crop, ema.crop), device=device)   # perfect point source
                 ideal[ema.crop // 2, ema.crop // 2] = 1.0
             strehl_ref = _normalized_peak(ideal)
-        # Target in WORK px. A detection steers us ONLY when it answers a tracker lock (the
-        # detector's ROI/tracking phase): acquisition blobs jiggle and the extended detector is
-        # for resolved targets, not stars. Untracked = the frame's matched-filtered brightest
-        # pixel, full frame -- the brightest star is a steadier choice than any detector guess.
-        present = bool(latest_blobs) and latest_tracking
-        if present:                                # strongest blob (detect emits in tile order)
-            fx, fy = max(latest_blobs, key=lambda b: b.get('score', 0.0))['px']
-            target = (fx / coord_scale, fy / coord_scale)
-        else:
-            pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))   # hot pixels can't win
-            target = (pk % work.shape[1], pk // work.shape[1])
-        star_ema, star_now, metrics, sat = ema.update(work, target)
-        # Extras schema ('<14f'): strehl NaN when the aperture is unknown; skew_rad NaN when the
-        # plate scale is (consumers turn NaN back into None/absent). Strehl compares the scalar
-        # EMA of per-frame normalized peaks to the ideal -- registration-free, and it measures
-        # the typical frame (what a lucky stack could keep), not our stacking convention.
-        strehl = (metrics['peak_norm_ema'] / strehl_ref) if strehl_ref else float('nan')
+        stack, star_now, metrics, sat = ema.update(work)
+        # Extras schema ('<16f'): strehl NaN when the aperture is unknown; skew_rad NaN when the
+        # plate scale is (consumers turn NaN back into None/absent). Strehl = the STACK's
+        # normalized peak over the ideal's -- quality of the average, not average of qualities.
+        strehl = (metrics['norm_peak'] / strehl_ref) if strehl_ref else float('nan')
         skew_rad_x = metrics['skew'][0] * rad_per_px if rad_per_px is not None else float('nan')
         skew_rad_y = metrics['skew'][1] * rad_per_px if rad_per_px is not None else float('nan')
         even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
-        # Side-by-side: the EMA (left) next to the RAW star crop this instant (right) -- the
+        # Side-by-side: the stack (left) next to the RAW star crop this instant (right) -- the
         # right half is the direct check that the finder is on the star at all.
         import numpy as _np
-        pair = _np.concatenate([_ema_frame_u16(star_ema, scale, sat if even else None),
+        pair = _np.concatenate([_ema_frame_u16(stack, scale, sat if even else None),
                                 _ema_frame_u16(star_now, scale)], axis=1)
         # Stamp with the SOURCE frame's capture time (not our processing time): the metrics
         # describe the light at capture, and consumers (graph x-axis, the sweep's settle gate)
@@ -425,8 +434,9 @@ def main(argv=None):
         if not src_t:
             raise ValueError(f"frame {i} of {cur.ident} has no capture stamp")
         out.write(pair,
-                  t_mono_ns=src_t, src_index=i, flags=1 if present else 0,
-                  extras=(metrics['peak'], metrics['peak_frame'], metrics['hfd'], strehl,
+                  t_mono_ns=src_t, src_index=i,
+                  extras=(metrics['stack_peak'], strehl, metrics['stack_hfd'],
+                          float(metrics['stack_n']), float(ctl_seq), float(metrics['clip_px']),
                           metrics['ellipse'][0], metrics['ellipse'][1],
                           metrics['skew'][0], metrics['skew'][1],
                           metrics['instant_ellipse'][0], metrics['instant_ellipse'][1],
@@ -439,35 +449,25 @@ def main(argv=None):
         while True:
             if parent_dead.is_set() or (args.stop_file and os.path.exists(args.stop_file)):
                 break
-            det_fo.poll()                             # refresh the target location (latest record)
-            got_det = det_fo.latest()
-            if got_det is not None:
-                drd, di = got_det
-                if last_det != (drd.ident, di):
-                    last_det = (drd.ident, di)
-                    import json as _json
-                    d = _json.loads(bytes(drd.read(di)).decode('utf-8'))
-                    # Trust the blobs only when they index the CURRENT cam stream -- a leftover record
-                    # from the previous camera/geometry would otherwise stack an old star on the new one.
-                    if cur is not None and d.get('seg') == cur.ident:
-                        latest_blobs = d.get('blobs', [])
-                        latest_tracking = bool(d.get('tracking'))
-                    else:
-                        latest_blobs = []
-                        latest_tracking = False
+            for cmd in ctl.poll():                    # stack control (backend-written)
+                if cmd.get('reset'):
+                    ctl_average = bool(cmd.get('average'))
+                    ctl_seq = int(cmd.get('seq', ctl_seq + 1))
+                    if ema is not None:
+                        ema.reset(ctl_average)
+                    print(f"[focus:{args.role}] stack reset "
+                          f"({'average' if ctl_average else 'ema'}, seq {ctl_seq})", flush=True)
             fo.poll()
             worked = False
             # LATEST-ONLY (like the detectors): always process the newest committed frame and
             # skip whatever piled up behind it -- a focus readout is only useful live, so
-            # latency beats completeness. (Skipping stretches the EMA's effective time
+            # latency beats completeness. (Skipping stretches the stack's effective time
             # constant when we're slow; that's the right trade for a focusing aid.)
             got = fo.latest()
             if got is not None:
                 rd, i = got
                 if rd is not cur:
                     switch_to(rd)
-                    latest_blobs = []
-                    latest_tracking = False
                 if last_done != (rd.ident, i):
                     last_done = (rd.ident, i)
                     try:
@@ -487,22 +487,19 @@ def main(argv=None):
 
 
 def analyze_ser(args, device):
-    """Offline sweep analysis: the live pipeline's exact find/EMA/Strehl math over a recorded
-    .ser. Emits per-frame metrics (peak_frame is what an autofocus sweep fits); the summary
-    reports the best-focus frame and how stable the star lock was (hot-pixel jumps show up as
-    target teleports)."""
+    """Offline analysis: the live pipeline's exact find/stack/Strehl math over a recorded .ser.
+    Emits per-frame STACK metrics; the summary reports the best-focus frame and the clipped
+    fraction (the thing that quietly ruins Strehl on real nights)."""
     import json as _json
     r = ser_mod.SerReader(args.ser)
     cid = r.header.color_id
     n = r.frames_on_disk()
     crop = _effective_crop(r.header, args.crop)
     scale = full_scale(cid, r.header.pixel_depth_per_plane)
-    ema = FocusEma(crop, args.search, args.alpha, scale=scale,
-                   find_sigma=(args.find_blur_px if args.find_blur_px > 0 else 2.0))
+    ema = FocusEma(crop, args.alpha, scale=scale, roi=args.roi)
     strehl_ref = None
     rows = []
     outf = open(args.metrics_out, 'w', encoding='utf-8') if args.metrics_out else None
-    last_t = None
     idxs = range(0, n, max(1, args.stride))
     if args.limit:
         idxs = list(idxs)[:args.limit]
@@ -513,8 +510,7 @@ def analyze_ser(args, device):
             if args.aperture_mm > 0 and args.focal_mm > 0 and args.pixel_um > 0:
                 r_null = skysim.airy_r_null_px(args.focal_mm, args.aperture_mm,
                                                args.wavelength_nm, args.pixel_um * coord_scale)
-                if args.find_blur_px <= 0:
-                    ema.find_sigma = max(1.0, 0.35 * r_null)
+                ema.find_sigma = max(1.0, 0.35 * r_null)
                 ideal = skysim.aperture_psf(ema.crop, r_null, obstruction=args.obstruction,
                                             vanes=args.vanes, vane_width_frac=args.vane_width,
                                             device=device)
@@ -522,37 +518,27 @@ def analyze_ser(args, device):
                 ideal = torch.zeros((ema.crop, ema.crop), device=device)
                 ideal[ema.crop // 2, ema.crop // 2] = 1.0
             strehl_ref = _normalized_peak(ideal)
-            print(f"[focus] {n} frames, crop {crop}, find_sigma {ema.find_sigma:.2f}px, "
-                  f"stride {args.stride}", flush=True)
-        pk = int(torch.argmax(_find_blur(work, ema.find_sigma)))
-        target = (pk % work.shape[1], pk // work.shape[1])
-        star_ema, _star_now, metrics, sat = ema.update(work, target)
-        row = {'i': i, 'tx': target[0], 'ty': target[1],
-               'peak': metrics['peak'], 'peak_frame': metrics['peak_frame'],
-               'hfd': metrics['hfd'],
-               'strehl': round(metrics['peak_norm_ema'] / strehl_ref, 4) if strehl_ref else None,
-               'sat_px': int(sat.sum())}
+            print(f"[focus] {n} frames, crop {crop}, stride {args.stride}", flush=True)
+        _stack, _star_now, metrics, _sat = ema.update(work)
+        row = {'i': i,
+               'stack_peak': metrics['stack_peak'],
+               'stack_strehl': round(metrics['norm_peak'] / strehl_ref, 5) if strehl_ref else None,
+               'stack_hfd': metrics['stack_hfd'],
+               'clip_px': metrics['clip_px']}
         rows.append(row)
         if outf:
             outf.write(_json.dumps(row) + chr(10))
         if k % 200 == 0:
-            print(f"  frame {i}/{n}  peak_frame {row['peak_frame']:.4f}", flush=True)
+            print(f"  frame {i}/{n}  strehl {row['stack_strehl']} hfd {row['stack_hfd']:.1f}",
+                  flush=True)
     if outf:
         outf.close()
     r.close()
-    # Summary: best focus + lock stability (a teleporting target = the finder changed its mind).
-    import math as _math
-    best = max(rows, key=lambda x: x['peak_frame'])
-    besth = min((x for x in rows if x['hfd'] > 0), key=lambda x: x['hfd'], default=None)
-    if besth:
-        print(f"[focus] min HFD {besth['hfd']:.2f}px at frame {besth['i']} "
-              f"(saturation-immune best focus)", flush=True)
-    jumps = sum(1 for a, b in zip(rows, rows[1:])
-                if _math.hypot(b['tx'] - a['tx'], b['ty'] - a['ty']) > args.search / 2)
-    satn = sum(1 for x in rows if x['sat_px'])
-    print(f"[focus] best peak_frame {best['peak_frame']:.4f} at frame {best['i']} "
-          f"(strehl there {best['strehl']}); target jumps >{args.search // 2}px: {jumps}; "
-          f"frames with saturated px: {satn}/{len(rows)}", flush=True)
+    best = max(rows, key=lambda x: x['stack_strehl'] or 0.0)
+    clipped = sum(1 for x in rows if x['clip_px'])
+    print(f"[focus] best stack Strehl {best['stack_strehl']} at frame {best['i']} "
+          f"(hfd there {best['stack_hfd']:.1f}px); frames with clipped px: "
+          f"{clipped}/{len(rows)}", flush=True)
 
 
 if __name__ == '__main__':
