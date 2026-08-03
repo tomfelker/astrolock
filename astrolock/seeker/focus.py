@@ -24,7 +24,8 @@ extra so the sweep can gate 'this stack is MY bucket'.
 
 It writes the star stream (both halves discovered by SerFollower, same naming as _debug):
   - <seg>_<role>_focus.ser          : [stack | this frame] side by side, mono 16-bit at
-                                      ABSOLUTE brightness; clipped pixels flash
+                                      ABSOLUTE brightness, TRUE values (clip marking is the
+                                      GUI shader's rainbow, per view)
   - <seg>_<role>_focus.frames.jsonl : commit spine; per-frame extras carry the STACK metrics
                                       (stack_peak/stack_strehl/stack_hfd/stack_n/ctl_seq/
                                       clip_px) + shape fits (astigmatism ellipse, coma skew)
@@ -214,14 +215,12 @@ class FocusEma:
     numerically stalls in float32 once the mean is established). Quality is ONLY ever read
     off the stack; individual frames are seeing-speckle draws (2026-08-02 field data)."""
 
-    def __init__(self, crop, alpha, scale, roi=0, peak_decay=0.9, find_sigma=2.0):
+    def __init__(self, crop, alpha, scale, roi=0, find_sigma=2.0):
         self.crop, self.alpha, self.scale, self.roi = crop, alpha, scale, roi
-        self.peak_decay = peak_decay
         self.find_sigma = find_sigma  # finder blur sigma; also seeds the shape fits (optics-set)
         self.stack = None
         self.average = False        # True: pure running mean (sweep bucket); False: EMA
         self.n = 0                  # frames since the last reset (the mean's divisor)
-        self.peak_meter = None      # per-pixel decaying peak-hold of the RAW star crop (clip flash)
 
     def reset(self, average):
         """Restart the stack: star lost, a confirmed new focus position, or a sweep bucket."""
@@ -244,16 +243,11 @@ class FocusEma:
         self.n += 1
         if self.stack is None or self.stack.shape != star.shape:
             self.stack = star.clone()
-            self.peak_meter = star.clone()
             self.n = 1
+        elif self.average:
+            self.stack += (star - self.stack) / self.n                 # exact running mean
         else:
-            if self.average:
-                self.stack += (star - self.stack) / self.n             # exact running mean
-            else:
-                self.stack = torch.lerp(self.stack, star, self.alpha)  # hot-start EMA
-            # Decaying per-pixel peak-hold of the RAW crop: catches a clipping core between the
-            # stack's slow settle, and holds the warning a moment after it stops clipping.
-            self.peak_meter = torch.maximum(self.peak_meter * self.peak_decay, star)
+            self.stack = torch.lerp(self.stack, star, self.alpha)      # hot-start EMA
         stack = self.stack
         # Stack quality: edge-mean pedestal off, sum normalizes, peak on top.
         edge = torch.cat([stack[0], stack[-1], stack[:, 0], stack[:, -1]])
@@ -273,18 +267,15 @@ class FocusEma:
             'instant_ellipse': [round(shape_instant['e1'], 4), round(shape_instant['e2'], 4)],
             'instant_skew': [round(shape_instant['sx'], 3), round(shape_instant['sy'], 3)],
         }
-        sat = self.peak_meter > (0.9 * self.scale)                    # near full well -> flash
-        return stack, star, metrics, sat
+        return stack, star, metrics
 
 
-def _ema_frame_u16(ema, scale, blank=None):
-    """The EMA star crop as a uint16 mono image for the .ser, at ABSOLUTE brightness (NOT range-stretched)
-    so the user can judge exposure by how bright it looks. ``blank`` (a saturation mask) zeroes those
-    pixels -- applied on alternate frames, saturated cores FLASH as a 'peak measurement can't be trusted'
-    warning."""
+def _ema_frame_u16(ema, scale):
+    """A star crop as a uint16 mono image for the .ser, at ABSOLUTE brightness (NOT
+    range-stretched) so the user can judge exposure by how bright it looks. TRUE values,
+    nothing baked in -- clip marking is the GUI shader's job (the clip rainbow), so clipped
+    pixels must arrive here still at full scale."""
     img = (ema / scale).clamp(0, 1)
-    if blank is not None:
-        img = torch.where(blank, torch.zeros_like(img), img)
     return (img * 65535.0).round().cpu().numpy()
 
 
@@ -413,18 +404,17 @@ def main(argv=None):
                 ideal = torch.zeros((ema.crop, ema.crop), device=device)   # perfect point source
                 ideal[ema.crop // 2, ema.crop // 2] = 1.0
             strehl_ref = _normalized_peak(ideal)
-        stack, star_now, metrics, sat = ema.update(work)
+        stack, star_now, metrics = ema.update(work)
         # Extras schema ('<16f'): strehl NaN when the aperture is unknown; skew_rad NaN when the
         # plate scale is (consumers turn NaN back into None/absent). Strehl = the STACK's
         # normalized peak over the ideal's -- quality of the average, not average of qualities.
         strehl = (metrics['norm_peak'] / strehl_ref) if strehl_ref else float('nan')
         skew_rad_x = metrics['skew'][0] * rad_per_px if rad_per_px is not None else float('nan')
         skew_rad_y = metrics['skew'][1] * rad_per_px if rad_per_px is not None else float('nan')
-        even = (total % 2 == 0)                        # blank saturated cores on alternate frames -> flashing
         # Side-by-side: the stack (left) next to the RAW star crop this instant (right) -- the
         # right half is the direct check that the finder is on the star at all.
         import numpy as _np
-        pair = _np.concatenate([_ema_frame_u16(stack, scale, sat if even else None),
+        pair = _np.concatenate([_ema_frame_u16(stack, scale),
                                 _ema_frame_u16(star_now, scale)], axis=1)
         # Stamp with the SOURCE frame's capture time (not our processing time): the metrics
         # describe the light at capture, and consumers (graph x-axis, the sweep's settle gate)
@@ -519,7 +509,7 @@ def analyze_ser(args, device):
                 ideal[ema.crop // 2, ema.crop // 2] = 1.0
             strehl_ref = _normalized_peak(ideal)
             print(f"[focus] {n} frames, crop {crop}, stride {args.stride}", flush=True)
-        _stack, _star_now, metrics, _sat = ema.update(work)
+        _stack, _star_now, metrics = ema.update(work)
         row = {'i': i,
                'stack_peak': metrics['stack_peak'],
                'stack_strehl': round(metrics['norm_peak'] / strehl_ref, 5) if strehl_ref else None,

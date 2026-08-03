@@ -100,9 +100,13 @@ MAXPIP = 4                       # pool of PIP panes along the bottom; each show
 def _default_settings(key=None):
     # The sky overlay defaults ON for the guide (wide FoV -- it's how you find the pass) and
     # OFF for the main (narrow FoV, already on target; keeps its pane clean and cheap).
+    # The clip rainbow (near-full-scale pixels painted random colors in the shader) defaults
+    # ON where clipping costs data quality -- the main cam and the focus star views -- and
+    # OFF for the guide, whose job is finding, not photometry.
     main = (key == 'main')
     return {'zoom': 1, 'reticles': True, 'histogram': False, 'wait_for_detector': True,
-            'show_stars': not main, 'show_target_names': not main, 'show_star_names': False}
+            'show_stars': not main, 'show_target_names': not main, 'show_star_names': False,
+            'clip_rainbow': main or (key or '').endswith('_focus')}
 
 
 def _fmt_time_delta(delta_ns):
@@ -238,6 +242,8 @@ uniform ivec2 off_g1;
 uniform ivec2 off_b;
 uniform vec2 wb;                        // display-only R,B gains
 uniform float inv_white;                // 1 / container max (255 or 65535)
+uniform float clip_thresh;              // container-relative clip mark threshold; < 0 = off
+uniform float clip_seed;                // changes per frame -> the rainbow shimmers
 out vec4 frag;
 // The ONLY nonlinearity in the whole pipeline: capture + histogram stay linear; here at the very
 // last step we encode linear light to sRGB for the display (IEC 61966-2-1: a linear toe below
@@ -247,18 +253,31 @@ vec3 lin_to_srgb(vec3 c) {
     vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
     return mix(lo, hi, step(vec3(0.0031308), c));
 }
+vec3 hash3(vec3 s) {                    // per-pixel-per-frame pseudo-random color
+    return fract(sin(vec3(dot(s, vec3(127.1, 311.7, 74.7)),
+                          dot(s, vec3(269.5, 183.3, 246.1)),
+                          dot(s, vec3(113.5, 271.9, 124.6)))) * 43758.5453);
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec3 rgb;
+    float raw_max;                      // pre-WB: clipping is a SENSOR fact, not a display one
     if (mono == 1) {
-        rgb = vec3(float(texelFetch(mosaic, p, 0).r));
+        float v = float(texelFetch(mosaic, p, 0).r);
+        rgb = vec3(v);
+        raw_max = v;
     } else {
         ivec2 c = p * 2;
-        float r = float(texelFetch(mosaic, c + off_r, 0).r) * wb.x;
-        float g = 0.5 * (float(texelFetch(mosaic, c + off_g0, 0).r)
-                       + float(texelFetch(mosaic, c + off_g1, 0).r));
-        float b = float(texelFetch(mosaic, c + off_b, 0).r) * wb.y;
-        rgb = vec3(r, g, b);
+        float r0 = float(texelFetch(mosaic, c + off_r, 0).r);
+        float g0 = float(texelFetch(mosaic, c + off_g0, 0).r);
+        float g1 = float(texelFetch(mosaic, c + off_g1, 0).r);
+        float b0 = float(texelFetch(mosaic, c + off_b, 0).r);
+        rgb = vec3(r0 * wb.x, 0.5 * (g0 + g1), b0 * wb.y);
+        raw_max = max(max(r0, g0), max(g1, b0));   // any clipped site marks the cell
+    }
+    if (clip_thresh > 0.0 && raw_max * inv_white >= clip_thresh) {
+        frag = vec4(hash3(vec3(gl_FragCoord.xy, clip_seed)), 1.0);   // trippy = unmistakable
+        return;
     }
     rgb = clamp(rgb * inv_white, 0.0, 1.0);
     frag = vec4(lin_to_srgb(rgb), 1.0);
@@ -299,6 +318,7 @@ class _StreamGL:
         self.raw = self.color = self.fbo = None
         self.key = None                          # (w, h, dtype, color_id) the textures were built for
         self.flip = 0
+        self.uploads = 0                         # frame counter -> the clip rainbow's shimmer seed
         self.tex_id = None                       # GL texture name of the latest rendered RGBA8 target
 
     def _rebuild(self, w, h, dtype, color_id):
@@ -318,13 +338,16 @@ class _StreamGL:
         self.key = (w, h, dtype, int(color_id))
         self.out_size = (ow, oh)
 
-    def upload(self, frame, color_id, wb):
+    def upload(self, frame, color_id, wb, clip_mark=False):
         """Raw mosaic/mono frame (numpy u16/u8) -> the tonemapped RGBA8 target. Returns (w, h) of the
-        display texture (half-res for Bayer: the 4-plane stack). Linear in, sRGB out (no gamma knob)."""
+        display texture (half-res for Bayer: the 4-plane stack). Linear in, sRGB out (no gamma knob).
+        ``clip_mark``: paint near-full-scale pixels (>= 250/255 of the container) a random color
+        per pixel per frame -- clipping reads as an unmissable shimmering rainbow."""
         h, w = frame.shape[0], frame.shape[1]
         if self.key != (w, h, frame.dtype, int(color_id)):
             self._rebuild(w, h, frame.dtype, color_id)
         self.flip ^= 1
+        self.uploads += 1
         i = self.flip
         self.tex_obj = self.color[i]             # moderngl handle for the nearest-blit pass
         self.raw[i].write(np.ascontiguousarray(frame))
@@ -332,6 +355,8 @@ class _StreamGL:
         white = int(np.iinfo(frame.dtype).max)
         prog['mosaic'].value = 0
         prog['inv_white'].value = 1.0 / white
+        prog['clip_thresh'].value = (250.0 / 255.0) if clip_mark else -1.0
+        prog['clip_seed'].value = float(self.uploads % 1024)
         if bayer.is_bayer(color_id):
             ri, (g0, g1), bi = bayer.rgb_plane_indices(color_id)
             prog['mono'].value = 0
@@ -719,7 +744,9 @@ def main(argv=None):
                 fh, fw = disp.shape[0], disp.shape[1]
                 cam['t_ns'] = int(_rec['t_mono_ns'] or 0)    # capture stamp of the DISPLAYED frame
                 _t = time.perf_counter()
-                w, h = cam['gl'].upload(disp, f.header.color_id, wb)
+                w, h = cam['gl'].upload(disp, f.header.color_id, wb,
+                                        clip_mark=view_settings.setdefault(
+                                            stream, _default_settings(stream))['clip_rainbow'])
                 _prof('upload', (time.perf_counter() - _t) * 1e3)
                 # Histogram inset (off by default): counts of the RAW LINEAR pixel values -- no gamma,
                 # no stretch, so every ADC level lands in its own place (an 8-bit scene fills its bins
@@ -729,7 +756,10 @@ def main(argv=None):
                     samp = (disp[::8, ::8].astype(np.float32) / white).clip(0.0, 1.0)
                     counts, _ = np.histogram(samp, bins=64, range=(0.0, 1.0))
                     m = counts.max()
-                    hist = np.sqrt(counts / m) if m > 0 else None
+                    # LOG y scale: a small target like the ISS puts only a handful of pixels in
+                    # the top bin -- on a linear (or sqrt) scale that clipping spike is invisible
+                    # against the sky's mountain; log1p keeps every occupied bin visible.
+                    hist = (np.log1p(counts) / math.log1p(m)) if m > 0 else None
         except (IndexError, ValueError, framestream.Lapped):
             return False                             # reconfigure race / lapped -- retry next tick
         if (w, h) != (cam['w'], cam['h']):               # frame size changed (source/optics switch)
@@ -1235,14 +1265,11 @@ def main(argv=None):
         # above it, and the collimation trail (last ~10 EMA CoM offsets, exaggerated) on the star.
         if role.endswith('_focus') and role == focus_ui['role'] + '_focus':
             sc = focus_ui['series']
-            # CLIP warning: fraction of the last ~100 frames with clipped star pixels. Loud on
-            # purpose -- a red border + percentage; per-pixel flashing alone proved too subtle
-            # (the 2026-07-11 sweep clipped 60% of its frames unnoticed).
+            # CLIP readout: fraction of the last ~100 frames with clipped star pixels. The
+            # per-pixel indication is the shader's clip rainbow (per view); this is the number.
             recent = sc['clip'][-100:]
             clip_frac = (sum(recent) / len(recent)) if recent else 0.0
             if clip_frac > 0:
-                dl.add_rect(A(S(2), S(2)), A(SW - S(2), SH - S(2)), C((235, 60, 45, 230)),
-                            0.0, S(3))                     # (rounding, thickness) -- no flags arg here
                 _text(dl, A(S(10), S(8)), f"CLIP {clip_frac:.0%}", S(16), (235, 60, 45, 255))
             GW, GH, mgn = min(S(220), max(S(90), SW - S(20))), S(80), S(10)
             gx1, gy1 = SW - mgn, SH - mgn
@@ -1259,7 +1286,7 @@ def main(argv=None):
                 # The label carries the absolute numbers.
                 lo, hi = min(series), max(series)
                 span = (hi - lo) or 1.0
-                label = f"Strehl {strehls[-1]:.2f}" if use_str else f"focus peak {sc['peak'][-1]:.3f}"
+                label = f"Strehl {strehls[-1]:.3g}" if use_str else f"focus peak {sc['peak'][-1]:.3g}"
                 dl.add_rect_filled(A(gx0 - S(4), gy0 - S(4)), A(gx1 + S(4), gy1 + S(4)), C((0, 0, 0, 150)))
                 n = len(series)
                 pts = [A(gx0 + GW * i / (n - 1), gy1 - GH * max(0.0, min(1.0, (v - lo) / span)))
@@ -1638,7 +1665,7 @@ def main(argv=None):
         for role, s in (data.get('display') or {}).items():
             vs = view_settings.setdefault(role, _default_settings(role))
             for k in ('zoom', 'reticles', 'histogram', 'wait_for_detector', 'show_stars',
-                      'show_target_names', 'show_star_names'):
+                      'show_target_names', 'show_star_names', 'clip_rainbow'):
                 if k in s:
                     vs[k] = s[k]
         opt = data.get('optics') or {}
@@ -2235,6 +2262,12 @@ def main(argv=None):
         if ch:
             sset['reticles'] = v
         _tip("Show the centre crosshairs + the main-cam FoV box on this camera's pane.")
+        ch, v = imgui.checkbox(f"Clip rainbow##clip_{role}", sset['clip_rainbow'])
+        if ch:
+            sset['clip_rainbow'] = v
+        _tip("Paint near-full-scale pixels (>= 250/255) a random color per pixel per frame -- "
+             "clipping reads as a shimmering rainbow, per view. Default: on for the main cam "
+             "and focus views (clipping costs data there), off for the guide.")
         ch, v = imgui.checkbox(f"Histogram##hist_{role}", sset['histogram'])
         if ch:
             sset['histogram'] = v
