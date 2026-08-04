@@ -1382,7 +1382,8 @@ def main(argv=None):
         if target != want:
             print(f"[backend] focuser move clamped to the device limit: "
                   f"abs {want} -> {target} (max {focuser.max_step})", flush=True)
-        focuser.move_to(target)
+        if not focuser.move_to(target):
+            print("[backend] focuser busy (still moving); jog ignored", flush=True)
 
     def end_sweep_watch():
         sw = sweep_watch
@@ -1435,10 +1436,11 @@ def main(argv=None):
             want = stt.get('want_pos')
             if want is not None and want != sw['served']:
                 if want != sw['want']:                      # a new request: command the move once
-                    sw['want'] = want
-                    sw['target'] = int(round(focuser_pos0 + want))
-                    focuser.move_to(sw['target'])
-                    print(f"[backend] focuser -> rel {want:g} (abs {sw['target']})", flush=True)
+                    target = int(round(focuser_pos0 + want))
+                    if focuser.move_to(target):             # busy (still moving) -> retry next tick
+                        sw['want'] = want
+                        sw['target'] = target
+                        print(f"[backend] focuser -> rel {want:g} (abs {target})", flush=True)
                 elif (not focuser_status.get('moving')      # arrived (count AND motor agree)
                         and focuser_status.get('pos') == sw['target']):
                     if sw['writer'] is None:

@@ -81,8 +81,17 @@ class Focuser:
 
     def move_to(self, abs_pos):
         """Command an absolute move. The caller keeps targets inside [0, max_step]; the firmware
-        clamps regardless. Returns immediately -- poll is_moving() for completion."""
-        self._f.move_focuser(int(abs_pos))
+        clamps regardless. Returns immediately -- poll is_moving() for completion. Returns False
+        (without raising) when the device refuses because it's ALREADY moving (SDK error 5) --
+        a jog landing mid-move is normal use, and the caller decides whether to drop or retry.
+        Any other error still raises."""
+        try:
+            self._f.move_focuser(int(abs_pos))
+            return True
+        except self._z.ZWO_IOError as e:
+            if e.error_code == 5:
+                return False
+            raise
 
     def stop(self):
         self._f.stop_focuser()
