@@ -33,12 +33,6 @@ def _strehl_of(pos):                                     # 1/strehl exactly quad
     return S0 / (1.0 + (SLOPE * (pos - P0)) ** 2)
 
 
-def test_sweep_order():
-    assert focus_sweep.sweep_order(5) == [0, 4, 1, 3, 2]     # extremes first, alternating inward
-    assert focus_sweep.sweep_order(4) == [0, 3, 1, 2]
-    assert sorted(focus_sweep.sweep_order(9)) == list(range(9))
-
-
 def test_fit_vcurve():
     pts = [(p, _strehl_of(p)) for p in np.linspace(0, 8, 9)]
     p0, s0, _ = focus_sweep.fit_vcurve(pts)
@@ -102,7 +96,7 @@ def test_focus_sweep():
     assert abs(state['strehl0'] - S0) < 0.05, state
     assert len(state['points']) == 5 and state['bracketed'], state
     assert state['clip_frac'] == 0.0
-    assert visited == [0.0, 8.0, 2.0, 6.0, 4.0], visited     # alternating sides, extremes first
+    assert visited == [0.0, 2.0, 4.0, 6.0, 8.0], visited     # monotonic, start to end
     focus.close()
     focuser.close()
     ctl.close()
@@ -110,7 +104,6 @@ def test_focus_sweep():
 
 
 if __name__ == '__main__':
-    test_sweep_order()
     test_fit_vcurve()
     test_focus_sweep()
     print("test_focus_sweep: OK")

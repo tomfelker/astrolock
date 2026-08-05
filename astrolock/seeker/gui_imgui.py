@@ -578,7 +578,7 @@ def main(argv=None):
                   'sweep_step': f"{sweep_ui['step']:g}",
                   'sweep_range': f"{sweep_ui['range']:g}", 'sweep_buckets': str(sweep_ui['buckets']),
                   'sweep_seconds': f"{sweep_ui['seconds']:g}",
-                  'focuser_step': '100', 'focuser_goto': '0',
+                  'focuser_step': '100', 'focuser_goto': '0', 'focuser_approach': '500',
                   'settings_name': ''},
           'src': {},                                      # role -> unified source dropdown value
           'pb_loop': {r: True for r in roles}, 'pb_dlg': None,     # (role, pfd.open_file) in flight
@@ -2779,16 +2779,40 @@ def main(argv=None):
                 imgui.same_line()
                 if imgui.button("Stop##focuser_stop"):
                     _send({'type': 'focuser_stop'})
+                imgui.text("Approach:")
+                _tip("Backlash control: every position is FINALLY reached moving in this "
+                     "direction. A move that would land from the other side first overshoots "
+                     "past the target by this many steps, then comes back. Sweeps run entirely "
+                     "in this direction.")
+                imgui.same_line()
+                _adirs = ['Increasing', 'Decreasing']
+                _ai = 0 if foc.get('approach_increasing', True) else 1
+                imgui.set_next_item_width(S(110))
+                ch, nidx = imgui.combo("##focuser_approach_dir", _ai, _adirs)
+                if ch and 0 <= nidx < len(_adirs):
+                    _send({'type': 'set_focuser_approach', 'increasing': nidx == 0})
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "from")
+                imgui.same_line()
+
+                def _commit_approach(txt):
+                    d = max(0, int(_flt(txt, foc.get('approach_distance', 500))))
+                    _send({'type': 'set_focuser_approach', 'distance': d})
+                    return str(d)
+                _input_commit('focuser_approach', S(56), _commit_approach)
+                imgui.same_line()
+                imgui.text_colored(C4(140, 145, 160), "steps away")
             imgui.separator()
             # --- Focus sweep: one stacked image + one Strehl per bucket, fit the V-curve.
             imgui.text("Sweep:")
             _tip("Focus sweep: each position integrates one pure-average stacked star and reads "
                  "its Strehl; 1/Strehl is least-squares fit as a parabola of position and the "
-                 "vertex is best focus. Positions are visited alternating sides (extremes first) "
-                 "so slow seeing drift cancels. With an EAF connected it runs unattended and "
-                 "moves to the apex when done; otherwise press OK as you set each prompted "
-                 "position by hand. Keep the star at 50-80% full well -- clipping dulls the "
-                 "metric (red buckets / CLIP border).")
+                 "vertex is best focus. Positions run monotonically in the focuser's approach "
+                 "direction (backlash-safe; condition drift then slants the fit instead of "
+                 "faking a centered peak). With an EAF connected it runs unattended and moves "
+                 "to the apex when done; otherwise press OK as you set each prompted position "
+                 "by hand. Keep the star at 50-80% full well -- clipping dulls the metric "
+                 "(red buckets / clip rainbow).")
             # Plain text boxes: nothing reads them until Start Sweep, which parses them then.
             imgui.same_line()
             if foc.get('connected'):

@@ -14,10 +14,15 @@ stream's extras until a post-reset record (ctl_seq advanced past the pre-bucket 
 stack_n >= --frames-per-step. That record's stack_strehl is the bucket's value -- quality of
 the average, never averages of per-frame quality (individual frames are seeing-speckle draws).
 
-Buckets visit positions ALTERNATING SIDES, extremes first (-R, +R, next in, ...), so slow
-seeing/transparency drift cancels out of the fit by symmetry instead of biasing the vertex --
-the same instinct as a human going way off one side, then the other, then splitting the
-difference.
+Buckets visit positions MONOTONICALLY, start to end -- the backend orients (start, end) along
+the focuser's approach direction, so with an EAF the gear train stays loaded the same way for
+every bucket (backlash) and its two-leg goto covers the first point. Monotonic also has the
+right failure mode under drifting conditions: a temporal gradient (sky clearing, seeing
+settling) lands in the fit's LINEAR term -- a slant, vertex pushed off-range, caught by the
+bracketed check. An alternating extremes-first order was tried and REVERTED (2026-08-03):
+it makes position correlate with |time from sweep center|, so the same gradient projects
+onto the QUADRATIC term -- a fake, confidently-centered vertex (found via a playback test
+whose 'focus' improved monotonically with time).
 
 Fit: defocus adds width in quadrature, so 1/strehl = a p^2 + b p + c; best focus p0 = -b/2a
 with expected strehl 1/(c - b^2/4a). Clipped frames degrade the stack Strehl gracefully (the
@@ -42,20 +47,6 @@ import numpy as np
 
 from astrolock.seeker import framestream
 from astrolock.seeker import session as session_mod
-
-
-def sweep_order(steps):
-    """Bucket visit order: extremes first, alternating sides, walking inward. Adjacent-in-time
-    buckets sit on opposite sides at similar leverage, so a linear drift in seeing or
-    transparency largely cancels out of the fit."""
-    lo, hi = 0, steps - 1
-    order = []
-    while lo <= hi:
-        order.append(lo)
-        if hi != lo:
-            order.append(hi)
-        lo, hi = lo + 1, hi - 1
-    return order
 
 
 def fit_vcurve(points):
@@ -93,8 +84,7 @@ def main(argv=None):
 
     steps = max(3, args.steps)
     frames = max(1, args.frames_per_step)
-    grid = list(np.linspace(args.start, args.end, steps))
-    positions = [grid[k] for k in sweep_order(steps)]
+    positions = list(np.linspace(args.start, args.end, steps))
     spacing = abs(args.end - args.start) / max(1, steps - 1)
     tol = args.pos_tol if args.pos_tol > 0 else max(spacing / 4.0, 1e-9)
 
@@ -235,7 +225,7 @@ def main(argv=None):
         if fit is not None:
             p0, strehl0, _ = fit
             result.update(p0=round(p0, 4), strehl0=round(strehl0, 4),
-                          bracketed=bool(min(grid) <= p0 <= max(grid)))
+                          bracketed=bool(min(positions) <= p0 <= max(positions)))
             warn = (f"; CLIP {result['clip_frac']:.0%} of frames -- reduce exposure"
                     if result['clip_frac'] > 0.2 else "")
             print(f"[sweep:{args.role}] best focus p0={p0:.4g} (strehl {strehl0:.3f}, "

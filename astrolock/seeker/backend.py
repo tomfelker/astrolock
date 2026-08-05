@@ -468,6 +468,13 @@ def main(argv=None):
     focuser_index = 0                  # GUI dropdown selection
     focuser_pos0 = 0                   # absolute position at connect: the session's relative zero
     focuser_status = {}                # published every tick while connected: pos/moving/temp
+    # Backlash control: every position is FINALLY approached from one fixed direction. A move
+    # that would land from the other side first overshoots past the target by approach_distance,
+    # then comes back -- so the gear train always settles loaded the same way. Sweeps run
+    # entirely in the approach direction.
+    focuser_approach_increasing = True
+    focuser_approach_distance = 500
+    focuser_goto_st = {'cur': None, 'final': None, 'commanded': False}   # two-leg move machine
     # Sweep servicing (service_sweep): a follower on {role}_sweep drives three duties while a
     # sweep runs -- resetting the focus stack at each bucket ('frames'), playing EAF actuator
     # for position requests, and the go-to-apex move on a successful fit.
@@ -1017,10 +1024,16 @@ def main(argv=None):
                   f"{exposure_s * 1e3:.0f} ms/frame", flush=True)
         seconds = float(cmd.get('seconds', 5.0))
         frames = max(1, int(round(seconds / exposure_s)))
+        start, end = float(cmd['start']), float(cmd['end'])
+        if focuser is not None:
+            # Sweeps run entirely in the approach direction (backlash: the gear train stays
+            # loaded the same way); the actuator's two-leg goto handles the first point.
+            lo_, hi_ = min(start, end), max(start, end)
+            start, end = (lo_, hi_) if focuser_approach_increasing else (hi_, lo_)
         sweep_proc = subprocess.Popen(
             [sys.executable, '-m', 'astrolock.seeker.focus_sweep',
              '--session', session_dir, '--role', role,
-             '--start', str(float(cmd['start'])), '--end', str(float(cmd['end'])),
+             '--start', str(start), '--end', str(end),
              '--steps', str(int(cmd.get('steps', 9))),
              '--frames-per-step', str(frames),
              '--settle-s', str(float(cmd.get('settle', 1.0)))],
@@ -1365,6 +1378,7 @@ def main(argv=None):
 
     def disconnect_focuser():
         nonlocal focuser, focuser_status
+        focuser_goto_st.update(cur=None, final=None, commanded=False)
         if focuser is not None:
             try:
                 focuser.close()
@@ -1374,16 +1388,36 @@ def main(argv=None):
             focuser_status = {}
             print("[backend] focuser disconnected", flush=True)
 
-    def focuser_move_rel(rel):
-        """Manual GUI move to a relative position; clamped to the device's window (the firmware
-        would clamp anyway -- clamping here keeps our printout honest about where it's going)."""
-        want = focuser_pos0 + int(round(float(rel)))
+    def focuser_goto(abs_want):
+        """Route ALL focuser motion through the backlash-aware two-leg machine: if the target
+        would be reached against the approach direction, first overshoot past it by
+        approach_distance, then come back -- the final leg is always in the approach direction.
+        A new goto supersedes any pending one (fast jogs re-target; the command is retried each
+        tick until the motor accepts it). Returns the clamped final target."""
+        want = int(round(float(abs_want)))
         target = max(0, min(focuser.max_step, want))
         if target != want:
             print(f"[backend] focuser move clamped to the device limit: "
                   f"abs {want} -> {target} (max {focuser.max_step})", flush=True)
-        if not focuser.move_to(target):
-            print("[backend] focuser busy (still moving); jog ignored", flush=True)
+        pos = focuser_status.get('pos')
+        if pos is None:
+            pos = focuser.position()
+        inc = focuser_approach_increasing
+        wrong_side = (pos > target) if inc else (pos < target)
+        if wrong_side and focuser_approach_distance > 0:
+            over = target + (-focuser_approach_distance if inc else focuser_approach_distance)
+            over_c = max(0, min(focuser.max_step, over))
+            if over_c != over:
+                print(f"[backend] focuser approach leg clamped by the device limit "
+                      f"(abs {over} -> {over_c}): backlash only partially taken out", flush=True)
+            focuser_goto_st.update(cur=over_c, final=target, commanded=False)
+        else:
+            focuser_goto_st.update(cur=target, final=target, commanded=False)
+        return target
+
+    def focuser_move_rel(rel):
+        """Manual GUI move to a relative position (jogs, the go-to field, the sweep apex)."""
+        focuser_goto(focuser_pos0 + int(round(float(rel))))
 
     def end_sweep_watch():
         sw = sweep_watch
@@ -1397,13 +1431,29 @@ def main(argv=None):
                   reset_step=None, apex_done=False, ema_restored=True)
 
     def service_focuser():
-        """Per-tick focuser status while connected: the published pos/moving/temp snapshot."""
+        """Per-tick focuser duties while connected: the published pos/moving/temp snapshot, and
+        advancing the two-leg goto machine (command the current leg until the motor accepts it;
+        on arrival, either start the final leg or finish)."""
         pos = focuser.position()
         moving, moving_manual = focuser.is_moving()
         if focuser_status.get('temp_t', 0.0) + 2.0 <= now:     # temperature is slow-moving; 0.5 Hz
             focuser_status['temp_c'] = focuser.temperature_c()
             focuser_status['temp_t'] = now
         focuser_status.update(pos=pos, moving=moving, moving_manual=moving_manual)
+        g = focuser_goto_st
+        if g['final'] is not None:
+            if not g['commanded']:
+                if focuser.move_to(g['cur']):              # busy (still moving) -> retry next tick
+                    g['commanded'] = True
+                    if g['cur'] != g['final']:
+                        print(f"[backend] focuser approach: via abs {g['cur']}, "
+                              f"then {'up' if focuser_approach_increasing else 'down'} "
+                              f"to {g['final']}", flush=True)
+            elif not moving and pos == g['cur']:
+                if g['cur'] == g['final']:
+                    g.update(cur=None, final=None, commanded=False)
+                else:
+                    g.update(cur=g['final'], commanded=False)   # arrived at the overshoot: come back
 
     def service_sweep():
         """Per-tick sweep duties while one runs (either actuator): reset the focus stack into
@@ -1435,13 +1485,12 @@ def main(argv=None):
         if focuser is not None and stt.get('awaiting') == 'position':
             want = stt.get('want_pos')
             if want is not None and want != sw['served']:
-                if want != sw['want']:                      # a new request: command the move once
-                    target = int(round(focuser_pos0 + want))
-                    if focuser.move_to(target):             # busy (still moving) -> retry next tick
-                        sw['want'] = want
-                        sw['target'] = target
-                        print(f"[backend] focuser -> rel {want:g} (abs {target})", flush=True)
-                elif (not focuser_status.get('moving')      # arrived (count AND motor agree)
+                if want != sw['want']:                      # a new request: start the (2-leg) move
+                    sw['want'] = want
+                    sw['target'] = focuser_goto(focuser_pos0 + want)
+                    print(f"[backend] focuser -> rel {want:g} (abs {sw['target']})", flush=True)
+                elif (focuser_goto_st['final'] is None      # both legs done...
+                        and not focuser_status.get('moving')   # ...and motor + count agree
                         and focuser_status.get('pos') == sw['target']):
                     if sw['writer'] is None:
                         sw['writer'] = framestream.FrameStream(session_dir,
@@ -1460,6 +1509,7 @@ def main(argv=None):
         nonlocal track_center, mount_desired_url, follow_enabled, track_primary, handoff_fine, handoff_conf
         nonlocal track_pref, focus_proc, focus_role, track_delay_s, track_started_t
         nonlocal utc_offset_ns, gps_status, align_matrix, bore_rotation, focuser_index
+        nonlocal focuser_approach_increasing, focuser_approach_distance
         t = cmd.get('type')
         if t == 'shutdown':                           # GUI is closing -> stop the whole session
             gui_quit = True
@@ -1881,6 +1931,14 @@ def main(argv=None):
             if focuser is not None:
                 focuser.stop()
                 print("[backend] focuser stopped", flush=True)
+        elif t == 'set_focuser_approach':          # backlash control: final-leg direction + distance
+            if 'increasing' in cmd:
+                focuser_approach_increasing = bool(cmd['increasing'])
+            if 'distance' in cmd:
+                focuser_approach_distance = max(0, int(cmd['distance']))
+            print(f"[backend] focuser approach: "
+                  f"{'increasing' if focuser_approach_increasing else 'decreasing'} "
+                  f"from {focuser_approach_distance} steps", flush=True)
         elif t == 'rescan_focusers':
             focusers_available[:] = eaf_mod.list_focuser_names()
             print(f"[backend] focusers: {focusers_available}", flush=True)
@@ -2209,9 +2267,13 @@ def main(argv=None):
                              'max_step': focuser.max_step,
                              'moving': bool(focuser_status.get('moving')),
                              'moving_manual': bool(focuser_status.get('moving_manual')),
-                             'temp_c': focuser_status.get('temp_c')}
+                             'temp_c': focuser_status.get('temp_c'),
+                             'approach_increasing': focuser_approach_increasing,
+                             'approach_distance': focuser_approach_distance}
                             if focuser is not None else
-                            {'connected': False, 'index': focuser_index}),
+                            {'connected': False, 'index': focuser_index,
+                             'approach_increasing': focuser_approach_increasing,
+                             'approach_distance': focuser_approach_distance}),
                 # ROI (cx, cy, size px) around the predicted target, for detect to clamp its work to.
                 'track_roi': track_rois or None,        # {role: [cx, cy, size]} -- active source + guide fallback
                 'sources': dict(sources),
