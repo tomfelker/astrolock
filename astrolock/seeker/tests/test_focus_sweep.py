@@ -33,6 +33,13 @@ def _strehl_of(pos):                                     # 1/strehl exactly quad
     return S0 / (1.0 + (SLOPE * (pos - P0)) ** 2)
 
 
+A1, A2 = 0.02, -0.01                                     # astig slope components (per step)
+
+
+def _ellipse_of(pos):                                    # crosses zero exactly at P0
+    return (A1 * (pos - P0), A2 * (pos - P0))
+
+
 def test_fit_vcurve():
     pts = [(p, _strehl_of(p)) for p in np.linspace(0, 8, 9)]
     p0, s0, _ = focus_sweep.fit_vcurve(pts)
@@ -82,9 +89,10 @@ def test_focus_sweep():
             ctl.append({'reset': 1, 'average': 1, 'seq': seq})
         if pos is not None:                              # fake focus process: known Strehl curve
             n += 1
+            e1, e2 = _ellipse_of(pos)
             focus.write(frame, t_mono_ns=session_mod.mono_ns(),
                         extras=(0.5, _strehl_of(pos), 20.0, float(n), float(seq), 0.0,
-                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+                                e1, e2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         time.sleep(0.005)
     th.join(10)
     assert not th.is_alive(), "sweep never finished"
@@ -97,6 +105,11 @@ def test_focus_sweep():
     assert len(state['points']) == 5 and state['bracketed'], state
     assert state['clip_frac'] == 0.0
     assert visited == [0.0, 2.0, 4.0, 6.0, 8.0], visited     # monotonic, start to end
+    # Astigmatism line fit: slope magnitude, zero crossing at P0, doubled-angle axis.
+    import math
+    assert abs(state['astig_slope'] - math.hypot(A1, A2)) < 1e-3, state
+    assert abs(state['astig_zero'] - P0) < 0.05, state
+    assert abs(state['astig_axis_deg'] - math.degrees(math.atan2(A2, A1) / 2)) < 1.0, state
     focus.close()
     focuser.close()
     ctl.close()

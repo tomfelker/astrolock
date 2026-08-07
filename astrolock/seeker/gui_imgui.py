@@ -551,7 +551,8 @@ def main(argv=None):
                 'shape_instant': None,                    # same for the instantaneous crop
                 'series': {k: [] for k in ('t', 'peak', 'hfd', 'strehl', 'clip')}}
     sweep_ui = {'start': 0.0, 'end': 9.0, 'step': 1.0,                # human-actuator units
-                'range': 1000.0, 'buckets': 9,                        # EAF-actuator units: +- steps + positions
+                'spacing': 250.0, 'buckets': 9,                       # EAF: absolute steps/bucket count
+                'center_current': True,                               # center on the focuser's position
                 'seconds': 5.0,                                       # integrated exposure per bucket
                 'role': None, 'fo': None, 'state': None,              # prompt/result stream tail
                 'confirmed': None,                                    # last position we OK'd
@@ -576,8 +577,8 @@ def main(argv=None):
                   'focus_shape_gain': f"{focus_ui['shape_gain']:g}",
                   'sweep_start': f"{sweep_ui['start']:g}", 'sweep_end': f"{sweep_ui['end']:g}",
                   'sweep_step': f"{sweep_ui['step']:g}",
-                  'sweep_range': f"{sweep_ui['range']:g}", 'sweep_buckets': str(sweep_ui['buckets']),
-                  'sweep_seconds': f"{sweep_ui['seconds']:g}",
+                  'sweep_spacing': f"{sweep_ui['spacing']:g}", 'sweep_buckets': str(sweep_ui['buckets']),
+                  'sweep_center': '0', 'sweep_seconds': f"{sweep_ui['seconds']:g}",
                   'focuser_step': '100', 'focuser_goto': '0', 'focuser_approach': '500',
                   'settings_name': ''},
           'src': {},                                      # role -> unified source dropdown value
@@ -879,7 +880,7 @@ def main(argv=None):
         def PY(h_):
             return gy1 - S(4) - (H - S(8)) * min(h_, hh) / hh
         dl.add_rect_filled(A(gx0 - S(4), gy0 - S(4)), A(gx0 + W + S(4), gy1 + S(4)), C((0, 0, 0, 150)))
-        for p_, h_, cf_ in pts:
+        for p_, h_, cf_, *_e in pts:
             dl.add_circle_filled(A(PX(p_), PY(h_)), S(2.5),
                                  C((235, 100, 100, 220) if cf_ > 0.05 else (120, 220, 255, 200)))
         p0 = stt.get('p0')
@@ -1904,18 +1905,21 @@ def main(argv=None):
         sweep_ui['seconds'] = max(0.1, _flt(ui['txt']['sweep_seconds'], sweep_ui['seconds']))
         ui['txt']['sweep_seconds'] = f"{sweep_ui['seconds']:g}"
         if _focuser_connected():
-            # EAF actuator: the range is +- steps around the CURRENT position (rel to pos0 at
-            # connect), sampled at 'buckets' positions. The backend refuses it up front if it
-            # would poke outside the device's window.
-            sweep_ui['range'] = abs(_flt(ui['txt']['sweep_range'], sweep_ui['range']))
+            # EAF actuator: absolute steps -- 'buckets' positions, 'spacing' apart, symmetric
+            # about the chosen center (the focuser's current position when 'current' is
+            # checked). The backend refuses it if it pokes outside the device's window.
+            sweep_ui['spacing'] = max(1, abs(_flt(ui['txt']['sweep_spacing'],
+                                                  sweep_ui['spacing'])))
             sweep_ui['buckets'] = max(3, min(201, int(_flt(ui['txt']['sweep_buckets'],
                                                            sweep_ui['buckets']))))
-            ui['txt']['sweep_range'] = f"{sweep_ui['range']:g}"
+            ui['txt']['sweep_spacing'] = f"{sweep_ui['spacing']:g}"
             ui['txt']['sweep_buckets'] = str(sweep_ui['buckets'])
             foc = (ctrl.get('state') or {}).get('focuser') or {}
-            rel_now = (foc.get('pos') or 0) - (foc.get('pos0') or 0)
+            center = (float(foc.get('pos') or 0) if sweep_ui['center_current']
+                      else _flt(ui['txt']['sweep_center'], float(foc.get('pos') or 0)))
+            half = sweep_ui['spacing'] * (sweep_ui['buckets'] - 1) / 2.0
             _send({'type': 'sweep', 'on': True, 'role': role,
-                   'start': rel_now - sweep_ui['range'], 'end': rel_now + sweep_ui['range'],
+                   'start': center - half, 'end': center + half,
                    'steps': sweep_ui['buckets'], 'seconds': sweep_ui['seconds']})
             return
         sweep_ui['start'] = _flt(ui['txt']['sweep_start'], sweep_ui['start'])   # parsed only here
@@ -2757,8 +2761,8 @@ def main(argv=None):
             if imgui.button("Rescan##focuser"):
                 _send({'type': 'rescan_focusers'})
             if foc.get('connected') and foc.get('pos') is not None:
-                pos, pos0 = foc['pos'], foc.get('pos0') or 0
-                line = f"rel {pos - pos0:+d}  (abs {pos} / {foc.get('max_step')})"
+                pos = foc['pos']
+                line = f"{pos} / {foc.get('max_step')}"
                 if foc.get('temp_c') is not None:
                     line += f"  {foc['temp_c']:.1f} °C"
                 imgui.text(line)
@@ -2776,19 +2780,19 @@ def main(argv=None):
                 stp = abs(int(_flt(ui['txt']['focuser_step'], 100)))
                 imgui.same_line()
                 if imgui.button("-##focuser_minus", (S(28), 0)):
-                    _send({'type': 'focuser_move', 'rel': pos - pos0 - stp})
+                    _send({'type': 'focuser_move', 'abs': pos - stp})
                 imgui.same_line()
                 if imgui.button("+##focuser_plus", (S(28), 0)):
-                    _send({'type': 'focuser_move', 'rel': pos - pos0 + stp})
+                    _send({'type': 'focuser_move', 'abs': pos + stp})
                 imgui.same_line()
-                imgui.text("Go to rel:")
+                imgui.text("Go to:")
                 imgui.same_line()
                 imgui.set_next_item_width(S(56))
                 _ch, ui['txt']['focuser_goto'] = imgui.input_text('##focuser_goto',
                                                                   ui['txt']['focuser_goto'])
                 imgui.same_line()
                 if imgui.button("Go##focuser_go"):
-                    _send({'type': 'focuser_move', 'rel': int(_flt(ui['txt']['focuser_goto'], 0))})
+                    _send({'type': 'focuser_move', 'abs': int(_flt(ui['txt']['focuser_goto'], pos))})
                 imgui.same_line()
                 if imgui.button("Stop##focuser_stop"):
                     _send({'type': 'focuser_stop'})
@@ -2829,19 +2833,32 @@ def main(argv=None):
             # Plain text boxes: nothing reads them until Start Sweep, which parses them then.
             imgui.same_line()
             if foc.get('connected'):
-                imgui.text_colored(C4(140, 145, 160), "±")
-                imgui.same_line()
                 imgui.set_next_item_width(S(56))
-                _ch, ui['txt']['sweep_range'] = imgui.input_text('##sweep_range',
-                                                                 ui['txt']['sweep_range'])
+                _ch, ui['txt']['sweep_spacing'] = imgui.input_text('##sweep_spacing',
+                                                                   ui['txt']['sweep_spacing'])
                 imgui.same_line()
-                imgui.text_colored(C4(140, 145, 160), "steps in")
+                imgui.text_colored(C4(140, 145, 160), "steps x")
                 imgui.same_line()
-                imgui.set_next_item_width(S(56))
+                imgui.set_next_item_width(S(40))
                 _ch, ui['txt']['sweep_buckets'] = imgui.input_text('##sweep_buckets',
                                                                    ui['txt']['sweep_buckets'])
                 imgui.same_line()
-                imgui.text_colored(C4(140, 145, 160), "buckets")
+                imgui.text_colored(C4(140, 145, 160), "buckets @")
+                imgui.same_line()
+                if sweep_ui['center_current']:            # WYSIWYG: the greyed box shows what
+                    ui['txt']['sweep_center'] = str(foc.get('pos') or 0)   # Start will use
+                imgui.begin_disabled(sweep_ui['center_current'])
+                imgui.set_next_item_width(S(64))
+                _ch, ui['txt']['sweep_center'] = imgui.input_text('##sweep_center',
+                                                                  ui['txt']['sweep_center'])
+                imgui.end_disabled()
+                imgui.same_line()
+                ch, v = imgui.checkbox("current##sweep_center_cur", sweep_ui['center_current'])
+                if ch:
+                    sweep_ui['center_current'] = v
+                _tip("Center the sweep on the focuser's CURRENT position (unchecked: type an "
+                     "absolute center). Range = spacing x (buckets - 1), symmetric about the "
+                     "center; the backend refuses it if it pokes outside the device's window.")
             else:
                 imgui.set_next_item_width(S(56))
                 _ch, ui['txt']['sweep_start'] = imgui.input_text('##sweep_start', ui['txt']['sweep_start'])
@@ -2895,6 +2912,16 @@ def main(argv=None):
                     _grey("Sweep aborted.")
                 elif 'p0' in stt:
                     imgui.text(f"Best focus: {stt['p0']:g}  (Strehl {stt.get('strehl0', 0):.3f})")
+                    if stt.get('astig_slope') is not None:
+                        imgui.text(f"Astig: {stt['astig_slope']:.4g}/step, "
+                                   f"zero @ {stt['astig_zero']:g}, "
+                                   f"axis {stt['astig_axis_deg']:.0f}°")
+                        _tip("Through-focus astigmatism line fit: the ellipse components flip "
+                             "sign across focus (the focal lines swap axes). Slope = the "
+                             "misalignment metric corrector-plate rotation would minimize; the "
+                             "zero crossing should sit near best focus (it goes vague as the "
+                             "slope reaches 0 -- that's success); axis = the physical "
+                             "orientation on the sensor.")
                     if not stt.get('bracketed', True):
                         imgui.text_colored(C4(235, 180, 90),
                                            "best focus is OUTSIDE the swept range -- re-sweep around it")

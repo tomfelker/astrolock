@@ -461,12 +461,12 @@ def main(argv=None):
 
     # ZWO EAF focuser (astrolock.seeker.eaf): backend-owned like the mount. The device's step
     # count and max-step limit are driver-configured and flash-persisted -- we only read/move.
-    # Sweeps and the GUI work in steps RELATIVE to the position at connect (focuser_pos0);
-    # rel -> abs is pos0 + rel, refused up front if it would poke outside [0, max_step].
+    # Positions are ABSOLUTE device steps everywhere (the EAF persists its count + max-step in
+    # flash; there's nothing relative worth inventing). Moves outside [0, max_step] are refused
+    # or clamped loudly.
     focusers_available = eaf_mod.list_focuser_names()
     focuser = None                     # open eaf_mod.Focuser, or None
     focuser_index = 0                  # GUI dropdown selection
-    focuser_pos0 = 0                   # absolute position at connect: the session's relative zero
     focuser_status = {}                # published every tick while connected: pos/moving/temp
     # Backlash control: every position is FINALLY approached from one fixed direction. A move
     # that would land from the other side first overshoots past the target by approach_distance,
@@ -1045,14 +1045,14 @@ def main(argv=None):
         stop_sweep()
         sweep_error = None
         if focuser is not None:
-            # Positions are relative to focuser_pos0; refuse up front if any part of the range
-            # falls outside the device's driver-configured window -- silently clamping would
+            # Positions are absolute steps; refuse up front if any part of the range falls
+            # outside the device's driver-configured window -- silently clamping would
             # corrupt the V-curve's spacing.
-            lo = focuser_pos0 + min(float(cmd['start']), float(cmd['end']))
-            hi = focuser_pos0 + max(float(cmd['start']), float(cmd['end']))
+            lo = min(float(cmd['start']), float(cmd['end']))
+            hi = max(float(cmd['start']), float(cmd['end']))
             if lo < 0 or hi > focuser.max_step:
-                sweep_error = (f"sweep range abs {int(lo)}..{int(hi)} exceeds the focuser's "
-                               f"0..{focuser.max_step} window (at {focuser_pos0}) -- "
+                sweep_error = (f"sweep range {int(lo)}..{int(hi)} exceeds the focuser's "
+                               f"0..{focuser.max_step} window -- "
                                "reduce the range or re-position in ASIStudio")
                 print(f"[backend] sweep refused: {sweep_error}", flush=True)
                 return
@@ -1411,7 +1411,7 @@ def main(argv=None):
     def connect_focuser():
         """Open the selected EAF and take the current step count as the session's relative zero.
         On failure, stay disconnected (loudly)."""
-        nonlocal focuser, focuser_pos0, focuser_status
+        nonlocal focuser, focuser_status
         disconnect_focuser()
         try:
             new = eaf_mod.Focuser(focuser_index)
@@ -1419,10 +1419,9 @@ def main(argv=None):
             print(f"[backend] focuser connect failed (#{focuser_index}): {e}", flush=True)
             return
         focuser = new
-        focuser_pos0 = focuser.position()
         focuser_status = {}
-        print(f"[backend] focuser connected: {focuser.name} at {focuser_pos0} "
-              f"(max {focuser.max_step}); this position is rel 0", flush=True)
+        print(f"[backend] focuser connected: {focuser.name} at {focuser.position()} "
+              f"(max {focuser.max_step})", flush=True)
 
     def disconnect_focuser():
         nonlocal focuser, focuser_status
@@ -1463,9 +1462,6 @@ def main(argv=None):
             focuser_goto_st.update(cur=target, final=target, commanded=False)
         return target
 
-    def focuser_move_rel(rel):
-        """Manual GUI move to a relative position (jogs, the go-to field, the sweep apex)."""
-        focuser_goto(focuser_pos0 + int(round(float(rel))))
 
     def end_sweep_watch():
         sw = sweep_watch
@@ -1527,16 +1523,16 @@ def main(argv=None):
         if stt.get('done') and not sw['apex_done']:
             sw['apex_done'] = True
             if focuser is not None and stt.get('p0') is not None and stt.get('bracketed'):
-                focuser_move_rel(stt['p0'])                 # the whole point: go to best focus
-                print(f"[backend] focuser -> best focus rel {stt['p0']:g} "
+                focuser_goto(stt['p0'])                     # the whole point: go to best focus
+                print(f"[backend] focuser -> best focus {stt['p0']:g} "
                       f"(strehl {stt.get('strehl0')})", flush=True)
         if focuser is not None and stt.get('awaiting') == 'position':
             want = stt.get('want_pos')
             if want is not None and want != sw['served']:
                 if want != sw['want']:                      # a new request: start the (2-leg) move
                     sw['want'] = want
-                    sw['target'] = focuser_goto(focuser_pos0 + want)
-                    print(f"[backend] focuser -> rel {want:g} (abs {sw['target']})", flush=True)
+                    sw['target'] = focuser_goto(want)
+                    print(f"[backend] focuser -> {sw['target']}", flush=True)
                 elif (focuser_goto_st['final'] is None      # both legs done...
                         and not focuser_status.get('moving')   # ...and motor + count agree
                         and focuser_status.get('pos') == sw['target']):
@@ -1979,7 +1975,7 @@ def main(argv=None):
                 disconnect_focuser()
         elif t == 'focuser_move':
             if focuser is not None:
-                focuser_move_rel(cmd.get('rel', 0))
+                focuser_goto(cmd.get('abs', 0))
             else:
                 print("[backend] ignoring focuser_move (not connected)", flush=True)
         elif t == 'focuser_stop':
@@ -2317,11 +2313,10 @@ def main(argv=None):
                 # Focus sweep process (the GUI follows <role>_sweep for its prompts/result).
                 'sweep': {'running': sweep_proc is not None and sweep_proc.poll() is None,
                           'role': sweep_role, 'error': sweep_error},
-                # EAF focuser: positions are absolute device steps; pos0 = the abs position at
-                # connect, the session's relative zero (the GUI displays pos - pos0).
+                # EAF focuser: positions are absolute device steps everywhere.
                 'focusers_available': list(focusers_available),
                 'focuser': ({'connected': True, 'index': focuser_index, 'name': focuser.name,
-                             'pos': focuser_status.get('pos'), 'pos0': focuser_pos0,
+                             'pos': focuser_status.get('pos'),
                              'max_step': focuser.max_step,
                              'moving': bool(focuser_status.get('moving')),
                              'moving_manual': bool(focuser_status.get('moving_manual')),

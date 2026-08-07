@@ -64,6 +64,31 @@ def fit_vcurve(points):
     return p0, (1.0 / ymin if ymin > 0 else 0.0), (a, b, c)
 
 
+def fit_astig(points):
+    """Vector linear fit of the per-bucket stack astigmatism e(p) = a*p + b, where e = (e1, e2)
+    is the second-moment ellipse in DOUBLED-ANGLE space. Through focus an astigmatic beam's
+    focal lines swap axes (a 90-degree physical rotation = a sign flip of e), so both
+    components cross zero ~linearly at best focus. Returns {'astig_slope' (|a| per focuser
+    step -- the misalignment metric corrector rotation would minimize), 'astig_zero' (the
+    magnitude-minimizing crossing; imprecise by construction when the slope ~ 0 -- a dialed-in
+    scope has no crossing to find), 'astig_axis_deg' (the fixed physical axis, atan2/2)} or
+    None. Linear only holds NEAR focus (ellipticity saturates on donuts); sweep small ranges
+    when measuring."""
+    if len(points) < 2:
+        return None
+    p = np.array([q[0] for q in points], dtype=np.float64)
+    e = np.array([[q[3], q[4]] for q in points], dtype=np.float64)
+    A = np.stack([p, np.ones_like(p)], axis=1)
+    coef, *_ = np.linalg.lstsq(A, e, rcond=None)
+    a, b = coef[0], coef[1]
+    n2 = float(a @ a)
+    if n2 <= 0:
+        return None
+    return {'astig_slope': float(np.hypot(a[0], a[1])),
+            'astig_zero': -float(a @ b) / n2,
+            'astig_axis_deg': math.degrees(math.atan2(a[1], a[0]) / 2.0)}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker focus sweep (actuator-agnostic)")
     p.add_argument('--session', required=True)
@@ -150,12 +175,13 @@ def main(argv=None):
         except framestream.Lapped:
             return -1.0
 
-    points = []                                # (pos, stack_strehl, clip_frac) per bucket
+    points = []                                # (pos, stack_strehl, clip_frac, e1, e2) per bucket
     clip_frames = total_frames = 0
     aborted = False
 
     def pts_out():
-        return [[p_, round(s_, 5), round(cf_, 3)] for p_, s_, cf_ in points]
+        return [[p_, round(s_, 5), round(cf_, 3), round(e1_, 4), round(e2_, 4)]
+                for p_, s_, cf_, e1_, e2_ in points]
 
     try:
         for k, pos in enumerate(positions):
@@ -183,7 +209,7 @@ def main(argv=None):
             # 'frames' is the backend's cue to reset the focus stack into pure-average mode;
             # the applied reset shows up as ctl_seq advancing past seq0.
             publish(awaiting='frames')
-            strehl = None
+            strehl = ellipse = None
             bucket_clip = bucket_n = 0
             while strehl is None and not stop.is_set() and not focus_gone():
                 fo_focus.poll()
@@ -204,6 +230,9 @@ def main(argv=None):
                         advanced = True
                     if int(rec['stack_n']) >= frames:
                         strehl = float(rec['stack_strehl'])
+                        # Same final stack also carries the astigmatism ellipse -- the
+                        # through-focus crossing diagnostic rides along for free.
+                        ellipse = (float(rec['ellipse_1']), float(rec['ellipse_2']))
                         break
                 if strehl is None and not advanced:
                     time.sleep(args.poll)
@@ -212,8 +241,9 @@ def main(argv=None):
             cf = bucket_clip / bucket_n if bucket_n else 0.0
             clip_frames += bucket_clip
             total_frames += bucket_n
-            points.append((want, strehl, cf))
-            print(f"[sweep:{args.role}] bucket {k + 1}: pos {want:g} strehl {strehl:.4f}"
+            points.append((want, strehl, cf, ellipse[0], ellipse[1]))
+            print(f"[sweep:{args.role}] bucket {k + 1}: pos {want:g} strehl {strehl:.4f} "
+                  f"e=({ellipse[0]:+.4f},{ellipse[1]:+.4f})"
                   + (f" (CLIP {cf:.0%})" if cf else ""), flush=True)
             publish(points=pts_out())
         aborted = stop.is_set() or not points
@@ -222,6 +252,12 @@ def main(argv=None):
                   'clip_frac': round(clip_frames / total_frames, 3) if total_frames else 0.0}
         usable = [q for q in points if q[1] > 0]
         fit = fit_vcurve(usable) if len(usable) >= 3 and not aborted else None
+        astig = fit_astig(points) if len(points) >= 2 and not aborted else None
+        if astig is not None:
+            result.update({k: round(v, 6) for k, v in astig.items()})
+            print(f"[sweep:{args.role}] astig: slope {astig['astig_slope']:.5f}/step, "
+                  f"zero @ {astig['astig_zero']:.4g}, axis {astig['astig_axis_deg']:.1f} deg",
+                  flush=True)
         if fit is not None:
             p0, strehl0, _ = fit
             result.update(p0=round(p0, 4), strehl0=round(strehl0, 4),
