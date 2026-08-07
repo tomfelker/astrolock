@@ -564,9 +564,55 @@ def main(argv=None):
             parts.append('HS')
         parts.append(caps.get('camera_short_name') or caps.get('camera') or sources.get(role) or '')
         _sname, oname, rname = (optics_sel.get(role) or [None, None, None])
+        # ASICap-style sidecar (<recording>.ser.txt): the static, humanly-formatted facts known
+        # at the click. Faithful-only -- keys we can't know are omitted, never invented; the
+        # recorder adds the dynamic parts (start/end, frame count, format) itself.
+        telescope = ' + '.join(n for n in (oname, rname) if n)
+        side = {'Camera': caps.get('camera') or sources.get(role) or 'unknown'}
+        if vals.get('gain') is not None:
+            side['Gain'] = f"{float(vals['gain']):g}"
+        if vals.get('exposure') is not None:
+            side['Exposure'] = f"{float(vals['exposure']):g}ms"
+        side['Bin'] = str(bin_by_role.get(role, 1))
+        if vals.get('highspeed') is not None:
+            side['High Speed Mode'] = 'ON' if vals['highspeed'] else 'OFF'
+        if vals.get('bandwidth') is not None:
+            side['USB Limit'] = f"{float(vals['bandwidth']):g}"
+        if sources.get(role) == 'zwo':                 # true facts of our ZWO capture path
+            side.update({'StartX': '0', 'StartY': '0', 'Flip': 'None',
+                         'Hardware Bin': 'OFF', 'Mono Bin': 'OFF'})
+        if telescope:
+            side['Telescope'] = telescope
+        side['Recorded By'] = recorded_by
         return ['--observer', recorded_by,
                 '--instrument', ','.join(p for p in parts if p),
-                '--telescope', ' + '.join(n for n in (oname, rname) if n)]
+                '--telescope', telescope,
+                '--sidecar-meta', json.dumps(side)]
+
+    def recorder_note(role, text):
+        """Append a live-change line to a running recorder's sidecar (best effort): a JSON line
+        on its stdin. The pipe doubles as the stop signal, so the recorder treats JSON lines as
+        events and anything else as stop."""
+        pr = recorder_processes.get(role)
+        if pr is None or pr.poll() is not None or pr.stdin is None:
+            return
+        try:
+            pr.stdin.write((json.dumps({'sidecar_change': text}) + '\n').encode('utf-8'))
+            pr.stdin.flush()
+        except OSError as e:
+            print(f"[backend] sidecar note for {role} failed: {e}", flush=True)
+
+    def sidecar_change_text(name, value):
+        """A control change as the sidecar's human form (same units as the static block)."""
+        if name == 'exposure':
+            return f"Exposure = {float(value):g}ms"
+        if name == 'gain':
+            return f"Gain = {float(value):g}"
+        if name == 'bandwidth':
+            return f"USB Limit = {float(value):g}"
+        if name == 'highspeed':
+            return f"High Speed Mode = {'ON' if value else 'OFF'}"
+        return f"{name} = {value}"
 
     def start_recorder(role, resume=False):
         """Spawn a recorder for `role`. We hold its stdin: 'stop' is a line on it, and if WE
@@ -1969,6 +2015,7 @@ def main(argv=None):
             elif role in roles and name == 'fps':          # cam-loop max-fps cap: live, its own channel
                 fps_by_role[role] = max(0.0, float(value))
                 control_write(role, {'fps': fps_by_role[role]})    # cam handles cmd['fps'] directly
+                recorder_note(role, f"FPS Cap = {fps_by_role[role] or 'unlimited'}")
                 print(f"[backend] {role} max fps = {fps_by_role[role] or 'unlimited'}", flush=True)
             elif role in roles and name == 'depth':        # capture bit depth: changes the format -> relaunch
                 depth_by_role[role] = 8 if int(float(str(value))) == 8 else 16
@@ -1981,6 +2028,7 @@ def main(argv=None):
                              if c['name'] == name), True)
                 if live:
                     control_write(role, {'controls': {name: value}})   # apply on the running cam
+                    recorder_note(role, sidecar_change_text(name, value))
                 else:
                     restart_cam(role, stop_first=True)                 # format change -> relaunch (later)
                 print(f"[backend] {role} control {name} = {value} ({'live' if live else 'relaunch'})", flush=True)

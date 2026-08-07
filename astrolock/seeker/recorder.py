@@ -28,17 +28,74 @@ anything.
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 import threading
 import time
 
-from astrolock.seeker import framestream, ser as ser_mod
+from astrolock.seeker import bayer, framestream, ser as ser_mod
 
 
 def _utc_of(rec):
     ns = rec.get('t_utc_ns') or 0
     return dt.datetime.fromtimestamp(ns / 1e9, dt.timezone.utc) if ns else None
+
+
+def _iso(t):
+    return t.strftime('%Y-%m-%dT%H:%M:%S.') + f"{t.microsecond // 1000:03d}Z" if t else 'unknown'
+
+
+def _colour_format(color_id, depth):
+    """The sidecar's 'Colour Format' in ASICap's vocabulary: RAW8/RAW16 for a Bayer mosaic,
+    MONO8/MONO16 otherwise."""
+    bits = 8 if depth <= 8 else 16
+    return f"{'RAW' if bayer.is_bayer(color_id) else 'MONO'}{bits}"
+
+
+class Sidecar:
+    """ASICap-compatible <recording>.ser.txt metadata sidecar (SharpCap/FireCapture write the
+    same style): '[camera]' then 'Key = Value' lines. The static block lands at file OPEN (a
+    crash still leaves the settings); 'Change = ...' lines are appended as live control changes
+    arrive; EndCapture/FrameCount close it out. One sidecar per output .ser."""
+
+    def __init__(self, ser_path, meta, color_id, depth, w, h, start_utc):
+        self.path = ser_path + '.txt'
+        meta = dict(meta)
+        camera = meta.pop('Camera', 'unknown')
+        static = {
+            'Bin': meta.pop('Bin', None),
+            'Capture Area Size': f"{w} * {h}",
+            'Colour Format': _colour_format(color_id, depth),
+            'Exposure': meta.pop('Exposure', None),
+            'Gain': meta.pop('Gain', None),
+            'Output Format': '*.SER',
+            'Raw Format': 'ON',
+            'StartCapture': _iso(start_utc),
+            'Timestamp Frames': 'ON',              # we always write the SER timestamp trailer
+            'TimeZone': f"{dt.datetime.now().astimezone().utcoffset().total_seconds() / 3600:g}",
+        }
+        if bayer.is_bayer(color_id):
+            static['Debayer Type'] = ser_mod.ColorId(color_id).name.replace('BAYER_', '')
+        static.update(meta)                        # the backend's remaining faithful keys
+        self._f = open(self.path, 'w', encoding='ascii', errors='replace', newline='\r\n')
+        self._f.write(f"[{camera}]\n")
+        for k in sorted(static):
+            if static[k] is not None:
+                self._f.write(f"{k} = {static[k]}\n")
+        self._f.flush()
+
+    def change(self, utc, frame_index, text):
+        """A live control change, stamped with capture time + the frame it lands before."""
+        self._f.write(f"Change = {_iso(utc)} frame {frame_index}: {text}\n")
+        self._f.flush()
+
+    def close(self, end_utc, frame_count, dropped):
+        self._f.write(f"EndCapture = {_iso(end_utc)}\n")
+        self._f.write(f"FrameCount = {frame_count}\n")
+        if dropped:
+            self._f.write(f"Frames Dropped = {dropped}\n")
+        self._f.close()
 
 
 def main(argv=None):
@@ -52,6 +109,9 @@ def main(argv=None):
     p.add_argument('--observer', default='')
     p.add_argument('--instrument', default='')
     p.add_argument('--telescope', default='')
+    p.add_argument('--sidecar-meta', default='',
+                   help="JSON dict of static ASICap-style sidecar fields (from the backend); "
+                        "empty = no .ser.txt sidecars")
     p.add_argument('--resume', action='store_true',
                    help="a reconcile RELAUNCH (predecessor died mid-recording): start from the "
                         "ring's oldest available frame instead of 'now', so the ring bridges "
@@ -61,10 +121,23 @@ def main(argv=None):
     os.makedirs(args.out_dir, exist_ok=True)
 
     stop = threading.Event()
+    change_queue = []                         # sidecar change events from the backend (stdin JSON)
+    change_lock = threading.Lock()
 
-    def _stdin_watch():                       # a line = stop recording; EOF = backend gone: stop too
+    def _stdin_watch():
+        """The backend holds our pipe. JSON lines are sidecar change events; any OTHER line --
+        or EOF (backend gone) -- means stop recording."""
         try:
-            sys.stdin.readline()
+            for line in sys.stdin:
+                line = line.strip()
+                if line.startswith('{'):
+                    try:
+                        with change_lock:
+                            change_queue.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        print(f"[rec:{args.role}] bad stdin event ignored: {e}", flush=True)
+                    continue
+                break                          # non-JSON line = explicit stop
         except Exception:
             pass
         stop.set()
@@ -82,6 +155,18 @@ def main(argv=None):
     written = skipped = thinned = 0
     first_t_ns = last_t_ns = None                 # capture stamps of the first/last WRITTEN frame
     phase = 0                                     # decimation phase for the watermark backoff
+    sidecar_meta = json.loads(args.sidecar_meta) if args.sidecar_meta else None
+    sidecar = None                                # the CURRENT file's .ser.txt (one per .ser)
+    side_count0 = 0                               # `written` when the current file opened
+    side_dropped0 = 0
+    side_last_utc = None                          # capture UTC of the current file's last frame
+
+    def sidecar_finish():
+        nonlocal sidecar
+        if sidecar is not None:
+            sidecar.close(side_last_utc, written - side_count0,
+                          (skipped_now() + thinned) - side_dropped0)
+            sidecar = None
 
     def skipped_now():
         return skipped + max(0, fo.lost - base_lost)
@@ -103,6 +188,7 @@ def main(argv=None):
     def archive_one(rd, i):
         """Write frame i straight from the ring; True if it landed, False if lapped."""
         nonlocal out, out_geom, out_path, written, skipped, first_t_ns, last_t_ns
+        nonlocal sidecar, side_count0, side_dropped0, side_last_utc
         wrote = False
         try:
             with rd.view(i) as (rec, frame):           # ZERO-COPY: write() reads the slot in place
@@ -113,6 +199,7 @@ def main(argv=None):
                 if out is None or out_geom != geom:
                     if out is not None:
                         out.close()
+                    sidecar_finish()
                     out_geom = geom
                     # Every output file is named for its FIRST frame's capture time (a
                     # geometry change just starts the next file the same way).
@@ -126,7 +213,17 @@ def main(argv=None):
                                             pixel_depth_per_plane=rd.header.pixel_depth_per_plane,
                                             observer=args.observer, instrument=args.instrument,
                                             telescope=args.telescope)
-                out.write_frame(frame, t_utc=_utc_of(rec))   # trailer gets CAPTURE time
+                    if sidecar_meta is not None:
+                        sidecar = Sidecar(out_path, sidecar_meta, rd.header.color_id,
+                                          rd.header.pixel_depth_per_plane,
+                                          frame.shape[1], frame.shape[0], t0)
+                        side_count0 = written
+                        side_dropped0 = skipped_now() + thinned
+                        side_last_utc = t0
+                u = _utc_of(rec)
+                out.write_frame(frame, t_utc=u)        # trailer gets CAPTURE time
+                if u is not None:
+                    side_last_utc = u
                 t_ns = int(rec['t_mono_ns'])
                 wrote = True
         except framestream.Lapped:
@@ -163,6 +260,11 @@ def main(argv=None):
             worked = False
             for rd, i in fo.drain(limit=256):
                 worked = _archive_or_thin(rd, i) or worked
+            with change_lock:                          # live control changes -> sidecar lines
+                events, change_queue[:] = list(change_queue), []
+            for ev in events:
+                if sidecar is not None and ev.get('sidecar_change'):
+                    sidecar.change(side_last_utc, written - side_count0, ev['sidecar_change'])
             if stop.is_set():
                 for rd, i in fo.drain():               # freeze: flush what's already committed
                     _archive_or_thin(rd, i)
@@ -181,6 +283,7 @@ def main(argv=None):
     finally:
         if out is not None:
             out.close()
+        sidecar_finish()
         fo.close()
         dropped = skipped_now() + thinned
         avg_fps = _fps(written)                                     # actual written frame rate
