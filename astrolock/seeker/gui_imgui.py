@@ -2258,6 +2258,19 @@ def main(argv=None):
         _tip("Record this camera automatically whenever tracking is engaged (same recorder as "
              "Record now; the file finalizes when the lock drops). Turns itself on when you "
              "switch this role to a real camera.")
+        imgui.same_line()
+        imgui.text("as")
+        _tip("Recording name: files are '<UTC timestamp>_<this>.ser' (+ the .ser.txt sidecar). "
+             "Press Enter to apply; takes effect at the NEXT recording started.")
+        imgui.same_line()
+        _rn_key = f'record_name_{role}'
+        if _rn_key not in ui['txt']:                       # init once from the backend's value
+            ui['txt'][_rn_key] = ((st or {}).get('record_name') or {}).get(role) or role
+
+        def _commit_record_name(txt, _role=role):
+            _send({'type': 'set_record_name', 'role': _role, 'name': txt})
+            return txt.strip() or _role
+        _input_commit(_rn_key, S(120), _commit_record_name)
         ch, v = imgui.checkbox(f"Reticles##ret_{role}", sset['reticles'])
         if ch:
             sset['reticles'] = v

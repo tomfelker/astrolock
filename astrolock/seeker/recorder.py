@@ -102,6 +102,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="AstroLock Seeker recorder (live stream -> disk .ser)")
     p.add_argument('--session', required=True, help="session directory of the live stream")
     p.add_argument('--role', default='main', help="stream to record (guide/main)")
+    p.add_argument('--name', default=None,
+                   help="filename suffix: <timestamp>_<name>.ser (default: the role)")
     p.add_argument('--out-dir', default='recordings', help="archive directory (never cleaned up)")
     # SER header identity strings (each stored as 40 ASCII bytes), composed by the backend:
     # Observer = recording software, Instrument = camera + capture settings,
@@ -205,7 +207,7 @@ def main(argv=None):
                     # geometry change just starts the next file the same way).
                     t0 = _utc_of(rec) or dt.datetime.now(dt.timezone.utc)
                     stamp = t0.strftime('%Y%m%dT%H%M%S') + f"{t0.microsecond // 1000:03d}Z"
-                    out_path = os.path.join(args.out_dir, f"{stamp}_{args.role}.ser")
+                    out_path = os.path.join(args.out_dir, f"{stamp}_{args.name or args.role}.ser")
                     print(f"[rec:{args.role}] -> {out_path} "
                           f"[{args.instrument} | {args.telescope}]", flush=True)
                     out = ser_mod.SerWriter(out_path, frame.shape[1], frame.shape[0],

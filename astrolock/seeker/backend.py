@@ -529,6 +529,7 @@ def main(argv=None):
     record_manual = {role: False for role in roles}
     record_auto = {role: args.source == 'zwo' for role in roles}   # real cam: on by default
     record_desired_prev = {role: False for role in roles}
+    record_name = {role: role for role in roles}  # filename suffix: <timestamp>_<this>.ser
     recorder_processes = {}                       # role -> the recorder we're managing
     recorder_spawned_s = {}                       # role -> last spawn time (crash-loop brake;
     stopped_recorders = []                        # cleared whenever recording isn't wanted)
@@ -630,6 +631,7 @@ def main(argv=None):
         recorder_processes[role] = subprocess.Popen(
             [sys.executable, '-m', 'astrolock.seeker.recorder',
              '--session', session_dir, '--role', role,
+             '--name', record_name[role],
              '--out-dir', args.recordings_dir]
             + recorder_header_args(role) + (['--resume'] if resume else []),
             stdin=subprocess.PIPE)
@@ -1848,6 +1850,13 @@ def main(argv=None):
                     record_auto[role] = bool(cmd.get('auto'))
                 print(f"[backend] record policy for {role}: manual={record_manual[role]} "
                       f"auto(while tracking)={record_auto[role]}", flush=True)
+        elif t == 'set_record_name':                  # filename suffix for the NEXT recording
+            role = cmd.get('role')
+            if role in roles:
+                raw = str(cmd.get('name') or '').strip()
+                clean = ''.join(c for c in raw if c not in '\\/:*?"<>|').strip() or role
+                record_name[role] = clean
+                print(f"[backend] {role} recordings named <timestamp>_{clean}.ser", flush=True)
         elif t == 'capture':
             role = cmd.get('role')
             if role in roles:
@@ -2283,6 +2292,7 @@ def main(argv=None):
                 'recording_desired': dict(record_desired_prev),   # what the loop is enforcing
                 'record_manual': dict(record_manual),   # policy flags (GUI checkboxes render
                 'record_auto': dict(record_auto),       # these; the backend owns them)
+                'record_name': dict(record_name),       # per-role recording filename suffix
                 'tracking': tracking,                   # "locked": the tracker has a target
                 'following': bool(tracking and follow_enabled and delay_left <= 0),   # actively slewing
                 'follow_enabled': follow_enabled,       # the persistent user intent (GUI checkbox)
